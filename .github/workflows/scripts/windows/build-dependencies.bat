@@ -487,7 +487,7 @@ cd .. || goto error
 
 echo "Building RapidYAML..."
 rmdir /S /Q "rapidyaml-%RAPIDYAML%-src"
-%SEVENZIP% x "rapidyaml-%RAPIDYAML%-src.zip" || goto error
+%SEVENZIP% x "-x^!rapidyaml-%RAPIDYAML%-src\ext\c4core\doc\img\*" "rapidyaml-%RAPIDYAML%-src.zip" || goto error
 cd "rapidyaml-%RAPIDYAML%-src" || goto error
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -B build -G Ninja || goto error
 cmake --build build --parallel || goto error
