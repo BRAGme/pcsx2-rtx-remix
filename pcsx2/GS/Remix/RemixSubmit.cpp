@@ -1633,6 +1633,14 @@ namespace RemixSubmit
 		float max_w = -std::numeric_limits<float>::max();
 		u32 min_z = 0xFFFFFFFFu;
 		u32 max_z = 0;
+		// Screen-space extent in pixels, (XY - XYOFFSET)/16 per GSState::GetXYWindow
+		// (GSState.cpp:5093). Without this there is no way to tell a full-screen quad from a
+		// small one in the dump, which is the single most diagnostic fact about a draw that is
+		// covering the viewport.
+		float min_px = std::numeric_limits<float>::max();
+		float max_px = -std::numeric_limits<float>::max();
+		float min_py = std::numeric_limits<float>::max();
+		float max_py = -std::numeric_limits<float>::max();
 
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
@@ -1693,6 +1701,13 @@ namespace RemixSubmit
 			draw_bounds.add(out.position);
 			min_w = std::min(min_w, w);
 			max_w = std::max(max_w, w);
+
+			const float px = (static_cast<float>(v.XYZ.X) - ox) * (1.0f / 16.0f);
+			const float py = (static_cast<float>(v.XYZ.Y) - oy) * (1.0f / 16.0f);
+			min_px = std::min(min_px, px);
+			max_px = std::max(max_px, px);
+			min_py = std::min(min_py, py);
+			max_py = std::max(max_py, py);
 			min_z = std::min(min_z, static_cast<u32>(v.XYZ.Z));
 			max_z = std::max(max_z, static_cast<u32>(v.XYZ.Z));
 		}
@@ -1962,7 +1977,7 @@ namespace RemixSubmit
 				"f={} d={} verts={} tris={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
 				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
 				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
-				"w=[{:.1f},{:.1f}] z=[{},{}] | mat={:016X}",
+				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | mat={:016X}",
 				s_frame_counter, s_submitted_this_frame, vertex_count, s_scratch_indices.size() / 3,
 				is_sky ? 1 : 0,
 				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),
@@ -1977,7 +1992,8 @@ namespace RemixSubmit
 				static_cast<u32>(r.m_cached_ctx.TEX0.TH), static_cast<u32>(r.m_cached_ctx.TEX0.TCC),
 				static_cast<u32>(r.m_cached_ctx.TEX0.TFX),
 				(source && (source->m_target || source->m_from_target)) ? 1 : 0,
-				min_w, max_w, min_z, max_z, material.content_hash));
+				min_w, max_w, min_z, max_z, min_px, max_px, min_py, max_py,
+				rt_unscaled_width, rt_unscaled_height, material.content_hash));
 		}
 
 		// Only now that the draw is committed does its extent count towards the frame's, and
