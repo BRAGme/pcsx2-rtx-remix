@@ -98,6 +98,15 @@ namespace remix_ps2::materials
 			return value;
 		}
 
+		// Mirrors RemixSubmit's PCSX2_REMIX_ALPHASTATE so the material flag and the instance
+		// struct can never disagree.
+		int alpha_state_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(read_env_int(L"PCSX2_REMIX_ALPHASTATE", 2), 0, 2));
+			return value;
+		}
+
 		bool textures_linear()
 		{
 			static const bool value = read_env_int(L"PCSX2_REMIX_TEXLINEAR", 0) != 0;
@@ -693,7 +702,10 @@ namespace remix_ps2::materials
 			opaque.alphaIsThinFilmThickness = 0;
 			opaque.heightTexture = nullptr;
 			opaque.displaceIn = 0.f;
-			opaque.useDrawCallAlphaState = 1;
+			// 0 when the caller is not chaining an InstanceInfoBlendEXT: claiming to supply
+			// draw-call alpha state and then not supplying it is what made every ABE=1 surface
+			// blend against nothing. See alpha_state_mode() in RemixSubmit.cpp.
+			opaque.useDrawCallAlphaState = (alpha_state_mode() != 0) ? 1 : 0;
 			opaque.blendType_hasvalue = 0;
 			opaque.blendType_value = 0;
 			opaque.invertedBlend = 0;
@@ -773,7 +785,7 @@ namespace remix_ps2::materials
 			opaque.opacityConstant = 1.f;
 			opaque.roughnessConstant = 0.7f;
 			opaque.metallicConstant = 0.f;
-			opaque.useDrawCallAlphaState = 1;
+			opaque.useDrawCallAlphaState = (alpha_state_mode() != 0) ? 1 : 0;
 			opaque.alphaTestType = 7;
 
 			remixapi_MaterialInfo material{};

@@ -1223,6 +1223,77 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// How the PS2's per-draw alpha state is handed to the runtime.
+		//
+		//   0 = tell the runtime to ignore draw-call alpha state entirely
+		//   1 = claim to supply it and then not (what shipped, and it is a bug -- see below)
+		//   2 = supply a real remixapi_InstanceInfoBlendEXT translated from the GS registers
+		//
+		// The material sets useDrawCallAlphaState = 1, which remix_c.h:255-256 documents as
+		// "InstanceInfoBlendEXT is used as a source for alpha state" -- but that struct was
+		// never chained into the instance's pNext. Every draw in this title has ABE=1, so every
+		// surface was being blended against whatever the runtime found in place of a struct we
+		// never provided. 0 and 1 exist to A/B that; 2 is the destination, because PS2 blending
+		// genuinely matters for glass, decals and effects.
+		int alpha_state_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_ALPHASTATE", 2), 0, 2));
+			return value;
+		}
+
+		// PS2 ATST -> D3D9 D3DCMPFUNC, which is the vocabulary the D3D9-shaped Remix API uses.
+		// GS_ATST: NEVER 0, ALWAYS 1, LESS 2, LEQUAL 3, EQUAL 4, GEQUAL 5, GREATER 6, NOTEQUAL 7.
+		u32 to_d3d_compare(u32 atst)
+		{
+			switch (atst)
+			{
+				case 0: return 1; // NEVER
+				case 1: return 8; // ALWAYS
+				case 2: return 2; // LESS
+				case 3: return 4; // LESSEQUAL
+				case 4: return 3; // EQUAL
+				case 5: return 7; // GREATEREQUAL
+				case 6: return 5; // GREATER
+				default: return 6; // NOTEQUAL
+			}
+		}
+
+		// The GS blend equation is (A - B) * C + D with A/B/D in {Cs, Cd, 0} and C in
+		// {As, Ad, FIX}. D3D9's fixed src*srcFactor + dst*dstFactor cannot express all of it, so
+		// this covers the cases that actually occur and falls back to a plain alpha blend --
+		// stated plainly because it is an approximation, not a translation.
+		void to_d3d_blend(const GIFRegALPHA& alpha, u32& src_factor, u32& dst_factor)
+		{
+			// D3DBLEND: ZERO 1, ONE 2, SRCALPHA 5, INVSRCALPHA 6, DESTALPHA 7, INVDESTALPHA 8.
+			const u32 c_factor = (alpha.C == 0) ? 5u : (alpha.C == 1) ? 7u : 2u; // As / Ad / FIX~ONE
+			const u32 inv_c_factor = (alpha.C == 0) ? 6u : (alpha.C == 1) ? 8u : 1u;
+
+			if (alpha.A == 0 && alpha.B == 1 && alpha.D == 1)
+			{
+				// Cs*C + Cd*(1-C): the standard blend.
+				src_factor = c_factor;
+				dst_factor = inv_c_factor;
+			}
+			else if (alpha.A == 0 && alpha.B == 2 && alpha.D == 1)
+			{
+				// Cs*C + Cd: additive.
+				src_factor = c_factor;
+				dst_factor = 2u; // ONE
+			}
+			else if (alpha.A == 0 && alpha.B == 2 && alpha.D == 2)
+			{
+				// Cs*C: modulate against nothing.
+				src_factor = c_factor;
+				dst_factor = 1u; // ZERO
+			}
+			else
+			{
+				src_factor = c_factor;
+				dst_factor = inv_c_factor;
+			}
+		}
+
 		// Ceiling on CreateMesh calls in a single frame; 0 (the default) is unlimited, so this
 		// is inert until it is deliberately turned on. It exists because the remaining
 		// device-loss reports are all "while walking", and camera translation re-hashes every
@@ -1950,9 +2021,35 @@ namespace RemixSubmit
 		// unless we look it up ourselves and OR it in here.
 		const remixapi_InstanceCategoryFlags tagged = remix_ps2::materials::categories_for(material.content_hash);
 
+		remixapi_InstanceInfoBlendEXT blend{};
+		blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+		blend.pNext = nullptr;
+		blend.alphaTestEnabled = r.m_cached_ctx.TEST.ATE ? 1 : 0;
+		blend.alphaTestReferenceValue = static_cast<u8>(r.m_cached_ctx.TEST.AREF);
+		blend.alphaTestCompareOp = to_d3d_compare(r.m_cached_ctx.TEST.ATST);
+		blend.alphaBlendEnabled = r.PRIM->ABE ? 1 : 0;
+		to_d3d_blend(r.m_context->ALPHA, blend.srcColorBlendFactor, blend.dstColorBlendFactor);
+		blend.colorBlendOp = 1; // D3DBLENDOP_ADD
+		blend.srcAlphaBlendFactor = blend.srcColorBlendFactor;
+		blend.dstAlphaBlendFactor = blend.dstColorBlendFactor;
+		blend.alphaBlendOp = 1;
+		// TFX: MODULATE 0, DECAL 1, HIGHLIGHT 2, HIGHLIGHT2 3. Only the first two are
+		// expressible as a fixed-function stage; the highlight modes degrade to modulate.
+		const bool decal = (r.m_cached_ctx.TEX0.TFX == 1);
+		blend.textureColorArg1Source = 2; // D3DTA_TEXTURE
+		blend.textureColorArg2Source = 0; // D3DTA_DIFFUSE
+		blend.textureColorOperation = decal ? 2u : 4u; // SELECTARG1 : MODULATE
+		blend.textureAlphaArg1Source = 2;
+		blend.textureAlphaArg2Source = 0;
+		blend.textureAlphaOperation = decal ? 2u : 4u;
+		blend.tFactor = 0xFFFFFFFFu;
+		blend.isTextureFactorBlend = 0;
+		blend.writeMask = 0xF; // D3DCOLORWRITEENABLE_ALL
+		blend.isVertexColorBakedLighting = 0;
+
 		remixapi_InstanceInfo instance{};
 		instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-		instance.pNext = nullptr;
+		instance.pNext = (alpha_state_mode() == 2) ? &blend : nullptr;
 		instance.categoryFlags = tagged | (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u);
 		instance.mesh = it->second.handle;
 		// Identity: the positions are already in the submitted camera's space. Per-draw world
