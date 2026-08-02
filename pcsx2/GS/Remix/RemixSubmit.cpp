@@ -126,6 +126,15 @@ namespace RemixSubmit
 			u64 distinct_instanced_peak = 0;
 			u64 distinct_instanced_total = 0;
 			u64 distinct_instanced_frames = 0;
+			// Stable-identity accounting. 'reuse' is a draw that registered onto a handle
+			// created in an earlier frame -- the whole point of the feature. 'rebuild' is a key
+			// whose slots were all occupied by geometry that did not fit, i.e. a genuine
+			// collision or a deforming object, and is the number that says whether the identity
+			// key discriminates well enough.
+			u64 id_reuse = 0;
+			u64 id_create = 0;
+			u64 id_rebuild = 0;
+			u64 id_probe_collisions = 0; // slots stepped over before a fit was found
 			u64 degenerate_triangles = 0; // zero-area triangles dropped before CreateMesh
 			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
@@ -153,6 +162,20 @@ namespace RemixSubmit
 		{
 			remixapi_MeshHandle handle = nullptr;
 			u64 last_used_frame = 0;
+
+			// Stable-identity bookkeeping; empty on the legacy path.
+			//
+			// 'local' is the geometry as it was uploaded: the draw's positions relative to their
+			// own centroid at the moment the mesh was created. Every later frame registers its
+			// own centred positions against this to recover the rigid transform that places the
+			// mesh, so the handle survives camera motion instead of being re-minted.
+			std::vector<float> local;
+			// Set when a draw claimed this entry but did not fit it, i.e. the identity key
+			// collided or the geometry is deforming. The rebuild happens at the frame boundary,
+			// never mid-frame: the handle may already be referenced by an instance submitted
+			// earlier in this same frame, and destroying it under the runtime is exactly the
+			// class of fault this whole change exists to remove.
+			bool rebuild_pending = false;
 		};
 
 		// The un-projection inputs of the frame's dominant 3D draw. Recorded per draw and
@@ -224,6 +247,14 @@ namespace RemixSubmit
 
 		// Mesh hashes already submitted this frame, cleared at each VSync. See the dedupe gate.
 		std::unordered_set<u64> s_frame_submitted_hashes;
+
+		// Distinct mesh *keys* instanced this frame. Under stable identity the dedupe set above
+		// also carries a quantized centroid, so two instances of one object appear twice in it
+		// while referencing a single handle; this set is what the success metric counts.
+		std::unordered_set<u64> s_frame_instanced_keys;
+
+		// Current draw's positions relative to their own centroid, reused across draws.
+		std::vector<float> s_scratch_local;
 
 		// Matrices already written to the PCSX2_REMIX_DUMP file, so the diagnostic stays one
 		// line per distinct matrix rather than one per frame per matrix.
@@ -526,6 +557,31 @@ namespace RemixSubmit
 		}
 
 		remixapi_MeshHandle s_reuse_handle = nullptr;
+
+		// The decisive follow-up to the reused-handle arm. That arm instanced ONE long-lived
+		// handle ~190 times a frame and survived 20/20 against a 1/20 control, which was read as
+		// "the runtime cannot sustain many DISTINCT BLASes per frame". But it changed two things
+		// at once: handle *diversity* fell from ~190 to 1, and handle *age* went from
+		// "created this frame" to "created once and held".
+		//
+		// Only one of those is fixable by stable mesh identity. Stable identity keeps a handle
+		// alive across frames -- it does NOT reduce how many distinct handles a frame references,
+		// because a frame still draws the same number of distinct objects. So if diversity is the
+		// fault, the whole feature is a dead end and must not be built.
+		//
+		// This arm separates them: instance N distinct, long-lived, pinned handles round-robin at
+		// the normal per-frame rate, with mesh creation churn untouched. N=1 reproduces the
+		// reused-handle arm; N at the frame's natural draw count holds diversity at its real
+		// value while making every instanced BLAS old.
+		u64 reuse_pool_size()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_REUSEPOOL", 0)));
+			return value;
+		}
+
+		std::vector<u64> s_pool_hashes;
+		std::unordered_set<u64> s_pinned_hashes;
 
 		bool no_draw_instance()
 		{
@@ -1454,6 +1510,77 @@ namespace RemixSubmit
 		// A/B handle for the measurement. The default is deliberately coarse relative to the
 		// camera's solve jitter but fine relative to real geometry: this title's submitted
 		// scene spans ~6-8 world units, so 0.01 is ~0.15% of the scene.
+		// --- stable mesh identity -----------------------------------------------------------
+		//
+		// The legacy identity hashes the submitted positions, which are derived from the
+		// recovered camera. That mints a fresh handle for a static surface whenever the camera
+		// moves, so every BLAS is one-shot -- measured at 20/20 survival when instancing is
+		// switched off entirely against 1/20 with it on (SOCOM slot 2, phase 3k-3m).
+		//
+		// Quantizing the positions, which is what shipped, cannot fix it: rounding is not a
+		// stable function under noise. A vertex sitting near a bucket boundary flips buckets for
+		// an arbitrarily small perturbation, and with a hundred vertices per draw the chance that
+		// at least one flips is close to certain. Identity has to come from something that is
+		// exactly reproducible, with the geometry compared by a metric rather than hashed.
+		//
+		// So: key on what the guest emits bit-exactly (vertex and index counts, the index
+		// buffer, vertex colours, the material) plus a log-quantized size, then confirm the match
+		// by rigidly registering the candidate's stored geometry against the draw's.
+		//
+		//   0 = legacy position hashing (the default), 1 = stable identity.
+		//
+		// DEFAULTED OFF, and the reason is a measurement rather than caution. This was built to
+		// fix the device loss, on the phase-3m reading that the runtime cannot sustain instancing
+		// many one-shot BLASes. That reading is wrong -- see the pinned-pool arm in notes.md --
+		// and 20 launches on SOCOM slot 2 give 1/20 with it on against a 4/20 control in the same
+		// sitting. It does what it says (mesh creations fall ~2.6x on Rainbow Six 3, 80% of draws
+		// re-instance an existing handle) and it is what gives the runtime usable motion vectors,
+		// but it does not buy survival, and it has not been visually verified beyond "the scene
+		// still renders in the right place". Turn it on deliberately.
+		int stable_identity()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_STABLEID", 0), 0, 1));
+			return value;
+		}
+
+		// Registration residual, as a fraction of the draw's own radius of gyration, below which
+		// two point sets are called the same geometry. Relative rather than absolute because a
+		// draw may be a 0.1-unit decal or a 20-unit wall in the same frame, and because the
+		// un-projection's error scales with depth.
+		float identity_tolerance()
+		{
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_IDTOL");
+				if (env.empty())
+					return 0.02f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed > 0.f) ? parsed : 0.02f;
+			}();
+
+			return value;
+		}
+
+		// Open-addressing depth for the identity key. Two genuinely different objects can share
+		// counts, indices and colours -- untextured white vertex colours make that common -- so
+		// a key needs somewhere to put the loser instead of thrashing one entry.
+		u64 identity_slots()
+		{
+			static const u64 value = static_cast<u64>(
+				std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_IDSLOTS", 4), 1, 16));
+			return value;
+		}
+
+		// Whether vertex colours take part in the key. They come straight out of GSVertex and are
+		// bit-exact, but a title that recomputes per-vertex lighting or fog every frame would
+		// re-key everything through them. Kept as a handle for that case.
+		bool identity_use_color()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_IDCOLOR", 1) != 0;
+			return value;
+		}
+
 		float mesh_hash_quantum()
 		{
 			// Not env_float(): 0 is a meaningful value here (exact hashing) and env_float
@@ -1595,19 +1722,21 @@ namespace RemixSubmit
 			// age. Without this a burst of new geometry can outrun the age-based reap.
 			while (s_meshes.size() > mesh_live_cap())
 			{
-				auto oldest = s_meshes.begin();
+				// Pinned entries are skipped rather than selected-then-refused: with a pool of
+				// them, refusing on the single oldest would abandon the whole eviction pass and
+				// let the cache grow without bound.
+				auto oldest = s_meshes.end();
 				for (auto it = s_meshes.begin(); it != s_meshes.end(); ++it)
 				{
-					if (it->second.last_used_frame < oldest->second.last_used_frame)
+					if (it->second.handle == s_reuse_handle || s_pinned_hashes.count(it->first) != 0)
+						continue;
+
+					if (oldest == s_meshes.end() || it->second.last_used_frame < oldest->second.last_used_frame)
 						oldest = it;
 				}
 
-				if (oldest->second.handle == s_reuse_handle)
-				{
-					// Would dangle the handle every instance this frame points at.
-					oldest->second.last_used_frame = s_frame_counter;
-					break;
-				}
+				if (oldest == s_meshes.end())
+					break; // everything resident is pinned
 
 				if (oldest->second.handle)
 				{
@@ -1632,7 +1761,7 @@ namespace RemixSubmit
 					continue;
 				}
 
-				if (it->second.handle == s_reuse_handle)
+				if (it->second.handle == s_reuse_handle || s_pinned_hashes.count(it->first) != 0)
 				{
 					++it;
 					continue;
@@ -1745,7 +1874,8 @@ namespace RemixSubmit
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
-					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {}",
+					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
+					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -1760,7 +1890,9 @@ namespace RemixSubmit
 				s_stats.meshes_destroyed_peak, s_stats.skip_inst_budget,
 				(s_stats.distinct_instanced_frames > 0) ?
 					(s_stats.distinct_instanced_total / s_stats.distinct_instanced_frames) : 0,
-				s_stats.distinct_instanced_peak);
+				s_stats.distinct_instanced_peak, s_pool_hashes.size(),
+				stable_identity(), s_stats.id_reuse, s_stats.id_create, s_stats.id_rebuild,
+				s_stats.id_probe_collisions);
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -2014,6 +2146,13 @@ namespace RemixSubmit
 		float max_px = -std::numeric_limits<float>::max();
 		float min_py = std::numeric_limits<float>::max();
 		float max_py = -std::numeric_limits<float>::max();
+		// Recovered texture coordinates, S/Q and T/Q. A draw whose UV range has collapsed samples
+		// one texel and renders as a flat untextured surface whatever the texture contains, which
+		// by eye is indistinguishable from a broken palette decode.
+		float min_u = std::numeric_limits<float>::max();
+		float max_u = -std::numeric_limits<float>::max();
+		float min_v = std::numeric_limits<float>::max();
+		float max_v = -std::numeric_limits<float>::max();
 
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
@@ -2081,6 +2220,10 @@ namespace RemixSubmit
 			max_px = std::max(max_px, px);
 			min_py = std::min(min_py, py);
 			max_py = std::max(max_py, py);
+			min_u = std::min(min_u, out.texcoord[0]);
+			max_u = std::max(max_u, out.texcoord[0]);
+			min_v = std::min(min_v, out.texcoord[1]);
+			max_v = std::max(max_v, out.texcoord[1]);
 			min_z = std::min(min_z, static_cast<u32>(v.XYZ.Z));
 			max_z = std::max(max_z, static_cast<u32>(v.XYZ.Z));
 		}
@@ -2216,7 +2359,83 @@ namespace RemixSubmit
 
 		// --- mesh identity ------------------------------------------------------------------
 		u64 hash = fnv_seed;
+		const bool stable_id = (stable_identity() != 0);
 
+		// The draw's own frame of reference: centroid and radius of gyration. Both are averages
+		// over every vertex, so per-vertex un-projection jitter cancels in them to O(1/sqrt(N))
+		// -- which is exactly why they can carry identity where a per-vertex quantization cannot.
+		float centroid[3] = {0.f, 0.f, 0.f};
+		float draw_rms = 0.f;
+
+		if (stable_id)
+		{
+			double sum[3] = {0.0, 0.0, 0.0};
+
+			for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+			{
+				for (u32 k = 0; k < 3; ++k)
+					sum[k] += static_cast<double>(v.position[k]);
+			}
+
+			const double inv_count = 1.0 / static_cast<double>(s_scratch_vertices.size());
+			for (u32 k = 0; k < 3; ++k)
+				centroid[k] = static_cast<float>(sum[k] * inv_count);
+
+			double radius_sq = 0.0;
+			s_scratch_local.clear();
+			s_scratch_local.resize(s_scratch_vertices.size() * 3);
+
+			for (size_t i = 0; i < s_scratch_vertices.size(); ++i)
+			{
+				for (u32 k = 0; k < 3; ++k)
+				{
+					const float local = s_scratch_vertices[i].position[k] - centroid[k];
+					s_scratch_local[(i * 3) + k] = local;
+					radius_sq += static_cast<double>(local) * static_cast<double>(local);
+				}
+			}
+
+			draw_rms = static_cast<float>(std::sqrt(radius_sq * inv_count));
+
+			if (!std::isfinite(draw_rms) || !std::isfinite(centroid[0]) ||
+				!std::isfinite(centroid[1]) || !std::isfinite(centroid[2]))
+			{
+				++s_stats.skip_nonfinite;
+				return;
+			}
+		}
+
+		if (stable_id)
+		{
+			// Everything here is either an exact integer out of the guest's own vertex buffer or
+			// an average over the whole draw. Nothing derived from the recovered camera per
+			// vertex takes part, which is what makes the key survive camera motion.
+			hash = fnv_mix(hash, s_scratch_vertices.size());
+			hash = fnv_mix(hash, s_scratch_indices.size());
+
+			for (const u32 index : s_scratch_indices)
+				hash = fnv_mix(hash, index);
+
+			if (identity_use_color())
+			{
+				for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+					hash = fnv_mix(hash, v.color);
+			}
+
+			// Size, log-quantized at eight steps per octave (~9% resolution). A plain linear
+			// quantization would have the same boundary-flip problem as position hashing; a log
+			// scale keeps the relative resolution constant across a decal and a wall, and the
+			// quantity itself is an average, so it barely moves.
+			const float scale = (draw_rms > 1e-6f) ? (std::log2(draw_rms) * 8.f) : -1024.f;
+			hash = fnv_mix(hash, static_cast<u64>(static_cast<s64>(std::lround(scale))));
+
+			// Remix binds the material into the mesh at CreateMesh time, so two draws with
+			// identical geometry but different textures must not share a handle -- and a tag-list
+			// change has to re-key so the new material reaches live geometry.
+			hash = fnv_mix(hash, material.content_hash);
+			hash = fnv_mix(hash, remix_ps2::materials::generation());
+		}
+		else
 		{
 			// Positions are quantized *for hashing only* -- the submitted vertex data stays at
 			// full precision.
@@ -2286,12 +2505,33 @@ namespace RemixSubmit
 			return;
 		}
 
-		// Coincident-geometry dedupe. Every instance goes out with the identity transform, so a
-		// second instance of the same mesh hash in the same frame is literally the same
-		// triangles in the same place -- overdraw the guest needed for its own blending, and
-		// z-fighting once a path tracer gets hold of it. 81% of the logged draws in Rainbow Six
-		// 3 were coincident with an earlier one.
-		if (!s_frame_submitted_hashes.insert(hash).second)
+		// The registration tolerance, and the quantum the dedupe key measures position in. One
+		// number so that "close enough to be the same geometry" and "close enough to be the same
+		// placement" cannot disagree.
+		const float fit_tolerance =
+			std::max(identity_tolerance() * std::max(draw_rms, 1e-3f), 1e-5f);
+
+		// Coincident-geometry dedupe. A second draw with the same identity AND the same placement
+		// in the same frame is literally the same triangles in the same place -- overdraw the
+		// guest needed for its own blending, and z-fighting once a path tracer gets hold of it.
+		// 81% of the logged draws in Rainbow Six 3 were coincident with an earlier one.
+		//
+		// The placement has to be part of this key under stable identity: two copies of one
+		// object share a mesh handle by design, and dropping the second would delete it from the
+		// scene. The legacy path hashed positions, so its key already carried the placement.
+		u64 dedupe_key = hash;
+
+		if (stable_id)
+		{
+			const float inv_quantum = 1.0f / fit_tolerance;
+			for (u32 k = 0; k < 3; ++k)
+			{
+				dedupe_key = fnv_mix(dedupe_key,
+					static_cast<u64>(static_cast<s64>(std::lround(centroid[k] * inv_quantum))));
+			}
+		}
+
+		if (!s_frame_submitted_hashes.insert(dedupe_key).second)
 		{
 			++s_stats.skip_coincident;
 			return;
@@ -2299,7 +2539,106 @@ namespace RemixSubmit
 
 		const remixapi_Interface& api = s_remix.api();
 
-		auto it = s_meshes.find(hash);
+		// --- claim a slot ---------------------------------------------------------------------
+		// Open addressing over identity_slots() keys. The first slot whose stored geometry
+		// rigidly registers onto this draw wins; the first empty slot takes a new mesh; and if
+		// every slot is occupied by geometry that does not fit, the best of them is used for this
+		// frame and flagged to be rebuilt at the frame boundary. Never destroyed here: an
+		// instance submitted earlier in this frame may already reference the handle.
+		auto it = s_meshes.end();
+		remixapi_Transform placement = s_identity_transform;
+
+		if (stable_id)
+		{
+			const u64 slots = identity_slots();
+			u64 probe = hash;
+			auto fallback = s_meshes.end();
+			u64 fallback_key = hash;
+			float fallback_residual = std::numeric_limits<float>::max();
+			float fallback_rotation[3][3] = {{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}};
+			bool matched = false;
+			bool empty_slot = false;
+
+			for (u64 slot = 0; slot < slots; ++slot)
+			{
+				auto candidate = s_meshes.find(probe);
+
+				if (candidate == s_meshes.end())
+				{
+					hash = probe;
+					empty_slot = true;
+					break;
+				}
+
+				float rotation[3][3] = {{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}};
+				float residual = std::numeric_limits<float>::max();
+
+				if (candidate->second.local.size() == s_scratch_local.size() &&
+					!candidate->second.rebuild_pending)
+				{
+					remix_ps2::kabsch_rotation(candidate->second.local.data(), s_scratch_local.data(),
+						s_scratch_vertices.size(), rotation);
+					residual = remix_ps2::rigid_residual(candidate->second.local.data(),
+						s_scratch_local.data(), s_scratch_vertices.size(), rotation);
+				}
+
+				if (residual <= fit_tolerance)
+				{
+					hash = probe;
+					it = candidate;
+					matched = true;
+					s_stats.id_probe_collisions += slot;
+					for (u32 i = 0; i < 3; ++i)
+					{
+						for (u32 j = 0; j < 3; ++j)
+							placement.matrix[i][j] = rotation[i][j];
+					}
+
+					break;
+				}
+
+				if (residual < fallback_residual)
+				{
+					fallback_residual = residual;
+					fallback = candidate;
+					fallback_key = probe;
+					std::memcpy(fallback_rotation, rotation, sizeof(rotation));
+				}
+
+				// Next slot. A different constant from fnv_mix's own so a slot chain cannot walk
+				// onto another key's first slot for a trivial reason.
+				probe = fnv_mix(probe, 0x9E3779B97F4A7C15ULL);
+			}
+
+			if (matched)
+			{
+				++s_stats.id_reuse;
+			}
+			else if (!empty_slot && fallback != s_meshes.end())
+			{
+				// Every slot is occupied by geometry that does not fit: a real key collision, or
+				// an object that is deforming rather than moving rigidly. Use the closest one for
+				// this frame and rebuild it at the frame boundary.
+				it = fallback;
+				hash = fallback_key;
+				it->second.rebuild_pending = true;
+				++s_stats.id_rebuild;
+
+				for (u32 i = 0; i < 3; ++i)
+				{
+					for (u32 j = 0; j < 3; ++j)
+						placement.matrix[i][j] = fallback_rotation[i][j];
+				}
+			}
+
+			placement.matrix[0][3] = centroid[0];
+			placement.matrix[1][3] = centroid[1];
+			placement.matrix[2][3] = centroid[2];
+		}
+		else
+		{
+			it = s_meshes.find(hash);
+		}
 
 		if (it == s_meshes.end())
 		{
@@ -2312,6 +2651,19 @@ namespace RemixSubmit
 			{
 				++s_stats.skip_mesh_budget;
 				return;
+			}
+
+			// Under stable identity the mesh is uploaded in its own local frame -- positions
+			// relative to the draw's centroid -- and placed by the instance transform. That is
+			// what lets the same handle serve the object again next frame from a moved camera:
+			// the BLAS holds a shape, not a location.
+			if (stable_id)
+			{
+				for (size_t i = 0; i < s_scratch_vertices.size(); ++i)
+				{
+					for (u32 k = 0; k < 3; ++k)
+						s_scratch_vertices[i].position[k] = s_scratch_local[(i * 3) + k];
+				}
 			}
 
 			remixapi_MeshInfoSurfaceTriangles surface{};
@@ -2344,6 +2696,23 @@ namespace RemixSubmit
 			++s_stats.meshes_created;
 			++s_stats.meshes_created_frame;
 			it = s_meshes.emplace(hash, mesh_entry{handle, s_frame_counter}).first;
+
+			if (stable_id)
+			{
+				++s_stats.id_create;
+				it->second.local = s_scratch_local;
+				// The mesh was uploaded in local space, so the identity rotation is exactly
+				// right for the frame that created it.
+				placement.matrix[0][3] = centroid[0];
+				placement.matrix[1][3] = centroid[1];
+				placement.matrix[2][3] = centroid[2];
+			}
+
+			if (const u64 pool = reuse_pool_size(); pool != 0 && s_pool_hashes.size() < pool)
+			{
+				s_pool_hashes.push_back(hash);
+				s_pinned_hashes.insert(hash);
+			}
 		}
 
 		it->second.last_used_frame = s_frame_counter;
@@ -2429,13 +2798,22 @@ namespace RemixSubmit
 
 			instance.mesh = s_reuse_handle;
 		}
+		else if (!s_pool_hashes.empty())
+		{
+			// Round-robin over the pinned pool, so a frame that draws N times references
+			// min(N, pool) distinct long-lived handles instead of N fresh ones.
+			const u64 index = s_submitted_this_frame % s_pool_hashes.size();
+			const auto pooled = s_meshes.find(s_pool_hashes[index]);
+			instance.mesh = (pooled != s_meshes.end()) ? pooled->second.handle : it->second.handle;
+		}
 		else
 		{
 			instance.mesh = it->second.handle;
 		}
-		// Identity: the positions are already in the submitted camera's space. Per-draw world
-		// transforms are phase 2.
-		instance.transform = s_identity_transform;
+		// Under stable identity this is the rigid placement recovered by registering the stored
+		// mesh onto this draw; on the legacy path the positions are already in the submitted
+		// camera's space and the transform is the identity.
+		instance.transform = stable_id ? placement : s_identity_transform;
 		instance.doubleSided = 1;
 
 		const u64 inst_budget = instance_budget();
@@ -2462,6 +2840,8 @@ namespace RemixSubmit
 			return;
 		}
 
+		s_frame_instanced_keys.insert(hash);
+
 		if (is_sky)
 			++s_stats.sky_tagged;
 
@@ -2474,7 +2854,8 @@ namespace RemixSubmit
 				"f={} d={} verts={} tris={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
 				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
 				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
-				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | mat={:016X}",
+				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
+				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
 				s_frame_counter, s_submitted_this_frame, vertex_count, s_scratch_indices.size() / 3,
 				is_sky ? 1 : 0,
 				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),
@@ -2490,7 +2871,8 @@ namespace RemixSubmit
 				static_cast<u32>(r.m_cached_ctx.TEX0.TFX),
 				(source && (source->m_target || source->m_from_target)) ? 1 : 0,
 				min_w, max_w, min_z, max_z, min_px, max_px, min_py, max_py,
-				rt_unscaled_width, rt_unscaled_height, material.content_hash));
+				rt_unscaled_width, rt_unscaled_height, min_u, max_u, min_v, max_v,
+				material.content_hash));
 		}
 
 		// Only now that the draw is committed does its extent count towards the frame's, and
@@ -2583,9 +2965,9 @@ namespace RemixSubmit
 		s_stats.meshes_destroyed_peak = std::max(s_stats.meshes_destroyed_peak, s_stats.meshes_destroyed_frame);
 		s_stats.meshes_destroyed_frame = 0;
 
-		if (!s_frame_submitted_hashes.empty())
+		if (!s_frame_instanced_keys.empty())
 		{
-			const u64 distinct = s_frame_submitted_hashes.size();
+			const u64 distinct = s_frame_instanced_keys.size();
 			s_stats.distinct_instanced_peak = std::max(s_stats.distinct_instanced_peak, distinct);
 			s_stats.distinct_instanced_total += distinct;
 			++s_stats.distinct_instanced_frames;
@@ -2594,6 +2976,28 @@ namespace RemixSubmit
 		++s_frame_counter;
 		s_submitted_this_frame = 0;
 		s_frame_submitted_hashes.clear();
+		s_frame_instanced_keys.clear();
+
+		// Entries a draw claimed but could not fit. Dropped here, at the frame boundary, so the
+		// handle is only destroyed once nothing in flight references it; the next frame's draw
+		// finds the slot empty and rebuilds it from current geometry.
+		for (auto it = s_meshes.begin(); it != s_meshes.end();)
+		{
+			if (!it->second.rebuild_pending)
+			{
+				++it;
+				continue;
+			}
+
+			if (it->second.handle)
+			{
+				remix_ps2::guarded_destroy_mesh(s_remix.api().DestroyMesh, it->second.handle);
+				++s_stats.meshes_destroyed;
+				++s_stats.meshes_destroyed_frame;
+			}
+
+			it = s_meshes.erase(it);
+		}
 
 		// Meshes first, then materials: a live mesh holds the material handle Remix bound into
 		// it at CreateMesh time, so releasing a material before the meshes referencing it would
@@ -2655,6 +3059,10 @@ namespace RemixSubmit
 		s_meshes.clear();
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
+		s_frame_instanced_keys.clear();
+		s_reuse_handle = nullptr;
+		s_pool_hashes.clear();
+		s_pinned_hashes.clear();
 
 		// Materials are content-keyed, so they survive a load by construction -- the same
 		// texture bytes produce the same hash. Only the per-frame budget is reset, which is
@@ -2700,7 +3108,10 @@ namespace RemixSubmit
 		s_meshes.clear();
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
+		s_frame_instanced_keys.clear();
 		s_reuse_handle = nullptr;
+		s_pool_hashes.clear();
+		s_pinned_hashes.clear();
 
 		if (s_debug_mesh)
 		{

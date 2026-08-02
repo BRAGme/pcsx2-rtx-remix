@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <utility>
 
 // Ported from rpcs3/Emu/RSX/Remix/RemixTransforms.cpp (branch remix-backend). Only the
@@ -638,6 +639,179 @@ namespace remix_ps2
 		}
 
 		return false;
+	}
+
+	bool kabsch_rotation(const float* a, const float* b, size_t count, float (&out)[3][3])
+	{
+		for (u32 i = 0; i < 3; ++i)
+		{
+			for (u32 j = 0; j < 3; ++j)
+				out[i][j] = (i == j) ? 1.f : 0.f;
+		}
+
+		if (!a || !b || count == 0)
+			return false;
+
+		// Cross-covariance S[j][k] = sum a_j * b_k, accumulated in double: the point sets are
+		// offsets from a centroid that may itself be thousands of units from the origin, so the
+		// summands span a wide range and float accumulation loses the small terms first.
+		double s[3][3] = {};
+
+		for (size_t i = 0; i < count; ++i)
+		{
+			const float* const pa = a + (i * 3);
+			const float* const pb = b + (i * 3);
+
+			for (u32 j = 0; j < 3; ++j)
+			{
+				for (u32 k = 0; k < 3; ++k)
+					s[j][k] += static_cast<double>(pa[j]) * static_cast<double>(pb[k]);
+			}
+		}
+
+		for (u32 j = 0; j < 3; ++j)
+		{
+			for (u32 k = 0; k < 3; ++k)
+			{
+				if (!std::isfinite(s[j][k]))
+					return false;
+			}
+		}
+
+		// Horn 1987, eq. (39): the quaternion rotating a into b is the eigenvector of the
+		// largest eigenvalue of this symmetric 4x4.
+		double n[4][4];
+		n[0][0] = s[0][0] + s[1][1] + s[2][2];
+		n[1][1] = s[0][0] - s[1][1] - s[2][2];
+		n[2][2] = -s[0][0] + s[1][1] - s[2][2];
+		n[3][3] = -s[0][0] - s[1][1] + s[2][2];
+		n[0][1] = n[1][0] = s[1][2] - s[2][1];
+		n[0][2] = n[2][0] = s[2][0] - s[0][2];
+		n[0][3] = n[3][0] = s[0][1] - s[1][0];
+		n[1][2] = n[2][1] = s[0][1] + s[1][0];
+		n[1][3] = n[3][1] = s[2][0] + s[0][2];
+		n[2][3] = n[3][2] = s[1][2] + s[2][1];
+
+		// Cyclic Jacobi. A 4x4 symmetric eigenproblem converges in a handful of sweeps and
+		// needs no pivoting or deflation; the accumulated 'v' holds the eigenvectors.
+		double v[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+
+		for (u32 sweep = 0; sweep < 24; ++sweep)
+		{
+			double off = 0.0;
+			for (u32 p = 0; p < 4; ++p)
+			{
+				for (u32 q = p + 1; q < 4; ++q)
+					off += n[p][q] * n[p][q];
+			}
+
+			if (off < 1e-24)
+				break;
+
+			for (u32 p = 0; p < 3; ++p)
+			{
+				for (u32 q = p + 1; q < 4; ++q)
+				{
+					if (std::abs(n[p][q]) < 1e-30)
+						continue;
+
+					const double theta = (n[q][q] - n[p][p]) / (2.0 * n[p][q]);
+					const double sign = (theta >= 0.0) ? 1.0 : -1.0;
+					const double t = sign / (std::abs(theta) + std::sqrt((theta * theta) + 1.0));
+					const double c = 1.0 / std::sqrt((t * t) + 1.0);
+					const double s_rot = t * c;
+
+					for (u32 k = 0; k < 4; ++k)
+					{
+						const double nkp = n[k][p];
+						const double nkq = n[k][q];
+						n[k][p] = (c * nkp) - (s_rot * nkq);
+						n[k][q] = (s_rot * nkp) + (c * nkq);
+					}
+
+					for (u32 k = 0; k < 4; ++k)
+					{
+						const double npk = n[p][k];
+						const double nqk = n[q][k];
+						n[p][k] = (c * npk) - (s_rot * nqk);
+						n[q][k] = (s_rot * npk) + (c * nqk);
+					}
+
+					for (u32 k = 0; k < 4; ++k)
+					{
+						const double vkp = v[k][p];
+						const double vkq = v[k][q];
+						v[k][p] = (c * vkp) - (s_rot * vkq);
+						v[k][q] = (s_rot * vkp) + (c * vkq);
+					}
+				}
+			}
+		}
+
+		u32 best = 0;
+		for (u32 i = 1; i < 4; ++i)
+		{
+			if (n[i][i] > n[best][best])
+				best = i;
+		}
+
+		double q[4] = {v[0][best], v[1][best], v[2][best], v[3][best]};
+		const double norm = std::sqrt((q[0] * q[0]) + (q[1] * q[1]) + (q[2] * q[2]) + (q[3] * q[3]));
+
+		if (!(norm > 1e-12) || !std::isfinite(norm))
+			return false; // identity is already in 'out'
+
+		for (double& value : q)
+			value /= norm;
+
+		const double w = q[0], x = q[1], y = q[2], z = q[3];
+
+		out[0][0] = static_cast<float>((w * w) + (x * x) - (y * y) - (z * z));
+		out[0][1] = static_cast<float>(2.0 * ((x * y) - (w * z)));
+		out[0][2] = static_cast<float>(2.0 * ((x * z) + (w * y)));
+		out[1][0] = static_cast<float>(2.0 * ((y * x) + (w * z)));
+		out[1][1] = static_cast<float>((w * w) - (x * x) + (y * y) - (z * z));
+		out[1][2] = static_cast<float>(2.0 * ((y * z) - (w * x)));
+		out[2][0] = static_cast<float>(2.0 * ((z * x) - (w * y)));
+		out[2][1] = static_cast<float>(2.0 * ((z * y) + (w * x)));
+		out[2][2] = static_cast<float>((w * w) - (x * x) - (y * y) + (z * z));
+
+		for (u32 i = 0; i < 3; ++i)
+		{
+			for (u32 j = 0; j < 3; ++j)
+			{
+				if (!std::isfinite(out[i][j]))
+					return false;
+			}
+		}
+
+		return true;
+	}
+
+	float rigid_residual(const float* a, const float* b, size_t count, const float (&rotation)[3][3])
+	{
+		if (!a || !b || count == 0)
+			return 0.f;
+
+		double sum = 0.0;
+
+		for (size_t i = 0; i < count; ++i)
+		{
+			const float* const pa = a + (i * 3);
+			const float* const pb = b + (i * 3);
+
+			for (u32 j = 0; j < 3; ++j)
+			{
+				const double mapped = (static_cast<double>(rotation[j][0]) * pa[0]) +
+				                      (static_cast<double>(rotation[j][1]) * pa[1]) +
+				                      (static_cast<double>(rotation[j][2]) * pa[2]);
+				const double d = mapped - static_cast<double>(pb[j]);
+				sum += d * d;
+			}
+		}
+
+		const double rms = std::sqrt(sum / static_cast<double>(count));
+		return std::isfinite(rms) ? static_cast<float>(rms) : std::numeric_limits<float>::max();
 	}
 
 	std::string format_matrix(const mat4& m)

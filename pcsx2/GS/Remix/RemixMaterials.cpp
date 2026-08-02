@@ -16,6 +16,7 @@
 #include "fmt/format.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -1047,13 +1048,44 @@ namespace remix_ps2::materials
 
 				const double mean_sat = (texels > 0) ? (sat_sum / static_cast<double>(texels)) : 0.0;
 
+				// Spatial detail, which the mean and the saturation cannot see: a flat white
+				// block and a photograph of concrete can have identical means. 'std' is the RMS
+				// deviation of luminance from the mean over the whole image, 'uniq' the number of
+				// distinct texel values (capped). A palette-decode failure shows as std ~0 and
+				// uniq 1; a correctly decoded 4-bit texture cannot have more than 16 distinct
+				// values, so uniq also says whether the CLUT width was honoured.
+				double var_sum = 0.0;
+				const double mean_luma =
+					(0.299 * mean_r) + (0.587 * mean_g) + (0.114 * mean_b);
+				std::unordered_set<u32> distinct;
+
+				for (size_t i = 0; i < texels; ++i)
+				{
+					const u32 b = entry.pixels[(i * 4) + 0];
+					const u32 g = entry.pixels[(i * 4) + 1];
+					const u32 r = entry.pixels[(i * 4) + 2];
+					const double luma = (0.299 * r) + (0.587 * g) + (0.114 * b);
+					var_sum += (luma - mean_luma) * (luma - mean_luma);
+
+					if (distinct.size() < 4096)
+					{
+						u32 packed;
+						std::memcpy(&packed, &entry.pixels[i * 4], sizeof(packed));
+						distinct.insert(packed);
+					}
+				}
+
+				const double std_dev = (texels > 0) ? std::sqrt(var_sum / static_cast<double>(texels)) : 0.0;
+
 				const std::string line = fmt::format(
 					"Remix tex={:016X} {}x{} psm=0x{:02x} tw={} th={} tbp0=0x{:04x} tbw={} pal={} "
-					"tex0hash={:016x} cluthash={:016x} region={}x{} meanRGB=({},{},{}) sat={:.3f}",
+					"tex0hash={:016x} cluthash={:016x} region={}x{} meanRGB=({},{},{}) sat={:.3f} "
+					"std={:.1f} uniq={}",
 					content_hash, entry.width, entry.height, static_cast<u32>(TEX0.PSM),
 					static_cast<u32>(TEX0.TW), static_cast<u32>(TEX0.TH), static_cast<u32>(TEX0.TBP0),
 					static_cast<u32>(TEX0.TBW), static_cast<u32>(psm.pal), key.TEX0Hash, key.CLUTHash,
-					key.region_width, key.region_height, mean_r, mean_g, mean_b, mean_sat);
+					key.region_width, key.region_height, mean_r, mean_g, mean_b, mean_sat,
+					std_dev, distinct.size());
 
 				INFO_LOG("{}", line);
 				dump_write(line);

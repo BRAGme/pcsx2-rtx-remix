@@ -137,6 +137,25 @@ namespace remix_ps2
 	// camera (same fov/aspect/near/far) expects to see.
 	mat4 make_perspective(float fov_y_degrees, float aspect, float near_plane, float far_plane);
 
+	// ---------------------------------------------------------------------------------------
+	// Rigid registration (Kabsch), used for stable mesh identity
+	// ---------------------------------------------------------------------------------------
+	//
+	// Finds the proper rotation R minimising sum |R*a_i - b_i|^2 for two mean-centred point
+	// sets, and reports the residual. Horn's unit-quaternion method: build the 4x4 symmetric
+	// matrix from the cross-covariance and take the eigenvector of its largest eigenvalue by
+	// Jacobi rotation. Chosen over an SVD because it yields a proper rotation by construction
+	// (no reflection to detect and undo) and stays well defined for the coplanar and collinear
+	// point sets that dominate real geometry -- walls, floors and billboards are all rank 2.
+	//
+	// 'a' and 'b' are 3*count floats, both already relative to their own centroid. 'out' is
+	// row-major R[i][j] with b ~= R*a. Returns false only if the input is empty or non-finite.
+	bool kabsch_rotation(const float* a, const float* b, size_t count, float (&out)[3][3]);
+
+	// RMS of |R*a_i - b_i| over the set. Reported separately from the solve so a caller can
+	// decide what residual means "the same object moved" versus "a different object".
+	float rigid_residual(const float* a, const float* b, size_t count, const float (&rotation)[3][3]);
+
 	// Debug helper: "[a b c d | e f g h | ...]"
 	std::string format_matrix(const mat4& m);
 
