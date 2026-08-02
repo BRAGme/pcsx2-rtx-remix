@@ -112,6 +112,13 @@ namespace RemixSubmit
 			u64 sky_tagged = 0; // instances categorised REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
 			u64 cutout_tagged = 0; // instances categorised ALPHA_BLEND_TO_CUTOUT
 			u64 skip_submit_delay = 0; // withheld by PCSX2_REMIX_SUBMITDELAY
+			u64 skip_inst_budget = 0; // over the per-frame DrawInstance budget
+			// Evictions per frame. A mesh cache pegged at its ceiling churns its *live set*
+			// even when the geometry is static, so instances can reference handles the LRU is
+			// reaping in the same frame -- a lifetime problem that would masquerade as a rate
+			// effect under an instance cap. These tell the two apart.
+			u64 meshes_destroyed_frame = 0;
+			u64 meshes_destroyed_peak = 0;
 			u64 degenerate_triangles = 0; // zero-area triangles dropped before CreateMesh
 			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
@@ -491,6 +498,15 @@ namespace RemixSubmit
 		// Splits the fault across the one boundary nothing has tested -- acceleration-structure
 		// build from the geometry, versus instance/TLAS submission and everything the runtime
 		// does with it per frame.
+		// Ceiling on DrawInstance calls per frame; 0 = unlimited. Bisects instancing *volume*
+		// against instancing *content* without needing a hypothesis about either.
+		u64 instance_budget()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_INSTBUDGET", 0)));
+			return value;
+		}
+
 		bool no_draw_instance()
 		{
 			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_NODRAWINSTANCE", 0) != 0;
@@ -1562,6 +1578,7 @@ namespace RemixSubmit
 				{
 					remix_ps2::guarded_destroy_mesh(api.DestroyMesh, oldest->second.handle);
 					++s_stats.meshes_destroyed;
+					++s_stats.meshes_destroyed_frame;
 				}
 
 				s_meshes.erase(oldest);
@@ -1584,6 +1601,7 @@ namespace RemixSubmit
 				{
 					remix_ps2::guarded_destroy_mesh(api.DestroyMesh, it->second.handle);
 					++s_stats.meshes_destroyed;
+					++s_stats.meshes_destroyed_frame;
 				}
 
 				it = s_meshes.erase(it);
@@ -1686,7 +1704,7 @@ namespace RemixSubmit
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
-					 "mesh/frame peak {}",
+					 "mesh/frame peak +{} -{} | instbudget-skip {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -1697,7 +1715,8 @@ namespace RemixSubmit
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
-				s_stats.skip_all_degenerate, s_stats.meshes_created_peak);
+				s_stats.skip_all_degenerate, s_stats.meshes_created_peak,
+				s_stats.meshes_destroyed_peak, s_stats.skip_inst_budget);
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -2363,6 +2382,13 @@ namespace RemixSubmit
 		instance.transform = s_identity_transform;
 		instance.doubleSided = 1;
 
+		const u64 inst_budget = instance_budget();
+		if (inst_budget != 0 && s_submitted_this_frame >= inst_budget)
+		{
+			++s_stats.skip_inst_budget;
+			return;
+		}
+
 		if (no_draw_instance())
 		{
 			// The mesh was created and is resident; nothing is instanced. Counted as submitted
@@ -2498,6 +2524,8 @@ namespace RemixSubmit
 
 		s_stats.meshes_created_peak = std::max(s_stats.meshes_created_peak, s_stats.meshes_created_frame);
 		s_stats.meshes_created_frame = 0;
+		s_stats.meshes_destroyed_peak = std::max(s_stats.meshes_destroyed_peak, s_stats.meshes_destroyed_frame);
+		s_stats.meshes_destroyed_frame = 0;
 
 		++s_frame_counter;
 		s_submitted_this_frame = 0;
