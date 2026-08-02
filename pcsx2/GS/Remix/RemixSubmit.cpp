@@ -452,12 +452,26 @@ namespace RemixSubmit
 			return std::max(near_plane * 4096.f, 100000.f);
 		}
 
+		// The ceiling on a submitted world position. This is a ray-tracing constraint, not a
+		// correctness one: a triangle thousands of units across sitting beside one a few units
+		// across collapses float precision in the BVH, and the GPU can take long enough on the
+		// resulting acceleration structure to trip the driver watchdog -- surfacing as
+		// VK_ERROR_DEVICE_LOST and dxvk-remix calling exit(). Derived from the far plane by
+		// default, but overridable so the usable range can be bisected without a rebuild.
 		float max_position_magnitude()
 		{
-			static const float value =
-				std::max(world_far_plane(world_near_plane()), remix_ps2::hardcoded_far_plane()) * 4.f;
+			static const float value = []() -> float {
+				const float derived =
+					std::max(world_far_plane(world_near_plane()), remix_ps2::hardcoded_far_plane()) * 4.f;
+				return env_float(L"PCSX2_REMIX_POSLIMIT", derived);
+			}();
+
 			return value;
 		}
+
+		// Largest |position| actually submitted this frame, so the ceiling can be set from a
+		// measurement rather than a guess.
+		float s_max_seen_position = 0.f;
 
 		u64 hash_floats(const float* values, u32 count)
 		{
@@ -969,13 +983,14 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} | warn stq {} | cam world {} fallback {}",
+					 "nonfinite {} poisoned {} | warn stq {} | cam world {} fallback {} | maxpos {:.0f}/{:.0f}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
 				s_stats.skip_const_q, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
-				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback);
+				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
+				s_max_seen_position, max_position_magnitude());
 
 			// Second line: the world anchor. Every stage of the pipeline is separately
 			// visible, so a null result names the stage that produced it -- no kicks, no
@@ -1224,6 +1239,9 @@ namespace RemixSubmit
 				++s_stats.skip_nonfinite;
 				return;
 			}
+
+			s_max_seen_position = std::max({s_max_seen_position, std::abs(out.position[0]),
+				std::abs(out.position[1]), std::abs(out.position[2])});
 		}
 
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
