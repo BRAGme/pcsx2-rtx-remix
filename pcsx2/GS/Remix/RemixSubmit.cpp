@@ -135,6 +135,15 @@ namespace RemixSubmit
 			u64 id_create = 0;
 			u64 id_rebuild = 0;
 			u64 id_probe_collisions = 0; // slots stepped over before a fit was found
+			// Frame batching. 'groups' is the load-bearing one: it is how many distinct meshes a
+			// batched frame references, and the survival dose-response is a function of exactly
+			// that number.
+			u64 batch_groups_peak = 0;
+			u64 batch_groups_total = 0;
+			u64 batch_frames = 0;
+			u64 batch_surfaces_peak = 0;
+			u64 batch_meshes_created = 0;
+			u64 batch_vertices_peak = 0;
 			u64 degenerate_triangles = 0; // zero-area triangles dropped before CreateMesh
 			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
@@ -255,6 +264,76 @@ namespace RemixSubmit
 
 		// Current draw's positions relative to their own centroid, reused across draws.
 		std::vector<float> s_scratch_local;
+
+		// --- frame batching -------------------------------------------------------------------
+		//
+		// The only quantity that has ever moved survival on the device loss is the number of
+		// DISTINCT MESHES a frame references: 0-1 gives 20/20, 5 gives 7/20, ~190-850 gives 1-4/20
+		// (SOCOM slot 2, 20 launches per arm). Handle age does not matter -- 850 pinned long-lived
+		// handles is 2/20 -- nor does BLAS routing or opacity micromaps. So the thing to attack is
+		// the count itself.
+		//
+		// remixapi_MeshInfo takes an array of surfaces, each with its own material, so a whole
+		// frame's geometry can go into a handful of meshes instead of hundreds. What it CANNOT
+		// share is the instance: remixapi_InstanceInfoBlendEXT and categoryFlags hang off
+		// remixapi_InstanceInfo, not off the surface. So draws are grouped by exactly those two,
+		// and it is the GROUP count -- not the draw count -- that decides whether this reaches the
+		// safe operating point at all. That number is in the counter block.
+		struct batch_surface
+		{
+			u64 material_hash = 0;
+			remixapi_MaterialHandle material = nullptr;
+			std::vector<remixapi_HardcodedVertex> vertices;
+			std::vector<u32> indices;
+		};
+
+		struct batch_group
+		{
+			remixapi_InstanceInfoBlendEXT blend{};
+			remixapi_InstanceCategoryFlags categories = 0;
+			std::unordered_map<u64, size_t> surface_of_material;
+			std::vector<batch_surface> surfaces;
+			size_t surfaces_used = 0;
+		};
+
+		// Kept allocated across frames and cleared rather than destroyed -- a frame's worth of
+		// geometry is tens of thousands of vertices and reallocating it every frame on the GS
+		// thread would be its own problem.
+		std::vector<batch_group> s_batch_groups;
+		std::unordered_map<u64, size_t> s_batch_group_of_key;
+		size_t s_batch_groups_used = 0;
+
+		// Meshes built by the flush, with the frame they were created in. Batched geometry is
+		// derived from the camera, so it is new every frame and these are one-shot by nature --
+		// which is fine, because mesh creation on its own survives 20/20 (phase 3k). They are
+		// retained for a couple of frames before release so the runtime is never handed a
+		// destroyed handle it might still be reading.
+		struct batch_mesh
+		{
+			remixapi_MeshHandle handle = nullptr;
+			u64 created_frame = 0;
+		};
+
+		std::vector<batch_mesh> s_batch_meshes;
+		std::vector<remixapi_MeshInfoSurfaceTriangles> s_batch_surface_scratch;
+
+		// Distinct (blend state, category) groups seen this frame, counted even when batching is
+		// off so the feasibility question can be answered without turning it on.
+		std::unordered_set<u64> s_frame_group_keys;
+
+		int batch_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_BATCH", 0), 0, 1));
+			return value;
+		}
+
+		u64 batch_retain_frames()
+		{
+			static const u64 value =
+				static_cast<u64>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_BATCHRETAIN", 3), 1, 60));
+			return value;
+		}
 
 		// Matrices already written to the PCSX2_REMIX_DUMP file, so the diagnostic stays one
 		// line per distinct matrix rather than one per frame per matrix.
@@ -1864,6 +1943,319 @@ namespace RemixSubmit
 			std::fflush(file);
 		}
 
+		// The GS register state a draw's instance-side properties are derived from, passed by value:
+		// GSRendererHW's members are private and RemixSubmit::OnDrawPrims is its only declared friend
+		// (GSRendererHW.h:37), so a namespace-scope helper cannot read them itself.
+		struct draw_regs
+		{
+			bool depth_read = false;
+			bool depth_write = false;
+			u32 ate = 0;
+			u32 atst = 0;
+			u32 aref = 0;
+			u32 abe = 0;
+			u32 tfx = 0;
+			GIFRegALPHA alpha{};
+		};
+
+		// Everything about a draw that lives on the *instance* rather than the mesh: the blend and
+		// alpha-test state Remix takes from InstanceInfoBlendEXT, and the category flags. Pulled
+		// out of OnDrawPrims because frame batching has to know it before it can decide which batch
+		// a draw belongs to -- draws that disagree on any of it cannot share an instance.
+		struct draw_state
+		{
+			remixapi_InstanceInfoBlendEXT blend{};
+			remixapi_InstanceCategoryFlags categories = 0;
+			bool is_sky = false;
+			bool is_cutout = false;
+		};
+
+		draw_state build_draw_state(const draw_regs& regs, u64 material_hash, u64 draw_ordinal)
+		{
+			const bool depth_read = regs.depth_read;
+			const bool depth_write = regs.depth_write;
+			const bool is_sky = classify_sky(depth_read, depth_write, draw_ordinal);
+
+			// The user's own tags, from the Remix conf layers. dxvk-remix only applies its hash
+			// lists on the native D3D9 path (setupCategoriesForTexture, rtx_types.cpp:348, whose one
+			// caller is d3d9_rtx.cpp:1064); an API instance's categories come solely from this
+			// field (rtx_remix_api.cpp:803). So a tag made in the developer menu does nothing at all
+			// unless we look it up ourselves and OR it in here.
+			const remixapi_InstanceCategoryFlags tagged = remix_ps2::materials::categories_for(material_hash);
+
+			remixapi_InstanceInfoBlendEXT blend{};
+			blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+			blend.pNext = nullptr;
+			blend.alphaTestEnabled = regs.ate ? 1 : 0;
+			blend.alphaTestReferenceValue = static_cast<u8>(regs.aref);
+			blend.alphaTestCompareOp = to_d3d_compare(regs.atst);
+			blend.alphaBlendEnabled = regs.abe ? 1 : 0;
+			to_d3d_blend(regs.alpha, blend.srcColorBlendFactor, blend.dstColorBlendFactor);
+			blend.colorBlendOp = 1; // D3DBLENDOP_ADD
+			blend.srcAlphaBlendFactor = blend.srcColorBlendFactor;
+			blend.dstAlphaBlendFactor = blend.dstColorBlendFactor;
+			blend.alphaBlendOp = 1;
+			// TFX: MODULATE 0, DECAL 1, HIGHLIGHT 2, HIGHLIGHT2 3. Only the first two are
+			// expressible as a fixed-function stage; the highlight modes degrade to modulate.
+			//
+			// PCSX2_REMIX_TEXSTAGE gates this separately from the blend fields so colour can be
+			// chased without giving up the alpha-state fix. 0 leaves the fields zeroed for the
+			// runtime's own default, 1 derives them from TFX.
+			//
+			// MEASURED on Rainbow Six 3 (-state 9), identical scene, PrintWindow capture, pixels
+			// with max channel > 12 counted as lit:
+			//   TEXSTAGE=1 (derived): lit 2,468,536  mean sat 0.0918  coloured 12.79% of lit
+			//   TEXSTAGE=0 (zeroed):  lit 1,110,107  mean sat 0.0545  coloured  3.72% of lit
+			// Sending the derived stage gives 3.4x the coloured pixels and 2.2x the lit area, so
+			// these fields are NOT the "colour is missing" regression -- they are carrying the
+			// texture's contribution and zeroing them is what removes it. Default 1.
+			if (texture_stage_mode() != 0)
+			{
+				const bool decal = (regs.tfx == 1);
+				blend.textureColorArg1Source = 2; // D3DTA_TEXTURE
+				blend.textureColorArg2Source = 0; // D3DTA_DIFFUSE
+				blend.textureColorOperation = decal ? 2u : 4u; // SELECTARG1 : MODULATE
+				blend.textureAlphaArg1Source = 2;
+				blend.textureAlphaArg2Source = 0;
+				blend.textureAlphaOperation = decal ? 2u : 4u;
+			}
+			blend.tFactor = 0xFFFFFFFFu;
+			blend.isTextureFactorBlend = 0;
+			blend.writeMask = 0xF; // D3DCOLORWRITEENABLE_ALL
+			blend.isVertexColorBakedLighting = 0;
+
+			// Alpha-tested draws are cut-outs -- foliage, decals, muzzle flashes -- and submitting
+			// them as ordinary blended geometry makes the whole quad participate in lighting rather
+			// than just the kept texels, so the billboard's triangle silhouette shows and the
+			// denoiser flickers on it. ALPHA_BLEND_TO_CUTOUT is the runtime's purpose-built path
+			// for exactly this (dxvk-remix rtx_instance_manager.cpp:597,
+			// forceAlphaTest = categories.test(InstanceCategories::AlphaBlendToCutout)).
+			//
+			// Keyed on ATE because that is the guest saying "this is a cut-out" itself. Rainbow Six
+			// 3's dump has ATE=0 on every draw, so this is inert there and carries no regression
+			// risk for it; it is aimed at SOCOM's foliage and is NOT yet verified against a SOCOM
+			// draw dump -- the counter is how that gets checked.
+			const bool is_cutout =
+				(cutout_mode() != 0) && regs.ate && (regs.atst != 1); // not ALWAYS
+
+			draw_state out{};
+			out.blend = blend;
+			out.is_sky = is_sky;
+			out.is_cutout = is_cutout;
+			out.categories = tagged |
+			                 (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u) |
+			                 (is_cutout ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT) : 0u);
+			return out;
+		}
+
+		// Appends the draw currently in the scratch buffers to its batch group, under the surface
+		// for its material. Indices are rebased onto the surface's running vertex count.
+		//
+		// Vertices go in exactly as they were built -- world or view space, whichever the frame is
+		// submitting in -- so the batch instance carries the identity transform and there is no
+		// registration to get wrong. Batching and stable identity are alternatives, not partners.
+		void batch_append(u64 group_key, const draw_state& ds, const remix_ps2::materials::binding& material)
+		{
+			size_t group_index;
+
+			if (const auto found = s_batch_group_of_key.find(group_key); found != s_batch_group_of_key.end())
+			{
+				group_index = found->second;
+			}
+			else
+			{
+				group_index = s_batch_groups_used++;
+				if (s_batch_groups.size() < s_batch_groups_used)
+					s_batch_groups.emplace_back();
+
+				batch_group& fresh = s_batch_groups[group_index];
+				fresh.blend = ds.blend;
+				fresh.categories = ds.categories;
+				fresh.surfaces_used = 0;
+				fresh.surface_of_material.clear();
+				s_batch_group_of_key.emplace(group_key, group_index);
+			}
+
+			batch_group& group = s_batch_groups[group_index];
+
+			size_t surface_index;
+
+			if (const auto found = group.surface_of_material.find(material.content_hash);
+				found != group.surface_of_material.end())
+			{
+				surface_index = found->second;
+			}
+			else
+			{
+				surface_index = group.surfaces_used++;
+				if (group.surfaces.size() < group.surfaces_used)
+					group.surfaces.emplace_back();
+
+				batch_surface& fresh = group.surfaces[surface_index];
+				fresh.material_hash = material.content_hash;
+				fresh.material = material.material;
+				fresh.vertices.clear();
+				fresh.indices.clear();
+				group.surface_of_material.emplace(material.content_hash, surface_index);
+			}
+
+			batch_surface& surface = group.surfaces[surface_index];
+			const u32 base = static_cast<u32>(surface.vertices.size());
+
+			surface.vertices.insert(surface.vertices.end(), s_scratch_vertices.begin(), s_scratch_vertices.end());
+			surface.indices.reserve(surface.indices.size() + s_scratch_indices.size());
+
+			for (const u32 index : s_scratch_indices)
+				surface.indices.push_back(base + index);
+		}
+
+		// Turns the frame's accumulated groups into meshes and instances them. Must run before
+		// Present, and is the whole point of batching: one CreateMesh and one DrawInstance per
+		// group, however many draws went into it.
+		void batch_flush()
+		{
+			if (s_batch_groups_used == 0)
+			{
+				s_batch_group_of_key.clear();
+				return;
+			}
+
+			const remixapi_Interface& api = s_remix.api();
+			u64 vertices_this_frame = 0;
+			u64 surfaces_this_frame = 0;
+
+			for (size_t g = 0; g < s_batch_groups_used; ++g)
+			{
+				batch_group& group = s_batch_groups[g];
+
+				s_batch_surface_scratch.clear();
+				u64 hash = fnv_seed;
+				hash = fnv_mix(hash, s_frame_counter);
+				hash = fnv_mix(hash, g);
+
+				for (size_t i = 0; i < group.surfaces_used; ++i)
+				{
+					batch_surface& surface = group.surfaces[i];
+
+					if (surface.vertices.empty() || surface.indices.empty())
+						continue;
+
+					remixapi_MeshInfoSurfaceTriangles triangles{};
+					triangles.vertices_values = surface.vertices.data();
+					triangles.vertices_count = surface.vertices.size();
+					triangles.indices_values = surface.indices.data();
+					triangles.indices_count = surface.indices.size();
+					triangles.skinning_hasvalue = 0;
+					triangles.material = surface.material;
+					s_batch_surface_scratch.push_back(triangles);
+
+					vertices_this_frame += surface.vertices.size();
+					++surfaces_this_frame;
+				}
+
+				if (s_batch_surface_scratch.empty())
+					continue;
+
+				remixapi_MeshInfo mesh_info{};
+				mesh_info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+				mesh_info.pNext = nullptr;
+				// Unique per frame per group: the geometry is camera-derived and genuinely new
+				// every frame, so reusing a hash would ask the runtime to treat different
+				// geometry as the same object.
+				mesh_info.hash = (hash == 0) ? 1 : hash;
+				mesh_info.surfaces_values = s_batch_surface_scratch.data();
+				mesh_info.surfaces_count = s_batch_surface_scratch.size();
+
+				remixapi_MeshHandle handle = nullptr;
+				const u32 status = remix_ps2::guarded_create_mesh(api.CreateMesh, &mesh_info, &handle);
+
+				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
+				{
+					ERROR_LOG("Remix: batch CreateMesh failed for group {} ({} surfaces): {}",
+						g, s_batch_surface_scratch.size(), remix_ps2::error_name(status));
+					continue;
+				}
+
+				++s_stats.meshes_created;
+				++s_stats.meshes_created_frame;
+				++s_stats.batch_meshes_created;
+				s_batch_meshes.push_back(batch_mesh{handle, s_frame_counter});
+
+				remixapi_InstanceInfo instance{};
+				instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+				instance.pNext = (alpha_state_mode() == 2) ? &group.blend : nullptr;
+				instance.categoryFlags = group.categories;
+				instance.mesh = handle;
+				// The geometry is already in the submitted camera's space.
+				instance.transform = s_identity_transform;
+				instance.doubleSided = 1;
+
+				remix_ps2::guarded_draw_instance(api.DrawInstance, &instance);
+				s_frame_instanced_keys.insert(mesh_info.hash);
+			}
+
+			s_stats.batch_surfaces_peak = std::max(s_stats.batch_surfaces_peak, surfaces_this_frame);
+			s_stats.batch_vertices_peak = std::max(s_stats.batch_vertices_peak, vertices_this_frame);
+
+			s_batch_group_of_key.clear();
+			s_batch_groups_used = 0;
+		}
+
+		// Teardown: drop every batch mesh and every accumulated group. Used on renderer close and
+		// on a save-state load, where the whole scene is replaced in one step.
+		void batch_discard()
+		{
+			if (s_remix.ok())
+			{
+				const remixapi_Interface& api = s_remix.api();
+
+				for (const batch_mesh& entry : s_batch_meshes)
+				{
+					if (entry.handle)
+					{
+						remix_ps2::guarded_destroy_mesh(api.DestroyMesh, entry.handle);
+						++s_stats.meshes_destroyed;
+					}
+				}
+			}
+
+			s_batch_meshes.clear();
+			s_batch_group_of_key.clear();
+			s_batch_groups_used = 0;
+		}
+
+		// Releases batch meshes whose frame is far enough behind that nothing in flight can still
+		// reference them.
+		void batch_reap()
+		{
+			if (s_batch_meshes.empty())
+				return;
+
+			const u64 retain = batch_retain_frames();
+			const remixapi_Interface& api = s_remix.api();
+			size_t write = 0;
+
+			for (size_t i = 0; i < s_batch_meshes.size(); ++i)
+			{
+				const batch_mesh& entry = s_batch_meshes[i];
+
+				if ((entry.created_frame + retain) > s_frame_counter)
+				{
+					s_batch_meshes[write++] = entry;
+					continue;
+				}
+
+				if (entry.handle)
+				{
+					remix_ps2::guarded_destroy_mesh(api.DestroyMesh, entry.handle);
+					++s_stats.meshes_destroyed;
+					++s_stats.meshes_destroyed_frame;
+				}
+			}
+
+			s_batch_meshes.resize(write);
+		}
+
 		void log_stats(bool force)
 		{
 			if (!force && (s_frame_counter == 0 || (s_frame_counter % stats_interval_frames()) != 0))
@@ -1875,7 +2267,8 @@ namespace RemixSubmit
 					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
-					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {}",
+					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
+				 "batch: mode {} groups/frame avg {} peak {} | surfaces peak {} verts peak {} meshes {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -1892,7 +2285,11 @@ namespace RemixSubmit
 					(s_stats.distinct_instanced_total / s_stats.distinct_instanced_frames) : 0,
 				s_stats.distinct_instanced_peak, s_pool_hashes.size(),
 				stable_identity(), s_stats.id_reuse, s_stats.id_create, s_stats.id_rebuild,
-				s_stats.id_probe_collisions);
+				s_stats.id_probe_collisions,
+				batch_mode(),
+				(s_stats.batch_frames > 0) ? (s_stats.batch_groups_total / s_stats.batch_frames) : 0,
+				s_stats.batch_groups_peak, s_stats.batch_surfaces_peak, s_stats.batch_vertices_peak,
+				s_stats.batch_meshes_created);
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -2539,6 +2936,61 @@ namespace RemixSubmit
 
 		const remixapi_Interface& api = s_remix.api();
 
+		// The instance-side state, needed here rather than further down because it is what
+		// decides which batch this draw can join. Non-const because its blend struct is chained
+		// into remixapi_InstanceInfo::pNext, which is a plain void*.
+		draw_regs regs{};
+		regs.depth_read = r.m_cached_ctx.DepthRead();
+		regs.depth_write = r.m_cached_ctx.DepthWrite();
+		regs.ate = r.m_cached_ctx.TEST.ATE;
+		regs.atst = r.m_cached_ctx.TEST.ATST;
+		regs.aref = r.m_cached_ctx.TEST.AREF;
+		regs.abe = r.PRIM->ABE;
+		regs.tfx = r.m_cached_ctx.TEX0.TFX;
+		regs.alpha = r.m_context->ALPHA;
+
+		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame);
+
+		// The batch key: everything that lives on the instance. Two draws may share a mesh only
+		// if they agree on all of it. Materials are per surface and deliberately absent.
+		u64 group_key = fnv_seed;
+		{
+			const u8* const blend_bytes = reinterpret_cast<const u8*>(&ds.blend);
+			// From categoryFlags onward -- sType and pNext are fixed and pNext is a pointer, so
+			// hashing the whole struct would key on an address.
+			for (size_t i = offsetof(remixapi_InstanceInfoBlendEXT, alphaTestEnabled);
+				 i < sizeof(remixapi_InstanceInfoBlendEXT); ++i)
+			{
+				group_key = fnv_mix(group_key, blend_bytes[i]);
+			}
+
+			group_key = fnv_mix(group_key, ds.categories);
+			group_key = fnv_mix(group_key, (alpha_state_mode() == 2) ? 1u : 0u);
+		}
+
+		s_frame_group_keys.insert(group_key);
+
+		if (batch_mode() != 0)
+		{
+			batch_append(group_key, ds, material);
+
+			if (!ds.is_sky && draw_bounds.valid)
+			{
+				s_frame_bounds.add(draw_bounds.min);
+				s_frame_bounds.add(draw_bounds.max);
+			}
+
+			if (ds.is_sky)
+				++s_stats.sky_tagged;
+
+			if (ds.is_cutout)
+				++s_stats.cutout_tagged;
+
+			++s_stats.draws_submitted;
+			++s_submitted_this_frame;
+			return;
+		}
+
 		// --- claim a slot ---------------------------------------------------------------------
 		// Open addressing over identity_slots() keys. The first slot whose stored geometry
 		// rigidly registers onto this draw wins; the first empty slot takes a new mesh; and if
@@ -2717,78 +3169,10 @@ namespace RemixSubmit
 
 		it->second.last_used_frame = s_frame_counter;
 
-		const bool depth_read = r.m_cached_ctx.DepthRead();
-		const bool depth_write = r.m_cached_ctx.DepthWrite();
-		const bool is_sky = classify_sky(depth_read, depth_write, s_submitted_this_frame);
-
-		// The user's own tags, from the Remix conf layers. dxvk-remix only applies its hash
-		// lists on the native D3D9 path (setupCategoriesForTexture, rtx_types.cpp:348, whose one
-		// caller is d3d9_rtx.cpp:1064); an API instance's categories come solely from this
-		// field (rtx_remix_api.cpp:803). So a tag made in the developer menu does nothing at all
-		// unless we look it up ourselves and OR it in here.
-		const remixapi_InstanceCategoryFlags tagged = remix_ps2::materials::categories_for(material.content_hash);
-
-		remixapi_InstanceInfoBlendEXT blend{};
-		blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
-		blend.pNext = nullptr;
-		blend.alphaTestEnabled = r.m_cached_ctx.TEST.ATE ? 1 : 0;
-		blend.alphaTestReferenceValue = static_cast<u8>(r.m_cached_ctx.TEST.AREF);
-		blend.alphaTestCompareOp = to_d3d_compare(r.m_cached_ctx.TEST.ATST);
-		blend.alphaBlendEnabled = r.PRIM->ABE ? 1 : 0;
-		to_d3d_blend(r.m_context->ALPHA, blend.srcColorBlendFactor, blend.dstColorBlendFactor);
-		blend.colorBlendOp = 1; // D3DBLENDOP_ADD
-		blend.srcAlphaBlendFactor = blend.srcColorBlendFactor;
-		blend.dstAlphaBlendFactor = blend.dstColorBlendFactor;
-		blend.alphaBlendOp = 1;
-		// TFX: MODULATE 0, DECAL 1, HIGHLIGHT 2, HIGHLIGHT2 3. Only the first two are
-		// expressible as a fixed-function stage; the highlight modes degrade to modulate.
-		//
-		// PCSX2_REMIX_TEXSTAGE gates this separately from the blend fields so colour can be
-		// chased without giving up the alpha-state fix. 0 leaves the fields zeroed for the
-		// runtime's own default, 1 derives them from TFX.
-		//
-		// MEASURED on Rainbow Six 3 (-state 9), identical scene, PrintWindow capture, pixels
-		// with max channel > 12 counted as lit:
-		//   TEXSTAGE=1 (derived): lit 2,468,536  mean sat 0.0918  coloured 12.79% of lit
-		//   TEXSTAGE=0 (zeroed):  lit 1,110,107  mean sat 0.0545  coloured  3.72% of lit
-		// Sending the derived stage gives 3.4x the coloured pixels and 2.2x the lit area, so
-		// these fields are NOT the "colour is missing" regression -- they are carrying the
-		// texture's contribution and zeroing them is what removes it. Default 1.
-		if (texture_stage_mode() != 0)
-		{
-			const bool decal = (r.m_cached_ctx.TEX0.TFX == 1);
-			blend.textureColorArg1Source = 2; // D3DTA_TEXTURE
-			blend.textureColorArg2Source = 0; // D3DTA_DIFFUSE
-			blend.textureColorOperation = decal ? 2u : 4u; // SELECTARG1 : MODULATE
-			blend.textureAlphaArg1Source = 2;
-			blend.textureAlphaArg2Source = 0;
-			blend.textureAlphaOperation = decal ? 2u : 4u;
-		}
-		blend.tFactor = 0xFFFFFFFFu;
-		blend.isTextureFactorBlend = 0;
-		blend.writeMask = 0xF; // D3DCOLORWRITEENABLE_ALL
-		blend.isVertexColorBakedLighting = 0;
-
-		// Alpha-tested draws are cut-outs -- foliage, decals, muzzle flashes -- and submitting
-		// them as ordinary blended geometry makes the whole quad participate in lighting rather
-		// than just the kept texels, so the billboard's triangle silhouette shows and the
-		// denoiser flickers on it. ALPHA_BLEND_TO_CUTOUT is the runtime's purpose-built path
-		// for exactly this (dxvk-remix rtx_instance_manager.cpp:597,
-		// forceAlphaTest = categories.test(InstanceCategories::AlphaBlendToCutout)).
-		//
-		// Keyed on ATE because that is the guest saying "this is a cut-out" itself. Rainbow Six
-		// 3's dump has ATE=0 on every draw, so this is inert there and carries no regression
-		// risk for it; it is aimed at SOCOM's foliage and is NOT yet verified against a SOCOM
-		// draw dump -- the counter is how that gets checked.
-		const bool is_cutout =
-			(cutout_mode() != 0) && r.m_cached_ctx.TEST.ATE && (r.m_cached_ctx.TEST.ATST != 1); // not ALWAYS
-
 		remixapi_InstanceInfo instance{};
 		instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-		instance.pNext = (alpha_state_mode() == 2) ? &blend : nullptr;
-		instance.categoryFlags = tagged |
-		                         (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u) |
-		                         (is_cutout ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT) : 0u);
+		instance.pNext = (alpha_state_mode() == 2) ? &ds.blend : nullptr;
+		instance.categoryFlags = ds.categories;
 		if (reuse_one_handle())
 		{
 			// First game mesh of the session, held for its lifetime: real geometry rather than
@@ -2842,10 +3226,10 @@ namespace RemixSubmit
 
 		s_frame_instanced_keys.insert(hash);
 
-		if (is_sky)
+		if (ds.is_sky)
 			++s_stats.sky_tagged;
 
-		if (is_cutout)
+		if (ds.is_cutout)
 			++s_stats.cutout_tagged;
 
 		if (s_drawdump_frames_left > 0)
@@ -2857,10 +3241,10 @@ namespace RemixSubmit
 				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
 				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
 				s_frame_counter, s_submitted_this_frame, vertex_count, s_scratch_indices.size() / 3,
-				is_sky ? 1 : 0,
+				ds.is_sky ? 1 : 0,
 				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),
 				static_cast<u32>(r.m_cached_ctx.ZBUF.ZMSK), static_cast<u32>(r.m_cached_ctx.ZBUF.PSM),
-				depth_read ? 1 : 0, depth_write ? 1 : 0,
+				r.m_cached_ctx.DepthRead() ? 1 : 0, r.m_cached_ctx.DepthWrite() ? 1 : 0,
 				static_cast<u32>(r.m_cached_ctx.TEST.ATE), static_cast<u32>(r.m_cached_ctx.TEST.ATST),
 				static_cast<u32>(r.m_cached_ctx.TEST.AREF), static_cast<u32>(r.m_cached_ctx.TEST.AFAIL),
 				static_cast<u32>(r.PRIM->ABE),
@@ -2878,7 +3262,7 @@ namespace RemixSubmit
 		// Only now that the draw is committed does its extent count towards the frame's, and
 		// sky geometry is deliberately excluded: a skybox is huge by construction and would
 		// dominate the scene radius the debug light is scaled from.
-		if (!is_sky && draw_bounds.valid)
+		if (!ds.is_sky && draw_bounds.valid)
 		{
 			s_frame_bounds.add(draw_bounds.min);
 			s_frame_bounds.add(draw_bounds.max);
@@ -2904,6 +3288,10 @@ namespace RemixSubmit
 		// matrix, at the cost of a bounded one-frame lag under motion.
 		refresh_window_size();
 		submit_camera();
+
+		// Before Present, and before the beacon's empty-frame test, because a batched frame's
+		// geometry has not been instanced until this runs.
+		batch_flush();
 
 		// The beacon only appears when nothing of the guest's own geometry survived the gates,
 		// so it never clutters a working scene but still says "the runtime is alive".
@@ -2977,6 +3365,20 @@ namespace RemixSubmit
 		s_submitted_this_frame = 0;
 		s_frame_submitted_hashes.clear();
 		s_frame_instanced_keys.clear();
+		// Counted whether or not batching is enabled: this is the number that decides whether
+		// batching can reach the operating point the dose-response calls safe, and it has to be
+		// answerable without turning the feature on.
+		if (!s_frame_group_keys.empty())
+		{
+			const u64 groups = s_frame_group_keys.size();
+			s_stats.batch_groups_peak = std::max(s_stats.batch_groups_peak, groups);
+			s_stats.batch_groups_total += groups;
+			++s_stats.batch_frames;
+		}
+
+		s_frame_group_keys.clear();
+
+		batch_reap();
 
 		// Entries a draw claimed but could not fit. Dropped here, at the frame boundary, so the
 		// handle is only destroyed once nothing in flight references it; the next frame's draw
@@ -3060,6 +3462,8 @@ namespace RemixSubmit
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
 		s_frame_instanced_keys.clear();
+		s_frame_group_keys.clear();
+		batch_discard();
 		s_reuse_handle = nullptr;
 		s_pool_hashes.clear();
 		s_pinned_hashes.clear();
@@ -3109,6 +3513,8 @@ namespace RemixSubmit
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
 		s_frame_instanced_keys.clear();
+		s_frame_group_keys.clear();
+		batch_discard();
 		s_reuse_handle = nullptr;
 		s_pool_hashes.clear();
 		s_pinned_hashes.clear();
