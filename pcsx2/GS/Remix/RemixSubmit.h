@@ -51,7 +51,13 @@ namespace RemixSubmit
 	// they are passed in rather than the Target itself so this header stays free of
 	// GSTextureCache.h, which GSDevice.cpp and GS.cpp would otherwise have to pull in.
 	// Zero means "no colour target for this draw" and the draw is skipped.
-	void OnDrawPrims(const GSRendererHW& renderer, int rt_unscaled_width, int rt_unscaled_height);
+	//
+	// 'tex_source' is the draw's GSTextureCache::Source*, type-erased for the same reason: it
+	// is the material bridge's input (TEX0/TEXA/region/lod, from which HashCacheKey::Create
+	// recomputes the content hash). Null for an untextured draw. C++ cannot forward-declare a
+	// nested class, so a void* is the only way to keep GSTextureCache.h out of this header.
+	void OnDrawPrims(const GSRendererHW& renderer, int rt_unscaled_width, int rt_unscaled_height,
+		const void* tex_source);
 
 	// Frame boundary, from GSRenderer::VSync after Merge() and before the present block.
 	void OnVSync();

@@ -710,6 +710,7 @@ if(WIN32)
 	# excludes it from that platform.
 	if(NOT ARCH_ARM64)
 		list(APPEND pcsx2GSSources
+			GS/Remix/RemixMaterials.cpp
 			GS/Remix/RemixRuntime.cpp
 			GS/Remix/RemixSubmit.cpp
 			GS/Remix/RemixTransforms.cpp
@@ -718,6 +719,7 @@ if(WIN32)
 		)
 		list(APPEND pcsx2GSHeaders
 			GS/Remix/remix_c.h
+			GS/Remix/RemixMaterials.h
 			GS/Remix/RemixRuntime.h
 			GS/Remix/RemixSubmit.h
 			GS/Remix/RemixTransforms.h

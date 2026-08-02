@@ -1455,6 +1455,9 @@
     <ClCompile Include="GS\GSDrawingEnvironment.cpp">
       <Filter>System\Ps2\GS\Renderers\Software</Filter>
     </ClCompile>
+    <ClCompile Include="GS\Remix\RemixMaterials.cpp">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClCompile>
     <ClCompile Include="GS\Remix\RemixRuntime.cpp">
       <Filter>System\Ps2\GS\Remix</Filter>
     </ClCompile>
@@ -2438,6 +2441,9 @@
       <Filter>System\Ps2\Iop\SIO\PAD</Filter>
     </ClInclude>
     <ClInclude Include="GS\Remix\remix_c.h">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Remix\RemixMaterials.h">
       <Filter>System\Ps2\GS\Remix</Filter>
     </ClInclude>
     <ClInclude Include="GS\Remix\RemixRuntime.h">

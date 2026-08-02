@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/Remix/RemixSubmit.h"
+#include "GS/Remix/RemixMaterials.h"
 #include "GS/Remix/RemixRuntime.h"
 #include "GS/Remix/RemixTransforms.h"
 #include "GS/Remix/RemixVU1Capture.h"
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -93,8 +95,14 @@ namespace RemixSubmit
 			u64 skip_too_large = 0;
 			u64 skip_nonfinite = 0; // Q guard values poisoned the un-projected positions
 			u64 skip_poisoned = 0; // hash quarantined by an earlier faulting runtime call
+			u64 skip_mesh_budget = 0; // over the per-frame CreateMesh budget
 			u64 meshes_created = 0;
 			u64 meshes_destroyed = 0;
+			// Mesh creation rate, the strongest remaining lead on the device-loss exit: it is
+			// reported to happen while walking, i.e. exactly when new geometry streams in.
+			u64 meshes_created_frame = 0;
+			u64 meshes_created_peak = 0;
+			u64 sky_tagged = 0; // instances categorised REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
 			u64 cam_world = 0;
 			u64 cam_fallback = 0;
 			// World-anchor (step 9) accounting. Every one of these has to be readable in a
@@ -212,10 +220,63 @@ namespace RemixSubmit
 		bool s_logged_world_camera = false;
 
 		float s_light_position[3] = {0.f, -1.f, 0.f};
-		float s_light_scale = 1.f;
+		float s_light_radius = 0.1f;
+		float s_light_radiance = 100.f;
 		bool s_light_placed = false;
 
-		float debug_light_radius()
+		remixapi_LightHandle s_sun_light = nullptr;
+		float s_sun_direction[3] = {0.f, 0.f, 1.f};
+		bool s_sun_placed = false;
+
+		// The world-space (or view-space, whichever is being submitted) bounding box of the
+		// geometry submitted this frame, and the finished frame's copy. This is the measurement
+		// the debug light is scaled from: the previous fixed radius/radiance were tuned for a
+		// synthetic camera with near 0.1, and a title whose world spans thousands of units was
+		// lit by a pinprick whose 1/d^2 falloff made everything past a few metres black.
+		struct scene_bounds
+		{
+			bool valid = false;
+			float min[3] = {0.f, 0.f, 0.f};
+			float max[3] = {0.f, 0.f, 0.f};
+
+			void add(const float (&p)[3])
+			{
+				if (!valid)
+				{
+					valid = true;
+					for (u32 i = 0; i < 3; ++i)
+						min[i] = max[i] = p[i];
+
+					return;
+				}
+
+				for (u32 i = 0; i < 3; ++i)
+				{
+					min[i] = std::min(min[i], p[i]);
+					max[i] = std::max(max[i], p[i]);
+				}
+			}
+
+			// Half the diagonal: the radius of the sphere the frame's geometry fits in.
+			float radius() const
+			{
+				if (!valid)
+					return 1.f;
+
+				const float dx = max[0] - min[0];
+				const float dy = max[1] - min[1];
+				const float dz = max[2] - min[2];
+				const float diag = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+				return std::isfinite(diag) ? std::max(0.5f * diag, 1e-3f) : 1.f;
+			}
+		};
+
+		scene_bounds s_frame_bounds{};
+		scene_bounds s_last_bounds{};
+
+		// Explicit absolute overrides. When unset (the default) radius and radiance are derived
+		// from the frame's measured extent instead, which is scale-free -- see place_debug_light.
+		float debug_light_radius_override()
 		{
 			static const float value = []() -> float {
 				if (const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_LIGHTRADIUS"); !env.empty())
@@ -225,13 +286,13 @@ namespace RemixSubmit
 						return parsed;
 				}
 
-				return 0.1f;
+				return 0.f;
 			}();
 
 			return value;
 		}
 
-		float debug_light_radiance()
+		float debug_light_radiance_override()
 		{
 			static const float value = []() -> float {
 				if (const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_LIGHTRADIANCE"); !env.empty())
@@ -241,7 +302,66 @@ namespace RemixSubmit
 						return parsed;
 				}
 
-				return 100.f;
+				return 0.f;
+			}();
+
+			return value;
+		}
+
+		// Target irradiance at the scene radius, in Remix's units. The whole point of deriving
+		// radius and radiance from the measured extent is that this number then means the same
+		// thing whether a guest world unit is a metre or a centimetre.
+		float debug_light_exposure()
+		{
+			static const float value = []() -> float {
+				if (const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_LIGHTEXPOSURE"); !env.empty())
+				{
+					const float parsed = static_cast<float>(::_wtof(env.c_str()));
+					if (std::isfinite(parsed) && parsed > 0.f)
+						return parsed;
+				}
+
+				return 3.f;
+			}();
+
+			return value;
+		}
+
+		// Fraction of the scene radius the sphere light's own radius is set to. Bigger means
+		// softer shadows and a flatter falloff across the scene; the radiance compensates so
+		// apparent brightness at the scene radius is unchanged.
+		constexpr float s_light_radius_fraction = 0.05f;
+
+		// A distant (directional) light along the camera forward -- a headlight with no
+		// distance falloff at all. Off by default because its radiance units are not the same
+		// as a sphere light's and the right value has to be found by looking.
+		float sun_radiance()
+		{
+			static const float value = []() -> float {
+				if (const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_SUN"); !env.empty())
+				{
+					const float parsed = static_cast<float>(::_wtof(env.c_str()));
+					if (std::isfinite(parsed) && parsed > 0.f)
+						return parsed;
+				}
+
+				return 0.f;
+			}();
+
+			return value;
+		}
+
+		float sun_angle_degrees()
+		{
+			static const float value = []() -> float {
+				if (const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_SUNANGLE"); !env.empty())
+				{
+					const float parsed = static_cast<float>(::_wtof(env.c_str()));
+					if (std::isfinite(parsed) && parsed > 0.f && parsed < 180.f)
+						return parsed;
+				}
+
+				return 30.f;
 			}();
 
 			return value;
@@ -279,17 +399,36 @@ namespace RemixSubmit
 			}
 		}
 
-		// 'scale' rescales the light for the recovered world's unit size: the defaults are
-		// tuned for the synthetic view-space camera (near 0.1), and a title whose world unit
-		// is a centimetre would otherwise be lit by a pinprick. Radiance follows the inverse
-		// square so the apparent brightness is unchanged.
-		void place_debug_light(const float (&position)[3], float scale = 1.f)
+		// The debug sphere light, sized from the frame's measured extent rather than from a
+		// fixed constant.
+		//
+		// A sphere light of radius R and radiance L delivers irradiance ~ L*pi*(R/d)^2 at
+		// distance d. Setting R = f*S (S = scene radius) makes L = E/(pi*f^2) -- independent of
+		// S -- so the same numbers work whether a guest world unit is a metre or a centimetre.
+		// Getting this wrong is what made world mode dark past a few metres: with R fixed at
+		// 0.1 in a world thousands of units across, everything but the nearest surface was
+		// receiving essentially nothing.
+		void place_debug_light(const float (&position)[3], float scene_radius)
 		{
 			const remixapi_Interface& api = s_remix.api();
 
+			const float radius_override = debug_light_radius_override();
+			const float radiance_override = debug_light_radiance_override();
+
+			const float radius = (radius_override > 0.f) ? radius_override :
+			                                               std::max(s_light_radius_fraction * scene_radius, 1e-4f);
+			const float radiance =
+				(radiance_override > 0.f) ?
+					radiance_override :
+					(debug_light_exposure() / (3.14159265f * s_light_radius_fraction * s_light_radius_fraction));
+
+			// Recreating the light every frame is a Remix state change for nothing; only do it
+			// when something actually moved or changed size. 2% hysteresis on the radius keeps
+			// a frame-to-frame wobble in the measured extent from thrashing it.
 			if (s_light_placed &&
 				s_light_position[0] == position[0] && s_light_position[1] == position[1] &&
-				s_light_position[2] == position[2] && s_light_scale == scale)
+				s_light_position[2] == position[2] && s_light_radiance == radiance &&
+				std::abs(radius - s_light_radius) <= (0.02f * s_light_radius))
 			{
 				return;
 			}
@@ -297,7 +436,8 @@ namespace RemixSubmit
 			s_light_position[0] = position[0];
 			s_light_position[1] = position[1];
 			s_light_position[2] = position[2];
-			s_light_scale = scale;
+			s_light_radius = radius;
+			s_light_radiance = radiance;
 			s_light_placed = true;
 
 			if (s_debug_light)
@@ -310,14 +450,12 @@ namespace RemixSubmit
 			sphere_light.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
 			sphere_light.pNext = nullptr;
 			sphere_light.position = {position[0], position[1], position[2]};
-			sphere_light.radius = debug_light_radius() * scale;
+			sphere_light.radius = radius;
 			sphere_light.shaping_hasvalue = 0;
 			// Zero-init leaves this at 0, but the runtime's own default is 1.0
 			// (rtx_lights.h kVolumetricRadianceScaleDefaultValue). At 0 the light contributes
 			// nothing volumetrically.
 			sphere_light.volumetricRadianceScale = 1.f;
-
-			const float radiance = debug_light_radiance() * scale * scale;
 
 			remixapi_LightInfo light_info{};
 			light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
@@ -334,13 +472,67 @@ namespace RemixSubmit
 			}
 		}
 
+		// A distant light along 'direction' -- no distance falloff, so the far end of a big
+		// scene is lit exactly as brightly as the near end. Opt-in via PCSX2_REMIX_SUN.
+		void place_sun_light(const float (&direction)[3])
+		{
+			const float radiance = sun_radiance();
+			if (radiance <= 0.f)
+				return;
+
+			const remixapi_Interface& api = s_remix.api();
+
+			if (s_sun_placed && s_sun_direction[0] == direction[0] && s_sun_direction[1] == direction[1] &&
+				s_sun_direction[2] == direction[2])
+			{
+				return;
+			}
+
+			const float len = std::sqrt((direction[0] * direction[0]) + (direction[1] * direction[1]) +
+										(direction[2] * direction[2]));
+			if (!std::isfinite(len) || len < 1e-6f)
+				return;
+
+			s_sun_direction[0] = direction[0];
+			s_sun_direction[1] = direction[1];
+			s_sun_direction[2] = direction[2];
+			s_sun_placed = true;
+
+			if (s_sun_light)
+			{
+				remix_ps2::guarded_destroy_light(api.DestroyLight, s_sun_light);
+				s_sun_light = nullptr;
+			}
+
+			remixapi_LightInfoDistantEXT distant{};
+			distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
+			distant.pNext = nullptr;
+			distant.direction = {direction[0] / len, direction[1] / len, direction[2] / len};
+			distant.angularDiameterDegrees = sun_angle_degrees();
+			distant.volumetricRadianceScale = 1.f;
+
+			remixapi_LightInfo light_info{};
+			light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+			light_info.pNext = &distant;
+			light_info.hash = 0x4;
+			light_info.radiance = {radiance, radiance, radiance};
+
+			const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_sun_light);
+			if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_sun_light)
+			{
+				ERROR_LOG("Remix: CreateLight failed for the distant light ({})", remix_ps2::error_name(status));
+				s_sun_light = nullptr;
+			}
+		}
+
 		bool create_debug_scene()
 		{
 			const remixapi_Interface& api = s_remix.api();
 
-			// Sphere light, straight from the official remixapi_example_c.c.
+			// Sphere light, straight from the official remixapi_example_c.c. The scene radius
+			// is a placeholder until the first frame measures one.
 			const float origin_light[3] = {0.f, -1.f, 0.f};
-			place_debug_light(origin_light);
+			place_debug_light(origin_light, 2.f);
 
 			if (!s_debug_light)
 				return false;
@@ -524,13 +716,23 @@ namespace RemixSubmit
 
 		void submit_camera()
 		{
+			// The extent the previous frame actually submitted, in whichever space is in use.
+			// Both tiers get the same treatment: view-space positions are in guest eye-depth
+			// units, which are just as far from "near 0.1" as world-space ones are.
+			const float scene_radius = s_last_bounds.radius();
+
 			if (!s_active_camera.valid)
 			{
 				submit_fallback_camera();
 				++s_stats.cam_fallback;
 
-				const float origin_light[3] = {0.f, -1.f, 0.f};
-				place_debug_light(origin_light);
+				// The fallback camera sits at the origin looking down +Z, so the light rides
+				// with it and the distant light points the same way.
+				const float origin_light[3] = {0.f, 0.f, 0.f};
+				place_debug_light(origin_light, scene_radius);
+
+				const float forward[3] = {0.f, 0.f, 1.f};
+				place_sun_light(forward);
 				return;
 			}
 
@@ -549,7 +751,13 @@ namespace RemixSubmit
 
 			// The debug light rides the camera, as in RPCS3: a world-space scene lit from
 			// wherever the origin happens to be is usually a black scene.
-			place_debug_light(s_active_camera.position, std::max(1.f, s_active_camera.near_plane / 0.1f));
+			place_debug_light(s_active_camera.position, scene_radius);
+
+			// Camera forward in world space. p_view = p_world * V (row-vector), so the gradient
+			// of view z with respect to world position is V's third column.
+			const float forward[3] = {
+				s_active_camera.view.m[0][2], s_active_camera.view.m[1][2], s_active_camera.view.m[2][2]};
+			place_sun_light(forward);
 		}
 
 		void drop_stale_camera()
@@ -898,7 +1106,10 @@ namespace RemixSubmit
 
 			s_active_hwnd = s_hwnd;
 			s_live = true;
-			INFO_LOG("Remix: renderer is live (far plane {})", remix_ps2::hardcoded_far_plane());
+			remix_ps2::materials::begin_frame();
+			INFO_LOG("Remix: renderer is live (far plane {}, materials {})",
+				remix_ps2::hardcoded_far_plane(),
+				s_remix.fork_features() ? "on" : "off (fork features unavailable)");
 		}
 
 		bool armed()
@@ -918,6 +1129,17 @@ namespace RemixSubmit
 		{
 			static const u64 value =
 				static_cast<u64>(std::max<s64>(1, remix_ps2::read_env_int(L"PCSX2_REMIX_MESHIDLE", 120)));
+			return value;
+		}
+
+		// Ceiling on CreateMesh calls in a single frame; 0 (the default) is unlimited, so this
+		// is inert until it is deliberately turned on. It exists because the remaining
+		// device-loss reports are all "while walking", and camera translation re-hashes every
+		// static mesh -- so the creation *rate*, not the live count, is the untested variable.
+		u64 mesh_create_budget()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_MESHBUDGET", 0)));
 			return value;
 		}
 
@@ -976,6 +1198,92 @@ namespace RemixSubmit
 			}
 		}
 
+		// --- sky categorisation -------------------------------------------------------------
+		//
+		// A PS2 skybox is drawn with the depth buffer disconnected: it neither tests Z (nothing
+		// can occlude it) nor writes Z (nothing it covers is nearer), and it is drawn before the
+		// world. Passing categoryFlags = 0 for it -- which is what every instance did until now
+		// -- makes Remix treat a box a few units across, centred on the camera, as real
+		// geometry, so the player is looking at the inside of it. Tagging it SKY moves it to the
+		// background at infinity.
+		//
+		// PCSX2_REMIX_SKY:      0 = off, 1 = depth-neutral (default).
+		// PCSX2_REMIX_SKYORDER: when > 0, additionally require the draw to be among the first N
+		//                       gate-passing draws of the frame.
+		int sky_mode()
+		{
+			static const int value = static_cast<int>(remix_ps2::read_env_int(L"PCSX2_REMIX_SKY", 1));
+			return value;
+		}
+
+		u32 sky_order_limit()
+		{
+			static const u32 value =
+				static_cast<u32>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_SKYORDER", 0)));
+			return value;
+		}
+
+		// 'depth_read'/'depth_write' come from GSRendererHW's own DepthRead()/DepthWrite()
+		// (GSRendererHW.h:62-79), evaluated by the caller because only OnDrawPrims is a friend
+		// of GSRendererHW. Reading the registers here instead would be a second, drifting
+		// interpretation of the same state.
+		bool classify_sky(bool depth_read, bool depth_write, u64 draw_ordinal)
+		{
+			if (sky_mode() == 0)
+				return false;
+
+			if (depth_read || depth_write)
+				return false;
+
+			const u32 limit = sky_order_limit();
+			return (limit == 0) || (draw_ordinal < limit);
+		}
+
+		// --- per-draw state dump ------------------------------------------------------------
+		//
+		// PCSX2_REMIX_DRAWDUMP=N dumps every gate-passing draw for the first N frames that
+		// submitted anything, to logs\remix_draws.txt. This exists so the sky rule above is
+		// derived from what the title actually does rather than picked and hoped for.
+		u64 drawdump_frames()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_DRAWDUMP", 0)));
+			return value;
+		}
+
+		u64 s_drawdump_frames_left = 0;
+		bool s_drawdump_started = false;
+
+		void drawdump_write(const std::string& line)
+		{
+			static constexpr u32 max_lines = 40000;
+			static u32 written = 0;
+			static bool tried = false;
+			static std::FILE* file = nullptr;
+
+			if (!tried)
+			{
+				tried = true;
+
+				const std::string& dir = EmuFolders::Logs.empty() ? EmuFolders::AppRoot : EmuFolders::Logs;
+				const std::string path = Path::Combine(dir, "remix_draws.txt");
+				file = FileSystem::OpenCFile(path.c_str(), "w");
+
+				if (file)
+					INFO_LOG("Remix: writing per-draw state to '{}'", path);
+				else
+					ERROR_LOG("Remix: could not open '{}' for the per-draw dump", path);
+			}
+
+			if (!file || written >= max_lines)
+				return;
+
+			++written;
+			std::fputs(line.c_str(), file);
+			std::fputc('\n', file);
+			std::fflush(file);
+		}
+
 		void log_stats(bool force)
 		{
 			if (!force && (s_frame_counter == 0 || (s_frame_counter % stats_interval_frames()) != 0))
@@ -983,14 +1291,22 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} | warn stq {} | cam world {} fallback {} | maxpos {:.0f}/{:.0f}",
+					 "nonfinite {} poisoned {} meshbudget {} | warn stq {} | cam world {} fallback {} | "
+					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} | mesh/frame peak {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
 				s_stats.skip_const_q, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
+				s_stats.skip_mesh_budget,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
-				s_max_seen_position, max_position_magnitude());
+				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
+				s_stats.sky_tagged, s_stats.meshes_created_peak);
+
+			// Third line: the material bridge. Kept separate so the counter block stays
+			// readable, and because the two numbers the user has to act on -- unique content
+			// hashes and the per-draw hash cost -- both live here.
+			INFO_LOG("{}", remix_ps2::materials::stats_line());
 
 			// Second line: the world anchor. Every stage of the pipeline is separately
 			// visible, so a null result names the stage that produced it -- no kicks, no
@@ -1075,7 +1391,7 @@ namespace RemixSubmit
 		}
 	}
 
-	void OnDrawPrims(const GSRendererHW& r, int rt_unscaled_width, int rt_unscaled_height)
+	void OnDrawPrims(const GSRendererHW& r, int rt_unscaled_width, int rt_unscaled_height, const void* tex_source)
 	{
 		if (!armed())
 			return;
@@ -1187,6 +1503,14 @@ namespace RemixSubmit
 		s_scratch_vertices.clear();
 		s_scratch_vertices.resize(vertex_count);
 
+		// Accumulated locally and only merged once the draw is known to be accepted, so a draw
+		// that bails out halfway cannot poison the frame's measured extent.
+		scene_bounds draw_bounds{};
+		float min_w = std::numeric_limits<float>::max();
+		float max_w = -std::numeric_limits<float>::max();
+		u32 min_z = 0xFFFFFFFFu;
+		u32 max_z = 0;
+
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
 			const GSVertex& v = verts[i];
@@ -1242,6 +1566,12 @@ namespace RemixSubmit
 
 			s_max_seen_position = std::max({s_max_seen_position, std::abs(out.position[0]),
 				std::abs(out.position[1]), std::abs(out.position[2])});
+
+			draw_bounds.add(out.position);
+			min_w = std::min(min_w, w);
+			max_w = std::max(max_w, w);
+			min_z = std::min(min_z, static_cast<u32>(v.XYZ.Z));
+			max_z = std::max(max_z, static_cast<u32>(v.XYZ.Z));
 		}
 
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
@@ -1307,6 +1637,13 @@ namespace RemixSubmit
 			}
 		}
 
+		// --- material ------------------------------------------------------------------------
+		// Recomputed here rather than read off the Source: only HashCacheEntry* is stored
+		// there (GSTextureCache.h:306) and it is null on most draws and always null for a
+		// render-target source, so the key has to be rebuilt from TEX0/TEXA/CLUT/region.
+		const GSTextureCache::Source* const source = static_cast<const GSTextureCache::Source*>(tex_source);
+		const remix_ps2::materials::binding material = remix_ps2::materials::bind(s_remix, source, s_frame_counter);
+
 		// --- mesh identity ------------------------------------------------------------------
 		u64 hash = fnv_seed;
 
@@ -1318,6 +1655,13 @@ namespace RemixSubmit
 
 			for (const u32 index : s_scratch_indices)
 				hash = fnv_mix(hash, index);
+
+			// Load-bearing: Remix binds the material into the mesh at CreateMesh time, so two
+			// draws with identical geometry but different textures must not share a handle.
+			// Zero when no material resolved, which also means a draw that missed the create
+			// budget this frame gets its own (untextured) handle and picks up the real one on a
+			// later frame instead of being stuck with the default material forever.
+			hash = fnv_mix(hash, material.content_hash);
 		}
 
 		if (hash == 0)
@@ -1338,14 +1682,26 @@ namespace RemixSubmit
 
 		if (it == s_meshes.end())
 		{
+			// Mesh creation is the leading suspect for the device-loss exit, which is reported
+			// to happen while walking -- i.e. when new geometry streams in and the camera moves,
+			// which re-hashes every static mesh. 0 = unlimited (the default, so this changes
+			// nothing until it is turned on deliberately).
+			const u64 budget = mesh_create_budget();
+			if (budget != 0 && s_stats.meshes_created_frame >= budget)
+			{
+				++s_stats.skip_mesh_budget;
+				return;
+			}
+
 			remixapi_MeshInfoSurfaceTriangles surface{};
 			surface.vertices_values = s_scratch_vertices.data();
 			surface.vertices_count = s_scratch_vertices.size();
 			surface.indices_values = s_scratch_indices.data();
 			surface.indices_count = s_scratch_indices.size();
 			surface.skinning_hasvalue = 0;
-			// Null material: Remix substitutes its own default. Materials are a later phase.
-			surface.material = nullptr;
+			// Null here means Remix substitutes its own default material -- still the case for
+			// render-target sources, untextured draws and anything the budget deferred.
+			surface.material = material.material;
 
 			remixapi_MeshInfo mesh_info{};
 			mesh_info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
@@ -1365,15 +1721,20 @@ namespace RemixSubmit
 			}
 
 			++s_stats.meshes_created;
+			++s_stats.meshes_created_frame;
 			it = s_meshes.emplace(hash, mesh_entry{handle, s_frame_counter}).first;
 		}
 
 		it->second.last_used_frame = s_frame_counter;
 
+		const bool depth_read = r.m_cached_ctx.DepthRead();
+		const bool depth_write = r.m_cached_ctx.DepthWrite();
+		const bool is_sky = classify_sky(depth_read, depth_write, s_submitted_this_frame);
+
 		remixapi_InstanceInfo instance{};
 		instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
 		instance.pNext = nullptr;
-		instance.categoryFlags = 0;
+		instance.categoryFlags = is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u;
 		instance.mesh = it->second.handle;
 		// Identity: the positions are already in the submitted camera's space. Per-draw world
 		// transforms are phase 2.
@@ -1386,6 +1747,42 @@ namespace RemixSubmit
 			s_poisoned.insert(hash);
 			++s_stats.skip_poisoned;
 			return;
+		}
+
+		if (is_sky)
+			++s_stats.sky_tagged;
+
+		if (s_drawdump_frames_left > 0)
+		{
+			drawdump_write(fmt::format(
+				"f={} d={} verts={} tris={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
+				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
+				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
+				"w=[{:.1f},{:.1f}] z=[{},{}] | mat={:016X}",
+				s_frame_counter, s_submitted_this_frame, vertex_count, s_scratch_indices.size() / 3,
+				is_sky ? 1 : 0,
+				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),
+				static_cast<u32>(r.m_cached_ctx.ZBUF.ZMSK), static_cast<u32>(r.m_cached_ctx.ZBUF.PSM),
+				depth_read ? 1 : 0, depth_write ? 1 : 0,
+				static_cast<u32>(r.m_cached_ctx.TEST.ATE), static_cast<u32>(r.m_cached_ctx.TEST.ATST),
+				static_cast<u32>(r.m_cached_ctx.TEST.AREF), static_cast<u32>(r.m_cached_ctx.TEST.AFAIL),
+				static_cast<u32>(r.PRIM->ABE),
+				static_cast<u32>(r.m_cached_ctx.FRAME.PSM), static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK),
+				static_cast<u32>(r.m_cached_ctx.TEX0.TBP0), static_cast<u32>(r.m_cached_ctx.TEX0.TBW),
+				static_cast<u32>(r.m_cached_ctx.TEX0.PSM), static_cast<u32>(r.m_cached_ctx.TEX0.TW),
+				static_cast<u32>(r.m_cached_ctx.TEX0.TH), static_cast<u32>(r.m_cached_ctx.TEX0.TCC),
+				static_cast<u32>(r.m_cached_ctx.TEX0.TFX),
+				(source && (source->m_target || source->m_from_target)) ? 1 : 0,
+				min_w, max_w, min_z, max_z, material.content_hash));
+		}
+
+		// Only now that the draw is committed does its extent count towards the frame's, and
+		// sky geometry is deliberately excluded: a skybox is huge by construction and would
+		// dominate the scene radius the debug light is scaled from.
+		if (!is_sky && draw_bounds.valid)
+		{
+			s_frame_bounds.add(draw_bounds.min);
+			s_frame_bounds.add(draw_bounds.max);
 		}
 
 		++s_stats.draws_submitted;
@@ -1426,6 +1823,9 @@ namespace RemixSubmit
 		if (s_debug_light)
 			remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_debug_light);
 
+		if (s_sun_light)
+			remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_sun_light);
+
 		const u32 status = remix_ps2::guarded_present(s_remix.api().Present, nullptr);
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
 			ERROR_LOG("Remix: Present failed ({})", remix_ps2::error_name(status));
@@ -1437,12 +1837,43 @@ namespace RemixSubmit
 
 		s_frame_viewport = viewport_constants{};
 
+		// Same one-frame latch for the measured extent: the light placed at the top of the next
+		// frame is scaled from the frame that just presented.
+		if (s_frame_bounds.valid)
+			s_last_bounds = s_frame_bounds;
+
+		s_frame_bounds = scene_bounds{};
+
 		resolve_world_camera();
+
+		// The per-draw dump follows the frames that actually submitted something, so it never
+		// burns its budget on the loading screens before the mission starts.
+		if (s_submitted_this_frame > 0)
+		{
+			if (!s_drawdump_started)
+			{
+				s_drawdump_started = true;
+				s_drawdump_frames_left = drawdump_frames();
+			}
+			else if (s_drawdump_frames_left > 0)
+			{
+				--s_drawdump_frames_left;
+			}
+		}
+
+		s_stats.meshes_created_peak = std::max(s_stats.meshes_created_peak, s_stats.meshes_created_frame);
+		s_stats.meshes_created_frame = 0;
 
 		++s_frame_counter;
 		s_submitted_this_frame = 0;
 
+		// Meshes first, then materials: a live mesh holds the material handle Remix bound into
+		// it at CreateMesh time, so releasing a material before the meshes referencing it would
+		// leave the runtime holding a dead handle.
 		reap_idle_meshes();
+		remix_ps2::materials::reap(s_remix, s_frame_counter);
+		remix_ps2::materials::begin_frame();
+
 		log_stats(false);
 	}
 
@@ -1455,9 +1886,14 @@ namespace RemixSubmit
 		s_active_camera = world_camera{};
 		s_frame_viewport = viewport_constants{};
 		s_last_viewport = viewport_constants{};
+		s_frame_bounds = scene_bounds{};
+		s_last_bounds = scene_bounds{};
 		s_camera_last_accept_frame = 0;
 		s_logged_world_camera = false;
 		s_light_placed = false;
+		s_sun_placed = false;
+		s_drawdump_started = false;
+		s_drawdump_frames_left = 0;
 
 		if (!s_remix.ok())
 			return;
@@ -1485,8 +1921,18 @@ namespace RemixSubmit
 			s_debug_light = nullptr;
 		}
 
-		// One last counter block, so a short session still reports what it saw.
+		if (s_sun_light)
+		{
+			remix_ps2::guarded_destroy_light(api.DestroyLight, s_sun_light);
+			s_sun_light = nullptr;
+		}
+
+		// One last counter block, so a short session still reports what it saw. Emitted before
+		// the material cache is torn down, because its counters are half the answer.
 		log_stats(true);
+
+		// After the meshes above: they hold the material handles.
+		remix_ps2::materials::destroy_all(s_remix);
 
 		// The runtime itself is deliberately NOT shut down: it is a process-lifetime singleton
 		// because a second Startup after Shutdown is unproven in dxvk-remix. Clearing

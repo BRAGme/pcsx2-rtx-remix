@@ -34,7 +34,8 @@ class GSRendererHW : public GSRenderer
 #if defined(_WIN32) && defined(_M_X64)
 	// The RTX Remix tee reads the committed draw's pristine vertex/index/context state from
 	// the top of DrawPrims. Third friend, after GSHwHack and the multi-ISA functions.
-	friend void RemixSubmit::OnDrawPrims(const GSRendererHW& renderer, int rt_unscaled_width, int rt_unscaled_height);
+	friend void RemixSubmit::OnDrawPrims(const GSRendererHW& renderer, int rt_unscaled_width, int rt_unscaled_height,
+		const void* tex_source);
 #endif
 
 public:

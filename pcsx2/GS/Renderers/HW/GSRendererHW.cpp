@@ -9279,7 +9279,7 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	// vertex buffer in place, and Lines2Sprites / the accurate_stq triangle path inside
 	// SetupIA set Q to 1.0 outright. Inert unless the Remix renderer is selected.
 	if (RemixSubmit::Armed())
-		RemixSubmit::OnDrawPrims(*this, rt ? rt->GetUnscaledWidth() : 0, rt ? rt->GetUnscaledHeight() : 0);
+		RemixSubmit::OnDrawPrims(*this, rt ? rt->GetUnscaledWidth() : 0, rt ? rt->GetUnscaledHeight() : 0, tex);
 #endif
 
 	const GSDrawingEnvironment& env = *m_draw_env;
