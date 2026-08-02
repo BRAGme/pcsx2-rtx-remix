@@ -66,6 +66,11 @@ namespace RemixVU1Capture
 
 		// ---- seqlock slot: written by the VU thread, read by the GS thread -----------------
 		std::atomic<u32> s_seq{0};
+
+		// Sequence number the GS side must see before it trusts a published frame again.
+		// Raised by DropPublished() when the guest's whole scene is replaced.
+		std::atomic<u32> s_drop_before_seq{0};
+
 		Frame s_published{};
 
 		// ---- VU-thread private state -------------------------------------------------------
@@ -419,6 +424,7 @@ namespace RemixVU1Capture
 		{
 			// A fresh session must not inherit the previous one's candidates.
 			s_seq.store(0, std::memory_order_relaxed);
+			s_drop_before_seq.store(0, std::memory_order_relaxed);
 			s_published = Frame{};
 			s_frame = Frame{};
 			s_generation.store(0, std::memory_order_relaxed);
@@ -599,6 +605,20 @@ namespace RemixVU1Capture
 		trace("published", s_seq.load(std::memory_order_relaxed), 0);
 	}
 
+	void DropPublished()
+	{
+		// Called from the GS thread when the guest's scene has been replaced wholesale (a
+		// save-state load). The published set describes the *old* scene, and the world camera
+		// solved from it would un-project the new scene's vertices into nonsense.
+		//
+		// Deliberately NOT a reset of the seqlock: the VU thread may be mid-publish, and
+		// zeroing s_seq under it would make the writer's seq+2 land on an odd value and wedge
+		// every future Latch. Instead the GS side records the sequence number it must see
+		// before it will trust a frame again. Worst case that discards one publish either
+		// side of the load, which is exactly the right conservative behaviour.
+		s_drop_before_seq.store(s_seq.load(std::memory_order_relaxed) + 2, std::memory_order_relaxed);
+	}
+
 	bool Latch(Frame& out)
 	{
 		bool have = false;
@@ -608,6 +628,9 @@ namespace RemixVU1Capture
 			const u32 seq = s_seq.load(std::memory_order_acquire);
 			if (seq == 0)
 				break; // nothing has ever been published
+
+			if (seq < s_drop_before_seq.load(std::memory_order_relaxed))
+				break; // published before a scene discontinuity -- stale by construction
 
 			if (seq & 1u)
 				continue; // a publish is in flight

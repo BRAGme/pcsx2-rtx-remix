@@ -499,7 +499,19 @@ int GSfreeze(FreezeAction mode, freezeData* data)
 		if (GSCapture::IsCapturing())
 			GSCapture::Flush();
 
-		return g_gs_renderer->Defrost(data);
+		const int result = g_gs_renderer->Defrost(data);
+
+#if defined(_WIN32) && defined(_M_X64)
+		// GS local memory -- and the guest's whole world with it -- has just been replaced.
+		// This path never goes through GSclose, so without this the Remix side would keep
+		// un-projecting the new scene through the camera it solved from the old one, and would
+		// hold a mesh cache keyed on hashes nothing will match again. Runs on the GS thread
+		// (dispatched from the MTGS command loop), same as every other Remix entry point.
+		if (result == 0 && RemixSubmit::Armed())
+			RemixSubmit::OnGSStateLoaded();
+#endif
+
+		return result;
 	}
 }
 

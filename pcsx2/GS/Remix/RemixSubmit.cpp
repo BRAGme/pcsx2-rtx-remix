@@ -321,7 +321,27 @@ namespace RemixSubmit
 						return parsed;
 				}
 
-				return 3.f;
+				return 1.f;
+			}();
+
+			return value;
+		}
+
+		// Volumetric (in-scattering) contribution of the debug light. Off by default: it is a
+		// per-froxel integration that a placeholder light has no business paying for, the
+		// runtime already warns that the froxel volume is larger than this camera's frustum,
+		// and it is one of the two terms that scale with how strong the light is.
+		float debug_light_volumetric()
+		{
+			static const float value = []() -> float {
+				if (const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_LIGHTVOLUMETRIC"); !env.empty())
+				{
+					const float parsed = static_cast<float>(::_wtof(env.c_str()));
+					if (std::isfinite(parsed) && parsed >= 0.f)
+						return parsed;
+				}
+
+				return 0.f;
 			}();
 
 			return value;
@@ -329,8 +349,19 @@ namespace RemixSubmit
 
 		// Fraction of the scene radius the sphere light's own radius is set to. Bigger means
 		// softer shadows and a flatter falloff across the scene; the radiance compensates so
-		// apparent brightness at the scene radius is unchanged.
-		constexpr float s_light_radius_fraction = 0.05f;
+		// the irradiance delivered at the scene radius is unchanged (it is exactly the exposure
+		// above, for any fraction).
+		//
+		// MEASURED, and load-bearing: the emitter's *surface radiance* -- not the light's total
+		// power, which this parameterisation holds fixed -- is what decides whether the session
+		// survives. Once real albedo textures exist, a small very bright emitter reproducibly
+		// drives the GPU to VK_ERROR_DEVICE_LOST within about six seconds:
+		//   fraction 0.05 -> radiance 382    dies at ~6 s (twice)
+		//   radius 1.0, radiance 10000       dies at ~6 s (the pre-material default)
+		//   radiance 100                     survives 45 s+
+		// At 0.1 the same illumination is delivered at radiance ~100. Do not lower this
+		// fraction without re-running that comparison.
+		constexpr float s_light_radius_fraction = 0.1f;
 
 		// A distant (directional) light along the camera forward -- a headlight with no
 		// distance falloff at all. Off by default because its radiance units are not the same
@@ -408,6 +439,10 @@ namespace RemixSubmit
 		// Getting this wrong is what made world mode dark past a few metres: with R fixed at
 		// 0.1 in a world thousands of units across, everything but the nearest surface was
 		// receiving essentially nothing.
+		// Defined with the rest of the world-camera parameters further down.
+		float world_near_plane();
+		float world_far_plane(float near_plane);
+
 		void place_debug_light(const float (&position)[3], float scene_radius)
 		{
 			const remixapi_Interface& api = s_remix.api();
@@ -415,8 +450,12 @@ namespace RemixSubmit
 			const float radius_override = debug_light_radius_override();
 			const float radiance_override = debug_light_radiance_override();
 
+			// Clamped against the frustum so a single outlier draw cannot turn one frame's
+			// measured extent into a light the size of the level.
+			const float bounded_radius = std::clamp(scene_radius, world_near_plane(), world_far_plane(world_near_plane()));
+
 			const float radius = (radius_override > 0.f) ? radius_override :
-			                                               std::max(s_light_radius_fraction * scene_radius, 1e-4f);
+			                                               std::max(s_light_radius_fraction * bounded_radius, 1e-4f);
 			const float radiance =
 				(radiance_override > 0.f) ?
 					radiance_override :
@@ -452,10 +491,7 @@ namespace RemixSubmit
 			sphere_light.position = {position[0], position[1], position[2]};
 			sphere_light.radius = radius;
 			sphere_light.shaping_hasvalue = 0;
-			// Zero-init leaves this at 0, but the runtime's own default is 1.0
-			// (rtx_lights.h kVolumetricRadianceScaleDefaultValue). At 0 the light contributes
-			// nothing volumetrically.
-			sphere_light.volumetricRadianceScale = 1.f;
+			sphere_light.volumetricRadianceScale = debug_light_volumetric();
 
 			remixapi_LightInfo light_info{};
 			light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
@@ -1875,6 +1911,63 @@ namespace RemixSubmit
 		remix_ps2::materials::begin_frame();
 
 		log_stats(false);
+	}
+
+	void OnGSStateLoaded()
+	{
+		if (!armed())
+			return;
+
+		// The VU1 candidates first, so nothing can latch a pre-load matrix in between.
+		RemixVU1Capture::DropPublished();
+		RemixVU1Capture::SetPinnedOffset(0xFFFFFFFFu);
+
+		// Back to the fallback camera until the back-slice republishes. Holding the old one
+		// for even the three frames s_camera_hold_frames allows would submit the new scene
+		// through the old world transform.
+		s_active_camera = world_camera{};
+		s_camera_last_accept_frame = 0;
+		s_logged_world_camera = false;
+
+		s_frame_viewport = viewport_constants{};
+		s_last_viewport = viewport_constants{};
+		s_frame_bounds = scene_bounds{};
+		s_last_bounds = scene_bounds{};
+
+		// The beacon must not fire just because the first frames after a load submit nothing.
+		s_empty_frame_streak = 0;
+
+		if (!s_live || !s_remix.ok())
+			return;
+
+		// Drop the mesh cache: every hash in it describes geometry from a world that no longer
+		// exists, so keeping it only delays the eviction and holds acceleration structures the
+		// scene will never reference again. The runtime itself is deliberately left up -- a
+		// second Startup after Shutdown is unproven in dxvk-remix and the window-loss guard
+		// depends on the singleton staying alive.
+		const remixapi_Interface& api = s_remix.api();
+		const size_t dropped = s_meshes.size();
+
+		for (const auto& [hash, entry] : s_meshes)
+		{
+			if (entry.handle)
+			{
+				remix_ps2::guarded_destroy_mesh(api.DestroyMesh, entry.handle);
+				++s_stats.meshes_destroyed;
+			}
+		}
+
+		s_meshes.clear();
+		s_poisoned.clear();
+
+		// Materials are content-keyed, so they survive a load by construction -- the same
+		// texture bytes produce the same hash. Only the per-frame budget is reset, which is
+		// what ramps the rebuild instead of doing it all in the first frame back.
+		remix_ps2::materials::begin_frame();
+
+		INFO_LOG("Remix: save state loaded -- dropped {} meshes, camera back to fallback until "
+				 "the back-slice republishes",
+			dropped);
 	}
 
 	void OnGSClose()

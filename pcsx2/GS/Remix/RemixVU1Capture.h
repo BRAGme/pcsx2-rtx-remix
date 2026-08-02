@@ -92,6 +92,11 @@ namespace RemixVU1Capture
 	// per-frame budget (PCSX2_REMIX_SCANKICKS, default 16) and publishes.
 	void OnXGKick();
 
+	// GS thread. Discards everything published so far: the candidates describe a scene that no
+	// longer exists (a save-state load replaces GS local memory and the guest's whole world in
+	// one step). Latch() then reports "nothing" until the VU side publishes afresh.
+	void DropPublished();
+
 	// GS thread, once per VSync. Copies the published set and starts a new VU-side frame.
 	// False means nothing has ever been published.
 	bool Latch(Frame& out);

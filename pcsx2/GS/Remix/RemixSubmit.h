@@ -62,6 +62,17 @@ namespace RemixSubmit
 	// Frame boundary, from GSRenderer::VSync after Merge() and before the present block.
 	void OnVSync();
 
+	// A save state was loaded: GS local memory, and with it the guest's entire world, has just
+	// been replaced in a single step. Called from the FreezeAction::Load branch of GSfreeze
+	// after Defrost succeeds -- which runs on the GS thread, dispatched from the MTGS command
+	// loop (MTGS.cpp:527), the same thread as every other entry point here.
+	//
+	// Everything derived from the old scene has to go: the world camera solved from the old
+	// state would un-project the new state's vertices into nonsense, the mesh cache is keyed on
+	// hashes nothing will ever match again, and the VU1 seqlock's published candidates were
+	// scanned out of the old VU1 memory.
+	void OnGSStateLoaded();
+
 	// Renderer teardown, from GSclose. Destroys meshes and lights; the runtime itself stays
 	// loaded for the life of the process (re-Startup support in dxvk-remix is unproven).
 	void OnGSClose();
