@@ -46,9 +46,14 @@ namespace RemixVU1Capture
 		// Viewport-independent shape score. Only used to rank candidates for the cut; the
 		// real accept/reject is the GS-side split + score_perspective.
 		float score;
-		u32 mem_offset; // byte offset into vuRegs[1].Mem
+		u32 mem_offset; // byte offset into vuRegs[1].Mem (of row 0, for a back-sliced matrix)
 		u32 start_pc; // vuRegs[1].start_pc at the kick that produced it
-		u64 ucode_hash; // FNV-1a over vuRegs[1].Micro -- the phase-2 ucode fingerprint
+		u64 ucode_hash; // FNV-1a over vuRegs[1].Micro -- the ucode fingerprint
+
+		// 0 = heuristic scan, 1 = ucode back-slice (live VI base), 2 = back-slice against
+		// the VIF1 TOPS double-buffer base. Anything but 0 is deterministic: the microcode
+		// itself said where the matrix is, so it does not compete on shape score.
+		u8 source;
 	};
 
 	struct Frame
@@ -59,6 +64,8 @@ namespace RemixVU1Capture
 		u32 windows_examined;
 		u32 windows_survived; // passed the shape prefilter
 		u32 kicks_reentrant; // kicks dropped because another thread was already scanning
+		u32 sliced_matrices; // matrices the ucode back-slice located this frame
+		u32 sliced_published; // of those, how many were read out and published
 		Candidate items[max_candidates];
 	};
 

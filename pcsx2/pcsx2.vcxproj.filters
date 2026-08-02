@@ -1467,6 +1467,9 @@
     <ClCompile Include="GS\Remix\RemixVU1Capture.cpp">
       <Filter>System\Ps2\GS\Remix</Filter>
     </ClCompile>
+    <ClCompile Include="GS\Remix\RemixVU1Slice.cpp">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Patch.h">
@@ -2447,6 +2450,9 @@
       <Filter>System\Ps2\GS\Remix</Filter>
     </ClInclude>
     <ClInclude Include="GS\Remix\RemixVU1Capture.h">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Remix\RemixVU1Slice.h">
       <Filter>System\Ps2\GS\Remix</Filter>
     </ClInclude>
   </ItemGroup>

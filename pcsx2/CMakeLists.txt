@@ -714,6 +714,7 @@ if(WIN32)
 			GS/Remix/RemixSubmit.cpp
 			GS/Remix/RemixTransforms.cpp
 			GS/Remix/RemixVU1Capture.cpp
+			GS/Remix/RemixVU1Slice.cpp
 		)
 		list(APPEND pcsx2GSHeaders
 			GS/Remix/remix_c.h
@@ -721,6 +722,7 @@ if(WIN32)
 			GS/Remix/RemixSubmit.h
 			GS/Remix/RemixTransforms.h
 			GS/Remix/RemixVU1Capture.h
+			GS/Remix/RemixVU1Slice.h
 		)
 	endif()
 elseif(LINUX)

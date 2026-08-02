@@ -32,11 +32,14 @@ namespace RemixSubmit
 {
 	namespace
 	{
-		// Frames a mesh may go unreferenced before its handle is released. Matches RPCS3.
-		constexpr u64 s_mesh_idle_frames = 300;
-
-		// How often the counter block is emitted, in frames.
-		constexpr u64 s_stats_interval_frames = 300;
+		// How often the counter block is emitted, in frames. Env-tunable so a short or
+		// crashing session still reports something before it ends.
+		u64 stats_interval_frames()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(1, remix_ps2::read_env_int(L"PCSX2_REMIX_STATSFRAMES", 300)));
+			return value;
+		}
 
 		// Sanity ceilings on a single submitted mesh, from RPCS3. Guards against a malformed
 		// draw turning into a multi-gigabyte allocation.
@@ -45,7 +48,13 @@ namespace RemixSubmit
 
 		// Positions further out than this are the FLT_MIN/m_max Q guards leaking through
 		// (GSState.cpp:1399/:1403 replace a zero Q with FLT_MIN, whose reciprocal is ~8.5e37).
-		constexpr float s_max_position_magnitude = 1.0e9f;
+		//
+		// 1e9 was the original ceiling and it is far too generous for a path tracer: a
+		// triangle spanning a billion units in the same acceleration structure as one
+		// spanning ten collapses float precision and produces degenerate BVH nodes. The
+		// ceiling is now the frustum the camera actually spans -- anything past the far plane
+		// cannot contribute to the image anyway.
+		float max_position_magnitude();
 
 		constexpr remixapi_Transform s_identity_transform =
 			{{
@@ -96,6 +105,9 @@ namespace RemixSubmit
 			u64 vu_windows = 0;
 			u64 vu_survivors = 0; // passed the VU-side shape prefilter
 			u64 vu_reentrant = 0; // kicks dropped because two threads executed VU1 at once
+			u64 vu_sliced = 0; // matrices the ucode back-slice located
+			u64 vu_sliced_published = 0; // of those, read out of VU1 memory and offered
+			u64 cam_accept_sliced = 0; // accepted cameras that came from the back-slice
 			u64 cam_candidates = 0; // offered to the GS side, summed over frames
 			u64 cam_reject_split = 0; // split_view_projection_direct refused
 			u64 cam_reject_score = 0; // split worked, score_perspective refused
@@ -409,17 +421,42 @@ namespace RemixSubmit
 
 		// --- the world-anchored camera ----------------------------------------------------
 
-		// Far plane for a recovered world camera. Unless PCSX2_REMIX_FARPLANE is set
-		// explicitly it follows the recovered near plane, because a PS2 title's world unit
-		// could be a metre or a centimetre and a fixed 1000 would either clip the level away
-		// or crush the whole scene into the first depth slice.
+		float env_float(const wchar_t* name, float fallback)
+		{
+			const std::wstring env = remix_ps2::read_env(name);
+			if (env.empty())
+				return fallback;
+
+			const float parsed = static_cast<float>(::_wtof(env.c_str()));
+			return (std::isfinite(parsed) && parsed > 0.f) ? parsed : fallback;
+		}
+
+		// Near/far for a recovered world camera, in the guest's own world units. These are
+		// constants rather than measurements -- see the note at the accept site for why the
+		// matrix cannot supply them for this title.
+		float world_near_plane()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_NEARPLANE", 1.f);
+			return value;
+		}
+
+		// Unless PCSX2_REMIX_FARPLANE is set explicitly this is a wide default: a PS2 title's
+		// world unit could be a metre or a centimetre, and the 1000 the view-space tier uses
+		// would clip a level whose coordinates run into the thousands, which R6 3's do.
 		float world_far_plane(float near_plane)
 		{
 			static const bool explicit_far = !remix_ps2::read_env(L"PCSX2_REMIX_FARPLANE").empty();
 			if (explicit_far)
 				return remix_ps2::hardcoded_far_plane();
 
-			return near_plane * 4096.f;
+			return std::max(near_plane * 4096.f, 100000.f);
+		}
+
+		float max_position_magnitude()
+		{
+			static const float value =
+				std::max(world_far_plane(world_near_plane()), remix_ps2::hardcoded_far_plane()) * 4.f;
+			return value;
 		}
 
 		u64 hash_floats(const float* values, u32 count)
@@ -528,6 +565,8 @@ namespace RemixSubmit
 			s_stats.vu_windows += frame.windows_examined;
 			s_stats.vu_survivors += frame.windows_survived;
 			s_stats.vu_reentrant += frame.kicks_reentrant;
+			s_stats.vu_sliced += frame.sliced_matrices;
+			s_stats.vu_sliced_published += frame.sliced_published;
 			s_stats.cam_candidates += frame.count;
 			s_stats.cam_last_candidates = frame.count;
 
@@ -574,6 +613,7 @@ namespace RemixSubmit
 			remix_ps2::mat4 best_normalized = remix_ps2::mat4_identity();
 			u64 best_hash = 0;
 			u32 best_offset = 0;
+			u8 best_source = 0;
 			const char* best_name = "";
 			bool best_transposed = false;
 
@@ -596,8 +636,62 @@ namespace RemixSubmit
 				{
 					const remix_ps2::mat4 oriented = (major == 0) ? raw : remix_ps2::mat4_transpose(raw);
 
-					for (const hypothesis& hyp : hypotheses)
+					// The four fixed hypotheses above assume the guest's post-divide space is
+					// one of the obvious ones. Rainbow Six 3's is not: it emits a [0,1]-style
+					// normalised space and keeps the aspect correction in a separate
+					// post-divide scale vector, so its offsets are 0.5 and nothing in the
+					// table matches.
+					//
+					// The offsets do not have to be guessed. For a fused matrix the viewport
+					// offset is *determined*: u = col0 - ox*col3 must be the view rotation's
+					// column 0 times a scalar, and that is only orthogonal to col3 for
+					// ox = dot(col0, col3) / |col3|^2. Same for oy. Any output range of the
+					// form NDC[-1,1] -> [0, R] additionally has scale == offset, which is
+					// what fixes sx.
+					//
+					// sy is then the one genuinely free parameter, and it is chosen so the
+					// recovered aspect equals the display's. Be clear about what that costs:
+					// score_perspective's aspect test is constructed rather than measured for
+					// these two hypotheses, so it no longer discriminates. Its fovY window
+					// still does, and the split itself -- which is what actually decides
+					// whether the matrix is a camera -- is untouched.
+					hypothesis derived[2] = {};
+					u32 derived_count = 0;
 					{
+						const float c3[3] = {oriented.m[0][3], oriented.m[1][3], oriented.m[2][3]};
+						const float len_sq = (c3[0] * c3[0]) + (c3[1] * c3[1]) + (c3[2] * c3[2]);
+
+						if (len_sq > 1e-8f && std::isfinite(len_sq))
+						{
+							const float c0[3] = {oriented.m[0][0], oriented.m[1][0], oriented.m[2][0]};
+							const float c1[3] = {oriented.m[0][1], oriented.m[1][1], oriented.m[2][1]};
+
+							const float ox = ((c0[0] * c3[0]) + (c0[1] * c3[1]) + (c0[2] * c3[2])) / len_sq;
+							const float oy = ((c1[0] * c3[0]) + (c1[1] * c3[1]) + (c1[2] * c3[2])) / len_sq;
+
+							const float u[3] = {c0[0] - (ox * c3[0]), c0[1] - (ox * c3[1]), c0[2] - (ox * c3[2])};
+							const float v[3] = {c1[0] - (oy * c3[0]), c1[1] - (oy * c3[1]), c1[2] - (oy * c3[2])};
+
+							const float len_u = std::sqrt((u[0] * u[0]) + (u[1] * u[1]) + (u[2] * u[2]));
+							const float len_v = std::sqrt((v[0] * v[0]) + (v[1] * v[1]) + (v[2] * v[2]));
+
+							if (len_u > 1e-6f && len_v > 1e-6f && std::abs(ox) > 1e-6f && std::abs(oy) > 1e-6f)
+							{
+								const float sy_mag = std::abs(oy) * (len_v / len_u) / reference_aspect;
+
+								derived[0] = {"auto", ox, ox, -sy_mag, oy};
+								derived[1] = {"autoY", ox, ox, sy_mag, oy};
+								derived_count = 2;
+							}
+						}
+					}
+
+					for (u32 h = 0; h < (std::size(hypotheses) + derived_count); ++h)
+					{
+						const hypothesis& hyp = (h < std::size(hypotheses)) ?
+						                            hypotheses[h] :
+						                            derived[h - std::size(hypotheses)];
+
 						const remix_ps2::mat4 normalized = remix_ps2::normalize_screen_clip(
 							oriented, hyp.scale_x, hyp.offset_x, hyp.scale_y, hyp.offset_y);
 
@@ -626,6 +720,13 @@ namespace RemixSubmit
 						if (content == s_active_camera.matrix_hash)
 							score += 0.5f;
 
+						// A matrix the microcode itself pointed at outranks anything the
+						// window scan turned up. The split and the perspective filter above
+						// have already agreed it is a camera; this only settles which of
+						// several accepted candidates the frame anchors to.
+						if (candidate.source != 0)
+							score += 10.f;
+
 						if (score > candidate_best)
 						{
 							candidate_best = score;
@@ -640,6 +741,7 @@ namespace RemixSubmit
 							best_normalized = normalized;
 							best_hash = content;
 							best_offset = candidate.mem_offset;
+							best_source = candidate.source;
 							best_name = hyp.name;
 							best_transposed = (major != 0);
 						}
@@ -649,9 +751,10 @@ namespace RemixSubmit
 				if (dump)
 				{
 					dump_write(fmt::format(
-						"f={} off=0x{:04x} pc=0x{:04x} ucode=0x{:016x} shape={:.2f} res=[{} ] best={} "
+						"f={} src={} off=0x{:04x} pc=0x{:04x} ucode=0x{:016x} shape={:.2f} res=[{} ] best={} "
 						"score={:.2f} fovY={:.2f} aspect={:.3f} near={:.5g} M={}",
-						s_frame_counter, candidate.mem_offset, candidate.start_pc, candidate.ucode_hash,
+						s_frame_counter, (candidate.source == 0) ? "scan" : ((candidate.source == 1) ? "slice" : "slice-tops"),
+						candidate.mem_offset, candidate.start_pc, candidate.ucode_hash,
 						candidate.score, detail, candidate_name, candidate_best,
 						candidate_params.fov_y_degrees, candidate_params.aspect, candidate_params.near_plane,
 						remix_ps2::format_matrix(raw)));
@@ -670,12 +773,16 @@ namespace RemixSubmit
 			remix_ps2::projection_params params{};
 			const bool described = remix_ps2::describe_projection(best_split.projection, params);
 
-			// near = |m[3][2] / m[2][2]| is scale-invariant in the z column, so it is a real
-			// world-unit distance even though the z column itself is in raw GS Z units.
-			camera.near_plane = (described && std::isfinite(params.near_plane) &&
-									params.near_plane > 1e-4f && params.near_plane < 1e6f) ?
-			                        params.near_plane :
-			                        0.1f;
+			// The near plane is NOT taken from the matrix, and the reason is specific rather
+			// than cautious. |m[3][2] / m[2][2]| is only a distance when the z column is a
+			// projective depth. Rainbow Six 3's is not: its z output is w plus a constant
+			// (col2 == col3 across rows 0-2, with m[3][2] carrying the offset), so that ratio
+			// comes back as ~2716 -- the offset, not a near plane. Measuring it and believing
+			// it produced a 1.1e7-deep frustum and a debug light scaled by 27000.
+			//
+			// So near/far are world-unit constants, env-overridable, and the recovered value
+			// is logged for information only.
+			camera.near_plane = world_near_plane();
 			camera.far_plane = world_far_plane(camera.near_plane);
 			camera.projection = remix_ps2::rebuild_projection_z(best_split.projection, camera.near_plane, camera.far_plane);
 
@@ -698,6 +805,8 @@ namespace RemixSubmit
 			s_active_camera = camera;
 			s_camera_last_accept_frame = s_frame_counter;
 			++s_stats.cam_accept;
+			if (best_source != 0)
+				++s_stats.cam_accept_sliced;
 
 			// Pin the address the winner came from. A camera actually recovered from an
 			// offset is stronger evidence than any shape score, and without it the true
@@ -707,11 +816,14 @@ namespace RemixSubmit
 			if (!s_logged_world_camera)
 			{
 				s_logged_world_camera = true;
-				INFO_LOG("Remix: world camera resolved -- hypothesis {}/{}, score {:.2f}, fovY {:.1f} deg, "
-						 "near {:.5g}, far {:.5g}, eye ({:.3f}, {:.3f}, {:.3f})",
+				INFO_LOG("Remix: world camera resolved -- source {}, hypothesis {}/{}, score {:.2f}, "
+						 "fovY {:.1f} deg, near {:.5g}, far {:.5g}, eye ({:.3f}, {:.3f}, {:.3f}) "
+						 "[matrix-implied near {:.5g}, not used]",
+					(best_source == 0) ? "window scan" : ((best_source == 1) ? "ucode back-slice" : "ucode back-slice (TOPS)"),
 					best_name, best_transposed ? "column-major" : "row-major", best_score,
 					params.fov_y_degrees, camera.near_plane, camera.far_plane,
-					camera.position[0], camera.position[1], camera.position[2]);
+					camera.position[0], camera.position[1], camera.position[2],
+					described ? params.near_plane : 0.f);
 			}
 		}
 
@@ -780,13 +892,57 @@ namespace RemixSubmit
 			return g_armed;
 		}
 
+		// Frames a mesh may go unreferenced, and a ceiling on how many may be resident.
+		//
+		// Both exist because of a confirmed failure, not as tuning: with the stock RPCS3
+		// numbers the Remix runtime reaches VK_ERROR_DEVICE_LOST and exits (its own log says
+		// "DxvkSubmissionQueue: Exiting after GPU device loss", process exit 0x60D0DEAD).
+		// A PS2 frame submits an order of magnitude more draws than an RSX one, so 300 frames
+		// of retention means thousands of live acceleration structures and tens of thousands
+		// of builds per second.
+		u64 mesh_idle_frames()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(1, remix_ps2::read_env_int(L"PCSX2_REMIX_MESHIDLE", 120)));
+			return value;
+		}
+
+		size_t mesh_live_cap()
+		{
+			static const size_t value =
+				static_cast<size_t>(std::max<s64>(64, remix_ps2::read_env_int(L"PCSX2_REMIX_MESHCAP", 4096)));
+			return value;
+		}
+
 		void reap_idle_meshes()
 		{
-			if (s_frame_counter < s_mesh_idle_frames)
+			const u64 idle_frames = mesh_idle_frames();
+			const remixapi_Interface& api = s_remix.api();
+
+			// Over the ceiling: evict least-recently-used until back under it, regardless of
+			// age. Without this a burst of new geometry can outrun the age-based reap.
+			while (s_meshes.size() > mesh_live_cap())
+			{
+				auto oldest = s_meshes.begin();
+				for (auto it = s_meshes.begin(); it != s_meshes.end(); ++it)
+				{
+					if (it->second.last_used_frame < oldest->second.last_used_frame)
+						oldest = it;
+				}
+
+				if (oldest->second.handle)
+				{
+					remix_ps2::guarded_destroy_mesh(api.DestroyMesh, oldest->second.handle);
+					++s_stats.meshes_destroyed;
+				}
+
+				s_meshes.erase(oldest);
+			}
+
+			if (s_frame_counter < idle_frames)
 				return;
 
-			const u64 cutoff = s_frame_counter - s_mesh_idle_frames;
-			const remixapi_Interface& api = s_remix.api();
+			const u64 cutoff = s_frame_counter - idle_frames;
 
 			for (auto it = s_meshes.begin(); it != s_meshes.end();)
 			{
@@ -808,7 +964,7 @@ namespace RemixSubmit
 
 		void log_stats(bool force)
 		{
-			if (!force && (s_frame_counter == 0 || (s_frame_counter % s_stats_interval_frames) != 0))
+			if (!force && (s_frame_counter == 0 || (s_frame_counter % stats_interval_frames()) != 0))
 				return;
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
@@ -824,12 +980,13 @@ namespace RemixSubmit
 			// Second line: the world anchor. Every stage of the pipeline is separately
 			// visible, so a null result names the stage that produced it -- no kicks, no
 			// windows through the shape prefilter, no candidates, no split, or no score.
-			INFO_LOG("Remix: vu kicks {} scanned {} reentrant {} windows {} shape-ok {} | cand {} (now {}) | "
-					 "split-reject {} score-reject {} accept {} | camera {}{}",
+			INFO_LOG("Remix: vu kicks {} scanned {} reentrant {} windows {} shape-ok {} | "
+					 "slice matrices {} published {} | cand {} (now {}) | "
+					 "split-reject {} score-reject {} accept {} (sliced {}) | camera {}{}",
 				s_stats.vu_kicks, s_stats.vu_kicks_scanned, s_stats.vu_reentrant, s_stats.vu_windows,
-				s_stats.vu_survivors,
+				s_stats.vu_survivors, s_stats.vu_sliced, s_stats.vu_sliced_published,
 				s_stats.cam_candidates, s_stats.cam_last_candidates, s_stats.cam_reject_split,
-				s_stats.cam_reject_score, s_stats.cam_accept,
+				s_stats.cam_reject_score, s_stats.cam_accept, s_stats.cam_accept_sliced,
 				s_active_camera.valid ? "world score " : "view-space",
 				s_active_camera.valid ? fmt::format("{:.2f} near {:.5g}", s_active_camera.score, s_active_camera.near_plane) : "");
 		}
@@ -1008,6 +1165,7 @@ namespace RemixSubmit
 		// only difference is the three lines that turn (ndc, w) into a position.
 		const bool world_mode = s_active_camera.valid;
 		const remix_ps2::clip_solver& solver = s_active_camera.solver;
+		const float position_limit = max_position_magnitude();
 
 		const GSVertex* const verts = r.m_vertex->buff;
 
@@ -1058,9 +1216,9 @@ namespace RemixSubmit
 			            (static_cast<u32>(v.RGBAQ.G) << 8) | static_cast<u32>(v.RGBAQ.B);
 
 			if (!std::isfinite(out.position[0]) || !std::isfinite(out.position[1]) || !std::isfinite(out.position[2]) ||
-				std::abs(out.position[0]) > s_max_position_magnitude ||
-				std::abs(out.position[1]) > s_max_position_magnitude ||
-				std::abs(out.position[2]) > s_max_position_magnitude ||
+				std::abs(out.position[0]) > position_limit ||
+				std::abs(out.position[1]) > position_limit ||
+				std::abs(out.position[2]) > position_limit ||
 				!(w > 0.0f))
 			{
 				++s_stats.skip_nonfinite;

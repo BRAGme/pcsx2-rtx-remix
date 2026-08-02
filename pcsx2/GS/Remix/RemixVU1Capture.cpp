@@ -6,6 +6,7 @@
 // RemixRuntime.h first: it pulls RedtapeWindows.h (NOMINMAX) ahead of remix_c.h's raw
 // <windows.h>, which would otherwise macro-poison min/max for everything after it.
 #include "GS/Remix/RemixRuntime.h"
+#include "GS/Remix/RemixVU1Slice.h"
 
 #include "VU.h"
 #include "VUmicro.h"
@@ -15,10 +16,13 @@
 #include "common/FileSystem.h"
 #include "common/Path.h"
 
+#include "fmt/format.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace RemixVU1Capture
 {
@@ -246,7 +250,7 @@ namespace RemixVU1Capture
 		// Keeps the frame's top max_candidates by shape score, de-duplicated by content.
 		// VU1 memory is double-buffered through VIF1.TOPS, so the same matrix routinely
 		// appears at two addresses in the same scan.
-		void insert_candidate(const float* m, float score, u32 offset, u32 start_pc, u64 ucode)
+		void insert_candidate(const float* m, float score, u32 offset, u32 start_pc, u64 ucode, u8 source = 0)
 		{
 			const u64 content = hash_bits(m, 16);
 
@@ -289,7 +293,101 @@ namespace RemixVU1Capture
 			out.mem_offset = offset;
 			out.start_pc = start_pc;
 			out.ucode_hash = ucode;
+			out.source = source;
 			s_frame_hashes[slot] = content;
+		}
+
+		// --- ucode back-slice, cached per (ucode hash, start_pc) --------------------------
+		//
+		// This is the primary camera source. The heuristic window scan above stays as the
+		// fallback, exactly where it was, because a program whose transform this cannot
+		// decode still deserves a chance.
+		constexpr u32 s_max_programs = 8;
+
+		struct ProgramEntry
+		{
+			bool used = false;
+			u64 ucode_hash = 0;
+			u32 start_pc = 0;
+			RemixVU1Slice::Program program;
+		};
+
+		ProgramEntry s_programs[s_max_programs];
+		u32 s_program_count = 0;
+
+		bool s_ucode_dump_enabled = false;
+
+		void dump_ucode(const ProgramEntry& entry, const u8* micro)
+		{
+			const std::string& dir = EmuFolders::Logs.empty() ? EmuFolders::AppRoot : EmuFolders::Logs;
+
+			const std::string bin_path =
+				Path::Combine(dir, fmt::format("remix_ucode_{:016x}.bin", entry.ucode_hash));
+			if (std::FILE* f = FileSystem::OpenCFile(bin_path.c_str(), "wb"))
+			{
+				std::fwrite(micro, 1, VU1_PROGSIZE, f);
+				std::fclose(f);
+			}
+
+			const std::string txt_path =
+				Path::Combine(dir, fmt::format("remix_ucode_{:016x}.txt", entry.ucode_hash));
+			if (std::FILE* f = FileSystem::OpenCFile(txt_path.c_str(), "w"))
+			{
+				const std::string text = RemixVU1Slice::Describe(micro, entry.start_pc, entry.program);
+				std::fwrite(text.data(), 1, text.size(), f);
+				std::fclose(f);
+			}
+		}
+
+		const RemixVU1Slice::Program* program_for(const u8* micro, u64 ucode_hash, u32 start_pc)
+		{
+			for (u32 i = 0; i < s_program_count; ++i)
+			{
+				if (s_programs[i].ucode_hash == ucode_hash && s_programs[i].start_pc == start_pc)
+					return &s_programs[i].program;
+			}
+
+			if (s_program_count >= s_max_programs)
+				return nullptr;
+
+			ProgramEntry& entry = s_programs[s_program_count++];
+			entry.used = true;
+			entry.ucode_hash = ucode_hash;
+			entry.start_pc = start_pc;
+			RemixVU1Slice::Analyze(micro, start_pc, entry.program);
+
+			if (s_ucode_dump_enabled)
+				dump_ucode(entry, micro);
+
+			return &entry.program;
+		}
+
+		// Reads one back-sliced matrix out of VU1 data memory. 'base_override' is used for
+		// the TOPS hypothesis; otherwise the live VI register the program itself computed is
+		// the base, which already carries whatever double-buffer bank is current.
+		bool read_sliced_matrix(const u8* mem, const RemixVU1Slice::Matrix& matrix,
+			bool use_tops, u32 tops, float (&out)[16], u32& out_offset)
+		{
+			for (u32 row = 0; row < 4; ++row)
+			{
+				const RemixVU1Slice::RowLoad& load = matrix.rows[row];
+				if (load.kind != RemixVU1Slice::LoadKind::LQ)
+					return false;
+
+				const u32 base = use_tops ? tops : static_cast<u32>(vuRegs[1].VI[load.vi_base].US[0]);
+				const u32 qword = (base + static_cast<u32>(static_cast<s32>(load.imm))) & 0x3FFu;
+				const u32 offset = qword * 16u;
+
+				if ((offset + 16u) > VU1_MEMSIZE)
+					return false;
+
+				std::memcpy(&out[row * 4], mem + offset, 16);
+
+				if (row == 0)
+					out_offset = offset;
+			}
+
+			return true;
 		}
 
 		void publish()
@@ -320,6 +418,14 @@ namespace RemixVU1Capture
 			s_generation_seen = 0;
 			s_scanning.store(false, std::memory_order_relaxed);
 			s_scan_budget = read_scan_budget();
+
+			// The back-slice cache is per session: a new game means new microprograms.
+			for (u32 i = 0; i < s_max_programs; ++i)
+				s_programs[i] = ProgramEntry{};
+			s_program_count = 0;
+
+			const std::wstring ucode_env = remix_ps2::read_env(L"PCSX2_REMIX_UCODEDUMP");
+			s_ucode_dump_enabled = !ucode_env.empty() && ucode_env[0] != L'0';
 
 			const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_SCANTRACE");
 			s_trace_enabled = !env.empty() && env[0] != L'0';
@@ -385,6 +491,47 @@ namespace RemixVU1Capture
 		const u32 start_pc = vuRegs[1].start_pc;
 
 		trace("ucode", ucode, start_pc);
+
+		// --- the deterministic path, first -------------------------------------------------
+		// The microcode says where its transform lives, so these go in ahead of anything the
+		// shape scan finds. They still go through the GS side's normalise/split/score gate,
+		// which is what confirms a decoded address actually holds a camera.
+		if (const RemixVU1Slice::Program* program = program_for(vuRegs[1].Micro, ucode, start_pc))
+		{
+			s_frame.sliced_matrices += program->count;
+
+			// VU.h's own accessor, so this file never has to know about vif0/vif1 selection.
+			// Under MTVU the authoritative copy is vu1Thread.vifRegs; this is the secondary
+			// hypothesis only, and the live-VI path above already covers the normal case.
+			const u32 tops = static_cast<u32>(vuRegs[1].GetVifRegs().tops);
+
+			for (u32 i = 0; i < program->count; ++i)
+			{
+				const RemixVU1Slice::Matrix& matrix = program->items[i];
+				if (!matrix.resolvable)
+					continue;
+
+				float m[16];
+				u32 offset = 0;
+
+				if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && finite_window(m))
+				{
+					insert_candidate(m, 1000.f, offset, start_pc, ucode, 1);
+					++s_frame.sliced_published;
+				}
+
+				// Second hypothesis for a VIF-relative base: if the program indexed off a
+				// register it loaded from XTOP, the live VI is right, but a program that
+				// recomputed that register after the load would not be -- so offer the
+				// current TOPS bank as well and let the GS side arbitrate.
+				if (matrix.rows[0].vi_base != 0 &&
+					read_sliced_matrix(mem, matrix, true, tops, m, offset) && finite_window(m))
+				{
+					insert_candidate(m, 999.f, offset, start_pc, ucode, 2);
+					++s_frame.sliced_published;
+				}
+			}
+		}
 
 		for (u32 offset = 0; (offset + s_matrix_bytes) <= VU1_MEMSIZE; offset += s_qword)
 		{
