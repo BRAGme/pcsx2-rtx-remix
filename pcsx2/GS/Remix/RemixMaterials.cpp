@@ -44,10 +44,12 @@ namespace remix_ps2::materials
 		// order of magnitude more distinct textures than an RSX one, so the warm-up would take
 		// minutes at 8. The budget exists to stop a level transition from stalling on hundreds
 		// of CreateTexture calls in a single frame, not to be a steady-state limit.
+		// 0 disables the bridge outright, which is the runtime bisection handle: it takes
+		// materials out of the picture without a rebuild.
 		u32 texture_budget()
 		{
 			static const u32 value =
-				static_cast<u32>(std::max<s64>(1, read_env_int(L"PCSX2_REMIX_TEXBUDGET", 32)));
+				static_cast<u32>(std::max<s64>(0, read_env_int(L"PCSX2_REMIX_TEXBUDGET", 32)));
 			return value;
 		}
 
@@ -83,6 +85,19 @@ namespace remix_ps2::materials
 			return value;
 		}
 
+		// Bisection handle for the bridge itself, because "materials on" is four separable
+		// runtime interactions and a GPU device loss names none of them:
+		//   1 = key + decode only, no Remix call at all
+		//   2 = CreateTexture only, mesh still gets a null material
+		//   3 = CreateTexture + CreateMaterial, but with no albedo texture named
+		//   4 = full, including the pseudo-path that binds the two (default)
+		int material_stage()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(read_env_int(L"PCSX2_REMIX_MATSTAGE", 4), 1, 4));
+			return value;
+		}
+
 		bool textures_linear()
 		{
 			static const bool value = read_env_int(L"PCSX2_REMIX_TEXLINEAR", 0) != 0;
@@ -112,6 +127,13 @@ namespace remix_ps2::materials
 		{
 			remixapi_TextureHandle texture = nullptr;
 			remixapi_MaterialHandle material = nullptr;
+			// The decoded BGRA8 payload, kept resident for the life of the texture. This is not
+			// belt-and-braces: the runtime does not take a copy at CreateTexture time, so a
+			// shared scratch buffer that the next texture overwrites is a use-after-free from
+			// the GPU's point of view. It cost a reproducible VK_ERROR_DEVICE_LOST about two
+			// seconds into every session before it was made per-entry. RPCS3 keeps its decoded
+			// BGRA8 resident for the same reason (RemixTextures.cpp, "kept resident").
+			std::vector<u8> pixels;
 			u64 last_used_frame = 0;
 			u32 width = 0;
 			u32 height = 0;
@@ -147,10 +169,37 @@ namespace remix_ps2::materials
 		std::unordered_set<u64> s_seen_content;
 		std::unordered_set<u64> s_seen_tex0;
 		std::unordered_set<u64> s_dumped;
-		std::vector<u8> s_decode_buffer;
-		std::vector<u8> s_pixel_buffer;
+
+		// The unswizzle target MUST be vector-aligned: GSLocalMemory's readTexture functions
+		// store with aligned SIMD writes, which is why PCSX2's own scratch buffer is an
+		// _aligned_malloc (GSTextureCache.cpp:55) and DumpTexture aligns its per-texture buffer
+		// to 32 (GSTextureReplacements.cpp:836). std::vector<u8> only guarantees 16 on MSVC x64,
+		// so it is the wrong container for this and cannot be used here.
+		u8* s_decode_buffer = nullptr;
+		size_t s_decode_capacity = 0;
+
 		counters s_stats{};
 		u32 s_budget_left = 0;
+
+		bool reserve_decode_buffer(size_t bytes)
+		{
+			if (s_decode_capacity >= bytes)
+				return true;
+
+			if (s_decode_buffer)
+			{
+				_aligned_free(s_decode_buffer);
+				s_decode_buffer = nullptr;
+				s_decode_capacity = 0;
+			}
+
+			s_decode_buffer = static_cast<u8*>(_aligned_malloc(bytes, VECTOR_ALIGNMENT));
+			if (!s_decode_buffer)
+				return false;
+
+			s_decode_capacity = bytes;
+			return true;
+		}
 
 		// Bounded so a title that really does animate every palette cannot turn the
 		// measurement sets into a leak.
@@ -190,7 +239,7 @@ namespace remix_ps2::materials
 		// Same route as GSTextureReplacements::DumpTexture (GSTextureReplacements.cpp:801-844),
 		// so what Remix gets is byte-for-byte what a PCSX2 texture dump would contain, modulo
 		// the alpha expansion and the channel order Remix wants.
-		bool decode(const GSTextureCache::Source& source, u32& out_width, u32& out_height)
+		bool decode(const GSTextureCache::Source& source, std::vector<u8>& out_pixels, u32& out_width, u32& out_height)
 		{
 			const GIFRegTEX0& TEX0 = source.m_TEX0;
 			const GIFRegTEXA& TEXA = source.m_TEXA;
@@ -214,27 +263,30 @@ namespace remix_ps2::materials
 			if (read_width <= 0 || read_height <= 0)
 				return false;
 
+			// Block-aligned, so read_width is a multiple of the format's block width and the
+			// pitch is a multiple of 32 for every PSM -- the same assumption DumpTexture makes.
 			const u32 pitch = static_cast<u32>(read_width) * sizeof(u32);
 			const size_t needed = static_cast<size_t>(pitch) * static_cast<size_t>(read_height);
 
-			s_decode_buffer.resize(needed);
+			if (!reserve_decode_buffer(needed))
+				return false;
 
 			GSLocalMemory& mem = g_gs_renderer->m_mem;
 			psm.rtx(mem, mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM), block_rect,
-				s_decode_buffer.data(), static_cast<int>(pitch), TEXA);
+				s_decode_buffer, static_cast<int>(pitch), TEXA);
 
 			// rtx() writes the whole block-aligned rect; the texture itself is the sub-rect.
 			const u32 offset = (static_cast<u32>(rect.top - block_rect.top) * pitch) +
 			                   (static_cast<u32>(rect.left - block_rect.left) * sizeof(u32));
 
-			s_pixel_buffer.resize(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
+			out_pixels.resize(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
 
 			const bool alpha_expand = expand_alpha();
-			u8* dst = s_pixel_buffer.data();
+			u8* dst = out_pixels.data();
 
 			for (int y = 0; y < th; ++y)
 			{
-				const u8* src = s_decode_buffer.data() + offset + (static_cast<size_t>(y) * pitch);
+				const u8* src = s_decode_buffer + offset + (static_cast<size_t>(y) * pitch);
 
 				for (int x = 0; x < tw; ++x, src += 4, dst += 4)
 				{
@@ -255,13 +307,19 @@ namespace remix_ps2::materials
 		bool create(const runtime& rt, u64 content_hash, const GSTextureCache::Source& source, material_entry& entry)
 		{
 			const Common::Timer::Value decode_start = Common::Timer::GetCurrentValue();
-			const bool decoded = decode(source, entry.width, entry.height);
+			const bool decoded = decode(source, entry.pixels, entry.width, entry.height);
 			s_stats.decode_ticks += Common::Timer::GetCurrentValue() - decode_start;
 
 			if (!decoded)
 			{
 				++s_stats.skip_unsupported;
 				return false;
+			}
+
+			if (material_stage() < 2)
+			{
+				++s_stats.created;
+				return true; // hashed and decoded, but nothing handed to the runtime
 			}
 
 			const remixapi_Interface& api = rt.api();
@@ -275,8 +333,8 @@ namespace remix_ps2::materials
 			info.depth = 1;
 			info.mipLevels = 1;
 			info.format = textures_linear() ? REMIXAPI_FORMAT_B8G8R8A8_UNORM : REMIXAPI_FORMAT_B8G8R8A8_SRGB;
-			info.data = s_pixel_buffer.data();
-			info.dataSize = s_pixel_buffer.size();
+			info.data = entry.pixels.data();
+			info.dataSize = entry.pixels.size();
 
 			const u32 tex_status = guarded_create_texture(api.CreateTexture, &info, &entry.texture);
 			if (tex_status != REMIXAPI_ERROR_CODE_SUCCESS || !entry.texture)
@@ -286,6 +344,12 @@ namespace remix_ps2::materials
 				entry.texture = nullptr;
 				++s_stats.failures;
 				return false;
+			}
+
+			if (material_stage() < 3)
+			{
+				++s_stats.created;
+				return true; // texture uploaded; the mesh still goes out with a null material
 			}
 
 			// The pseudo-path trick (RPCS3 RemixTextures.cpp:643-648). The fork resolves this
@@ -324,7 +388,7 @@ namespace remix_ps2::materials
 			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
 			material.pNext = &opaque;
 			material.hash = content_hash;
-			material.albedoTexture = albedo_path;
+			material.albedoTexture = (material_stage() >= 4) ? albedo_path : nullptr;
 			material.normalTexture = nullptr;
 			material.tangentTexture = nullptr;
 			material.emissiveTexture = nullptr;
@@ -383,7 +447,7 @@ namespace remix_ps2::materials
 	{
 		binding out{};
 
-		if (!rt.ok() || !rt.fork_features())
+		if (!rt.ok() || !rt.fork_features() || texture_budget() == 0)
 			return out;
 
 		++s_stats.binds;
@@ -450,20 +514,27 @@ namespace remix_ps2::materials
 				return out;
 			}
 
-			material_entry entry{};
+			// Inserted before the runtime call, not after: entry.pixels is the buffer Remix is
+			// handed and it must live at a stable address for the life of the texture.
+			// unordered_map never invalidates references to existing elements, so the map node
+			// is that stable address; a local built here and copied in afterwards would leave
+			// the runtime holding a pointer into a dead stack frame.
+			it = s_entries.emplace(content_hash, material_entry{}).first;
+			material_entry& entry = it->second;
+			entry.last_used_frame = frame;
+
 			if (!create(rt, content_hash, *source, entry))
 			{
 				entry.failed = true;
 				entry.texture = nullptr;
 				entry.material = nullptr;
+				entry.pixels.clear();
+				entry.pixels.shrink_to_fit();
 			}
 			else
 			{
 				--s_budget_left;
 			}
-
-			entry.last_used_frame = frame;
-			it = s_entries.emplace(content_hash, entry).first;
 
 			if (!entry.failed && dump_enabled() && s_dumped.insert(content_hash).second)
 			{
@@ -543,10 +614,14 @@ namespace remix_ps2::materials
 		s_seen_content.clear();
 		s_seen_tex0.clear();
 		s_dumped.clear();
-		s_decode_buffer.clear();
-		s_decode_buffer.shrink_to_fit();
-		s_pixel_buffer.clear();
-		s_pixel_buffer.shrink_to_fit();
+
+		if (s_decode_buffer)
+		{
+			_aligned_free(s_decode_buffer);
+			s_decode_buffer = nullptr;
+			s_decode_capacity = 0;
+		}
+
 		s_stats = {};
 		s_budget_left = 0;
 	}
