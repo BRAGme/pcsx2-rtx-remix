@@ -103,11 +103,25 @@ namespace RemixSubmit
 		int s_window_width = 0;
 		int s_window_height = 0;
 
+		// The window Startup() actually bound to. PCSX2 destroys and recreates its render
+		// window on a fullscreen toggle, which leaves the runtime presenting into a dead HWND:
+		// observed as a ~170s delay and then an unbounded storm of FAULTED Present calls that
+		// takes the process down. The runtime is a process-lifetime singleton and a second
+		// Startup after shutdown is unproven in dxvk-remix, so a recreated window cannot be
+		// re-bound -- it is detected here and the renderer stops cleanly instead.
+		HWND s_active_hwnd = nullptr;
+		bool s_window_lost = false;
+
 		remixapi_MeshHandle s_debug_mesh = nullptr;
 		remixapi_LightHandle s_debug_light = nullptr;
 
 		u64 s_frame_counter = 0;
 		u64 s_submitted_this_frame = 0;
+
+		// Consecutive frames that submitted nothing, and how many of them the beacon waits for.
+		// ~2 seconds at 60Hz: long enough that a load or an all-2D stretch never triggers it.
+		u64 s_empty_frame_streak = 0;
+		constexpr u64 s_beacon_after_empty_frames = 120;
 		stat_counters s_stats{};
 
 		std::unordered_map<u64, mesh_entry> s_meshes;
@@ -337,6 +351,13 @@ namespace RemixSubmit
 				return;
 			}
 
+			// The close path clears s_init_attempted so a reopen rebuilds the scene, but
+			// runtime::initialize() short-circuits once started -- it would still be bound to the
+			// window that has since been destroyed. Refusing here keeps that from coming back to
+			// life as a fault storm.
+			if (s_window_lost)
+				return;
+
 			if (!s_remix.initialize(s_hwnd))
 			{
 				ERROR_LOG("Remix: runtime unavailable, degrading to a no-op");
@@ -349,6 +370,7 @@ namespace RemixSubmit
 				return;
 			}
 
+			s_active_hwnd = s_hwnd;
 			s_live = true;
 			INFO_LOG("Remix: renderer is live (far plane {})", remix_ps2::hardcoded_far_plane());
 		}
@@ -427,7 +449,22 @@ namespace RemixSubmit
 
 		if (wi.type == WindowInfo::Type::Win32 && wi.window_handle)
 		{
-			s_hwnd = static_cast<HWND>(wi.window_handle);
+			HWND incoming = static_cast<HWND>(wi.window_handle);
+
+			// A different HWND after the runtime bound means PCSX2 recreated the render window
+			// (fullscreen toggle is the usual cause). The old window is gone, so every later
+			// Present would fault against it. Stop instead -- one clear line beats a fault storm.
+			if (s_active_hwnd && incoming != s_active_hwnd && !s_window_lost)
+			{
+				s_window_lost = true;
+				s_live = false;
+				ERROR_LOG("Remix: the render window was recreated ({} -> {}); this is usually a "
+						  "fullscreen toggle. The runtime cannot re-bind, so rendering has stopped -- "
+						  "restart the emulator, and stay windowed in Remix mode.",
+					static_cast<void*>(s_active_hwnd), static_cast<void*>(incoming));
+			}
+
+			s_hwnd = incoming;
 			s_window_width = static_cast<int>(wi.surface_width);
 			s_window_height = static_cast<int>(wi.surface_height);
 			INFO_LOG("Remix: stashed render window {} ({}x{})", static_cast<void*>(s_hwnd), s_window_width, s_window_height);
@@ -746,7 +783,16 @@ namespace RemixSubmit
 
 		// The beacon only appears when nothing of the guest's own geometry survived the gates,
 		// so it never clutters a working scene but still says "the runtime is alive".
+		// Gating this on a single empty frame makes the beacon strobe on and off through normal
+		// play, because plenty of individual frames legitimately submit nothing (loads, fades,
+		// all-2D frames). Require a sustained drought instead: it still answers "is the runtime
+		// alive with no geometry?" but stays out of the way of a scene that is working.
 		if (s_submitted_this_frame == 0)
+			++s_empty_frame_streak;
+		else
+			s_empty_frame_streak = 0;
+
+		if (s_empty_frame_streak >= s_beacon_after_empty_frames)
 			submit_debug_triangle();
 
 		if (s_debug_light)
