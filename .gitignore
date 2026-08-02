@@ -96,8 +96,12 @@ oprofile_data/
 /bin/videos
 /bin/portable.ini
 /bin/portable.txt
-# RTX Remix runtime, deployed (not vendored) beside the executable.
+# RTX Remix runtime, deployed (not vendored) beside the executable, plus the
+# logs, metrics and user config layer the runtime writes into the working dir.
 /bin/remix
+/bin/rtx-remix
+/bin/user.conf
+/bin/metrics.txt
 
 # Resources and docs copied from /bin
 /bin-arm64
