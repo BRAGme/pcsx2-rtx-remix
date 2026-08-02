@@ -128,6 +128,7 @@ namespace RemixSubmit
 			u64 cam_reject_split = 0; // split_view_projection_direct refused
 			u64 cam_reject_score = 0; // split worked, score_perspective refused
 			u64 cam_accept = 0;
+			u64 cam_reject_degenerate = 0; // split and scored, but refuted by the geometry
 			u32 cam_last_candidates = 0;
 		};
 
@@ -453,6 +454,7 @@ namespace RemixSubmit
 		// Defined with the rest of the world-camera parameters further down.
 		float world_near_plane();
 		float world_far_plane(float near_plane);
+		float camera_distance_limit();
 
 		void place_debug_light(const float (&position)[3], float scene_radius)
 		{
@@ -1071,6 +1073,80 @@ namespace RemixSubmit
 			camera.score = best_score;
 			camera.valid = true;
 
+			// --- refutation against the geometry, not against ground truth --------------------
+			//
+			// cam_accept counts *acceptances*, not correctness, and a camera that splits and
+			// scores cleanly can still be nonsense. SOCOM produced eye (0,0,0) exactly, while
+			// earlier sessions on the same title gave (1930,210,3920) and (-582,-9,618) -- so
+			// the solve is not stable, and a camera at the origin looking at geometry that is
+			// somewhere else renders a black frame while every counter still reads healthy.
+			// That is the worst possible failure mode: silent.
+			//
+			// The frame's own submitted geometry refutes it without needing ground truth. If the
+			// eye is nowhere near what it is supposedly looking at, it is not the camera, and
+			// falling back to view-space at least renders something.
+			if (!std::isfinite(camera.position[0]) || !std::isfinite(camera.position[1]) ||
+				!std::isfinite(camera.position[2]))
+			{
+				++s_stats.cam_reject_degenerate;
+				drop_stale_camera();
+				return;
+			}
+
+			// An eye at *exactly* the origin is a solver degeneracy, not a camera: the split
+			// collapsed and solve_camera_position returned the trivial answer. Checked
+			// unconditionally, because the very first resolve of a session happens before any
+			// geometry has been submitted -- which is precisely when SOCOM produced
+			// eye (0,0,0) -- so the geometry cross-check below cannot catch it.
+			{
+				const float eye_magnitude = std::sqrt((camera.position[0] * camera.position[0]) +
+													  (camera.position[1] * camera.position[1]) +
+													  (camera.position[2] * camera.position[2]));
+
+				if (eye_magnitude < 1e-4f)
+				{
+					++s_stats.cam_reject_degenerate;
+
+					if (s_stats.cam_reject_degenerate == 1)
+						WARNING_LOG("Remix: refusing a world camera whose eye solved to the origin -- staying in view-space");
+
+					drop_stale_camera();
+					return;
+				}
+			}
+
+			if (s_last_bounds.valid)
+			{
+				const float cx = 0.5f * (s_last_bounds.min[0] + s_last_bounds.max[0]);
+				const float cy = 0.5f * (s_last_bounds.min[1] + s_last_bounds.max[1]);
+				const float cz = 0.5f * (s_last_bounds.min[2] + s_last_bounds.max[2]);
+				const float dx = camera.position[0] - cx;
+				const float dy = camera.position[1] - cy;
+				const float dz = camera.position[2] - cz;
+				const float distance = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+				// The previous frame's geometry was submitted through the previous camera, so
+				// this is a loose consistency check, not a tight one: only a camera that is
+				// orders of magnitude away from the scene it is meant to be inside is refused.
+				const float limit = std::max(s_last_bounds.radius(), world_near_plane()) * camera_distance_limit();
+
+				if (distance > limit)
+				{
+					++s_stats.cam_reject_degenerate;
+
+					if (s_stats.cam_reject_degenerate == 1)
+					{
+						WARNING_LOG("Remix: refusing a degenerate world camera -- eye ({:.1f}, {:.1f}, {:.1f}) is "
+									"{:.0f} units from the submitted geometry's centre ({:.1f}, {:.1f}, {:.1f}), "
+									"limit {:.0f}. Staying in view-space; raise PCSX2_REMIX_CAMDIST if this is wrong.",
+							camera.position[0], camera.position[1], camera.position[2], distance, cx, cy, cz, limit);
+					}
+
+					drop_stale_camera();
+					return;
+				}
+			}
+
 			s_active_camera = camera;
 			s_camera_last_accept_frame = s_frame_counter;
 			++s_stats.cam_accept;
@@ -1304,6 +1380,16 @@ namespace RemixSubmit
 		// genuinely matters for glass, decals and effects.
 		// See the use site: separates the texture-stage fields of InstanceInfoBlendEXT from its
 		// blend fields, so colour can be chased without giving up the alpha-state fix.
+		// How many scene radii the recovered eye may be from the submitted geometry's centre
+		// before the camera is refused. Deliberately generous: the geometry it is checked
+		// against was submitted through the *previous* camera, so this is a sanity gate against
+		// a degenerate solve, not a precision test.
+		float camera_distance_limit()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_CAMDIST", 50.f);
+			return value;
+		}
+
 		// Auto-classification of alpha-tested draws as cut-outs. 0 disables it.
 		int cutout_mode()
 		{
@@ -1569,11 +1655,12 @@ namespace RemixSubmit
 			// windows through the shape prefilter, no candidates, no split, or no score.
 			INFO_LOG("Remix: vu kicks {} scanned {} reentrant {} windows {} shape-ok {} | "
 					 "slice matrices {} published {} | cand {} (now {}) | "
-					 "split-reject {} score-reject {} accept {} (sliced {}) | camera {}{}",
+					 "split-reject {} score-reject {} degenerate-reject {} accept {} (sliced {}) | camera {}{}",
 				s_stats.vu_kicks, s_stats.vu_kicks_scanned, s_stats.vu_reentrant, s_stats.vu_windows,
 				s_stats.vu_survivors, s_stats.vu_sliced, s_stats.vu_sliced_published,
 				s_stats.cam_candidates, s_stats.cam_last_candidates, s_stats.cam_reject_split,
-				s_stats.cam_reject_score, s_stats.cam_accept, s_stats.cam_accept_sliced,
+				s_stats.cam_reject_score, s_stats.cam_reject_degenerate, s_stats.cam_accept,
+				s_stats.cam_accept_sliced,
 				s_active_camera.valid ? "world score " : "view-space",
 				s_active_camera.valid ? fmt::format("{:.2f} near {:.5g}", s_active_camera.score, s_active_camera.near_plane) : "");
 		}

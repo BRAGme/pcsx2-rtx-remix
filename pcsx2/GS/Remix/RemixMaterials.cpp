@@ -1015,13 +1015,45 @@ namespace remix_ps2::materials
 
 			if (!entry.failed && dump_enabled() && s_dumped.insert(content_hash).second)
 			{
+				// Mean colour of what we actually handed the runtime. This is the one
+				// measurement that separates "the decode produced grey" from "the colour was
+				// lost downstream" -- a question that has now cost two wrong diagnoses.
+				u32 mean_r = 0, mean_g = 0, mean_b = 0;
+				double sat_sum = 0.0;
+				const size_t texels = entry.pixels.size() / 4;
+
+				for (size_t i = 0; i < texels; ++i)
+				{
+					// Packed BGRA.
+					const u32 b = entry.pixels[(i * 4) + 0];
+					const u32 g = entry.pixels[(i * 4) + 1];
+					const u32 r = entry.pixels[(i * 4) + 2];
+					mean_b += b;
+					mean_g += g;
+					mean_r += r;
+
+					const u32 mx = std::max(r, std::max(g, b));
+					const u32 mn = std::min(r, std::min(g, b));
+					if (mx > 8)
+						sat_sum += static_cast<double>(mx - mn) / static_cast<double>(mx);
+				}
+
+				if (texels > 0)
+				{
+					mean_r = static_cast<u32>(mean_r / texels);
+					mean_g = static_cast<u32>(mean_g / texels);
+					mean_b = static_cast<u32>(mean_b / texels);
+				}
+
+				const double mean_sat = (texels > 0) ? (sat_sum / static_cast<double>(texels)) : 0.0;
+
 				const std::string line = fmt::format(
 					"Remix tex={:016X} {}x{} psm=0x{:02x} tw={} th={} tbp0=0x{:04x} tbw={} pal={} "
-					"tex0hash={:016x} cluthash={:016x} region={}x{}",
+					"tex0hash={:016x} cluthash={:016x} region={}x{} meanRGB=({},{},{}) sat={:.3f}",
 					content_hash, entry.width, entry.height, static_cast<u32>(TEX0.PSM),
 					static_cast<u32>(TEX0.TW), static_cast<u32>(TEX0.TH), static_cast<u32>(TEX0.TBP0),
 					static_cast<u32>(TEX0.TBW), static_cast<u32>(psm.pal), key.TEX0Hash, key.CLUTHash,
-					key.region_width, key.region_height);
+					key.region_width, key.region_height, mean_r, mean_g, mean_b, mean_sat);
 
 				INFO_LOG("{}", line);
 				dump_write(line);
