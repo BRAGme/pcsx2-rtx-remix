@@ -112,6 +112,8 @@ namespace RemixSubmit
 			u64 sky_tagged = 0; // instances categorised REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
 			u64 cutout_tagged = 0; // instances categorised ALPHA_BLEND_TO_CUTOUT
 			u64 skip_submit_delay = 0; // withheld by PCSX2_REMIX_SUBMITDELAY
+			u64 degenerate_triangles = 0; // zero-area triangles dropped before CreateMesh
+			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
 			u64 cam_fallback = 0;
 			// World-anchor (step 9) accounting. Every one of these has to be readable in a
@@ -466,6 +468,22 @@ namespace RemixSubmit
 		{
 			static const u64 value =
 				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_SUBMITDELAY", 0)));
+			return value;
+		}
+
+		// Edge length, as a fraction of the scene radius, below which a triangle is treated as
+		// having no area. Squared into a |cross| threshold at the use site.
+		float degenerate_area_epsilon()
+		{
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_DEGENEPS");
+				if (env.empty())
+					return 1e-4f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 1e-4f;
+			}();
+
 			return value;
 		}
 
@@ -1657,7 +1675,8 @@ namespace RemixSubmit
 					 "skip: tri {} untex {} fst {} constq {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
-					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | mesh/frame peak {}",
+					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
+					 "mesh/frame peak {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -1667,7 +1686,8 @@ namespace RemixSubmit
 				s_stats.skip_minw,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
-				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.meshes_created_peak);
+				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
+				s_stats.skip_all_degenerate, s_stats.meshes_created_peak);
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -2041,8 +2061,28 @@ namespace RemixSubmit
 			return;
 		}
 
-		// Flat per-triangle normals from the un-projected edges. Ten lines that remove an
-		// all-black-shading failure mode; a smooth normal has nothing to be derived from here.
+		// Flat per-triangle normals from the un-projected edges, AND -- load-bearing -- the
+		// point at which zero-area triangles are dropped instead of submitted.
+		//
+		// This code used to detect a degenerate triangle, decline to give it a normal, and hand
+		// it to CreateMesh anyway. A zero-area or slivered triangle is exactly what produces
+		// pathological BVH nodes, and a build that runs long enough trips the driver watchdog:
+		// VK_ERROR_DEVICE_LOST, which dxvk-remix turns into exit(0x60D0DEAD). Measured on SOCOM
+		// slot 2, 20 launches per arm: submitting no game geometry at all survived 20/20 against
+		// a 1/20 control, so the fault is in the content of what we submit -- not its volume
+		// (throttling creation to 50/frame gave 4/20) and not its timing (withholding it for the
+		// first 600 frames and then submitting still gave 1/20).
+		//
+		// The threshold is relative to the scene, not absolute: |cross| is twice the triangle
+		// area and therefore scales as length squared, and a world unit means something
+		// different per title (maxpos ~2,500 on Rainbow Six 3, ~5,300 on SOCOM). A fixed 1e-12
+		// is meaningless in both.
+		const float degenerate_scale = std::max(s_last_bounds.radius(), 1.f);
+		const float degenerate_edge = degenerate_area_epsilon() * degenerate_scale;
+		const float degenerate_cross = degenerate_edge * degenerate_edge;
+
+		size_t write = 0;
+
 		for (size_t i = 0; (i + 2) < s_scratch_indices.size(); i += 3)
 		{
 			const remixapi_HardcodedVertex& v0 = s_scratch_vertices[s_scratch_indices[i]];
@@ -2058,9 +2098,12 @@ namespace RemixSubmit
 				(e1[0] * e2[1]) - (e1[1] * e2[0])};
 
 			const float len = std::sqrt((n[0] * n[0]) + (n[1] * n[1]) + (n[2] * n[2]));
-			if (!std::isfinite(len) || len < 1e-12f)
+
+			if (!std::isfinite(len) || len < degenerate_cross)
 			{
-				// Degenerate triangle: leave the -Z default rather than emit a NaN normal.
+				// Drop the whole index triple. Skipping only the normal is what shipped and it
+				// left the triangle in the acceleration structure.
+				++s_stats.degenerate_triangles;
 				continue;
 			}
 
@@ -2071,11 +2114,24 @@ namespace RemixSubmit
 			// The whole triangle shares it: doubleSided = 1 makes the winding irrelevant.
 			for (u32 k = 0; k < 3; ++k)
 			{
-				remixapi_HardcodedVertex& target = s_scratch_vertices[s_scratch_indices[i + k]];
+				const u32 index = s_scratch_indices[i + k];
+				remixapi_HardcodedVertex& target = s_scratch_vertices[index];
 				target.normal[0] = n[0];
 				target.normal[1] = n[1];
 				target.normal[2] = n[2];
+				s_scratch_indices[write + k] = index;
 			}
+
+			write += 3;
+		}
+
+		s_scratch_indices.resize(write);
+
+		if (s_scratch_indices.empty())
+		{
+			// Every triangle in the draw was degenerate.
+			++s_stats.skip_all_degenerate;
+			return;
 		}
 
 		// --- material ------------------------------------------------------------------------
