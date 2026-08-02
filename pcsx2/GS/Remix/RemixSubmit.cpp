@@ -1843,6 +1843,11 @@ namespace RemixSubmit
 			// budget this frame gets its own (untextured) handle and picks up the real one on a
 			// later frame instead of being stuck with the default material forever.
 			hash = fnv_mix(hash, material.content_hash);
+
+			// The tag-list generation. Remix binds the material into the mesh at CreateMesh
+			// time, so a mesh cached before the user tagged a texture would keep the pre-tag
+			// material -- an emissive tag would appear to do nothing until the mesh aged out.
+			hash = fnv_mix(hash, remix_ps2::materials::generation());
 		}
 
 		if (hash == 0)

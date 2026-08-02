@@ -68,6 +68,11 @@ namespace remix_ps2
 		// most once a second); call once per frame.
 		void refresh_categories();
 
+		// Bumped every time the tag lists change on disk. The caller MUST fold this into its
+		// mesh hash: Remix binds the material into the mesh at CreateMesh time, so a mesh built
+		// before a tag changed would keep the pre-tag material for as long as it stays cached.
+		u64 generation();
+
 		// One line for the periodic counter block.
 		std::string stats_line();
 

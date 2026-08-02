@@ -135,6 +135,7 @@ namespace remix_ps2::materials
 			// BGRA8 resident for the same reason (RemixTextures.cpp, "kept resident").
 			std::vector<u8> pixels;
 			u64 last_used_frame = 0;
+			u64 generation = 0; // tag-list generation this material was built for
 			u32 width = 0;
 			u32 height = 0;
 			bool failed = false; // decode or a runtime call refused: never retried
@@ -246,6 +247,73 @@ namespace remix_ps2::materials
 		std::unordered_map<u64, remixapi_InstanceCategoryFlags> s_categories;
 		u64 s_category_tags = 0; // entries in s_categories, for the stats line
 		u64 s_category_hits = 0; // instances that picked a flag up
+
+		// Textures the user has asked to emit light. There is no emissive texture list in
+		// RtxOptions -- dxvk-remix only has global scales (rtx_options.h:339, :894) -- so there
+		// is no existing option name the developer menu would write for us. Two sources:
+		//
+		//  * our own conf key, in the same layers and the same format as the category lists, so
+		//    it lives next to everything else the user edits; and
+		//  * an existing Remix category, so a tag made in the developer menu turns a fixture
+		//    into a light with no file editing at all. The default is worldSpaceUiTextures
+		//    because that is precisely what the user had already found and used to make bulbs
+		//    bright -- WORLD_UI makes them *render* bright but emits nothing, which is the gap
+		//    this closes.
+		std::unordered_set<u64> s_emissive;
+		u64 s_generation = 1;
+
+		// Bit 31 is unused by remixapi_InstanceCategoryBit (which stops at 1 << 26), so the
+		// emissive marker can ride through the same parse/negate machinery as a real category
+		// and then be stripped before anything reaches the runtime.
+		constexpr remixapi_InstanceCategoryFlags s_emissive_marker_bit = 1u << 31;
+
+		// Materials replaced because the tag lists changed. They are not destroyed immediately:
+		// meshes built earlier still hold the handle Remix bound into them at CreateMesh time,
+		// so they are retired on the same age rule the meshes are.
+		struct retired_material
+		{
+			remixapi_MaterialHandle handle;
+			u64 frame;
+		};
+
+		std::vector<retired_material> s_retired;
+
+		float emissive_intensity()
+		{
+			static const float value = []() -> float {
+				if (const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVEINTENSITY"); !env.empty())
+				{
+					const float parsed = static_cast<float>(::_wtof(env.c_str()));
+					if (std::isfinite(parsed) && parsed >= 0.f)
+						return parsed;
+				}
+
+				// Deliberately strong: the levels measured here contain no lights at all, so a
+				// timid default would look like the feature had not worked. The user is the one
+				// who can see the result, so this is the first knob they should reach for.
+				return 20.f;
+			}();
+
+			return value;
+		}
+
+		// Which existing Remix category also means "emissive". Empty disables the bridge and
+		// leaves only the explicit list.
+		remixapi_InstanceCategoryFlags emissive_from_category()
+		{
+			static const remixapi_InstanceCategoryFlags value = []() -> remixapi_InstanceCategoryFlags {
+				const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVEFROM");
+				if (env.empty())
+					return REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI;
+
+				if (env == L"0" || env == L"none")
+					return 0;
+
+				return static_cast<remixapi_InstanceCategoryFlags>(::wcstoull(env.c_str(), nullptr, 0));
+			}();
+
+			return value;
+		}
 
 		std::vector<std::string> conf_paths()
 		{
@@ -386,6 +454,15 @@ namespace remix_ps2::materials
 
 					key = key.substr(kfirst, klast - kfirst + 1);
 
+					// Our own key, in the same layers and the same textual format. Both
+					// spellings are accepted because the runtime's config reader tolerates
+					// either and a user is as likely to write one as the other.
+					if (key == "rtx.pcsx2EmissiveTextures" || key == "pcsx2.emissiveTextures")
+					{
+						parse_hash_list(text.substr(eq + 1), s_emissive_marker_bit);
+						continue;
+					}
+
 					for (const category_option& option : s_category_options)
 					{
 						if (key == option.key)
@@ -402,6 +479,45 @@ namespace remix_ps2::materials
 			// Drop entries every layer cancelled out, so the count means what it says.
 			for (auto it = s_categories.begin(); it != s_categories.end();)
 				it = (it->second == 0) ? s_categories.erase(it) : std::next(it);
+
+			// Split the emissive marker back out: it is carried through the same map only so
+			// that '-0x...' negation works on it exactly as it does on a real category, and it
+			// must never reach the runtime as a category flag.
+			s_emissive.clear();
+
+			const remixapi_InstanceCategoryFlags from_category = emissive_from_category();
+
+			for (auto it = s_categories.begin(); it != s_categories.end();)
+			{
+				const bool marked = (it->second & s_emissive_marker_bit) != 0;
+				it->second &= ~s_emissive_marker_bit;
+
+				if (marked || (from_category != 0 && (it->second & from_category) != 0))
+					s_emissive.insert(it->first);
+
+				it = (it->second == 0) ? s_categories.erase(it) : std::next(it);
+			}
+
+			// PCSX2_REMIX_EMISSIVE, same format, for iterating without touching a file.
+			if (const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVE"); !env.empty())
+			{
+				const std::string narrow(env.begin(), env.end());
+				const size_t before = s_categories.size();
+				parse_hash_list(narrow, s_emissive_marker_bit);
+
+				for (auto it = s_categories.begin(); it != s_categories.end();)
+				{
+					if ((it->second & s_emissive_marker_bit) != 0)
+					{
+						s_emissive.insert(it->first);
+						it->second &= ~s_emissive_marker_bit;
+					}
+
+					it = (it->second == 0) ? s_categories.erase(it) : std::next(it);
+				}
+
+				(void)before;
+			}
 
 			s_category_tags = s_categories.size();
 		}
@@ -585,6 +701,14 @@ namespace remix_ps2::materials
 			opaque.alphaReferenceValue = 0;
 			opaque.displaceOut = 0.f;
 
+			// Emissive. The texture is pointed at the *same* pseudo-path as the albedo, so the
+			// bulb's own texels shape what it radiates instead of the whole quad glowing flat.
+			// This is what turns a tagged fixture into an actual light source: WORLD_UI alone
+			// makes it render bright but contributes nothing to the path tracer, which is why
+			// the level still needed the follow-cam debug light.
+			const bool is_emissive = (material_stage() >= 4) && (s_emissive.count(content_hash) != 0);
+			const float intensity = is_emissive ? emissive_intensity() : 0.f;
+
 			remixapi_MaterialInfo material{};
 			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
 			material.pNext = &opaque;
@@ -592,9 +716,9 @@ namespace remix_ps2::materials
 			material.albedoTexture = (material_stage() >= 4) ? albedo_path : nullptr;
 			material.normalTexture = nullptr;
 			material.tangentTexture = nullptr;
-			material.emissiveTexture = nullptr;
-			material.emissiveIntensity = 0.f;
-			material.emissiveColorConstant = {0.f, 0.f, 0.f};
+			material.emissiveTexture = is_emissive ? albedo_path : nullptr;
+			material.emissiveIntensity = intensity;
+			material.emissiveColorConstant = is_emissive ? remixapi_Float3D{1.f, 1.f, 1.f} : remixapi_Float3D{0.f, 0.f, 0.f};
 			material.spriteSheetRow = 1;
 			material.spriteSheetCol = 1;
 			material.spriteSheetFps = 0;
@@ -615,8 +739,75 @@ namespace remix_ps2::materials
 				return false;
 			}
 
+			entry.generation = s_generation;
+
+			if (is_emissive)
+				INFO_LOG("Remix: material {:016X} is emissive (intensity {:g})", content_hash, intensity);
+
 			++s_stats.created;
 			return true;
+		}
+
+		// Rebuilds only the material of an existing entry, keeping its texture. Used when the
+		// tag lists change: the old handle is retired rather than destroyed, because meshes
+		// created earlier still hold the handle Remix bound into them at CreateMesh time.
+		void rebuild_material(const runtime& rt, u64 content_hash, material_entry& entry, u64 frame)
+		{
+			if (!entry.texture || entry.failed || material_stage() < 3)
+			{
+				entry.generation = s_generation;
+				return;
+			}
+
+			const remixapi_Interface& api = rt.api();
+
+			wchar_t albedo_path[32]{};
+			::swprintf_s(albedo_path, L"0x%016llX", static_cast<unsigned long long>(content_hash));
+
+			const bool is_emissive = (material_stage() >= 4) && (s_emissive.count(content_hash) != 0);
+			const float intensity = is_emissive ? emissive_intensity() : 0.f;
+
+			remixapi_MaterialInfoOpaqueEXT opaque{};
+			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+			opaque.albedoConstant = {1.f, 1.f, 1.f};
+			opaque.opacityConstant = 1.f;
+			opaque.roughnessConstant = 0.7f;
+			opaque.metallicConstant = 0.f;
+			opaque.useDrawCallAlphaState = 1;
+			opaque.alphaTestType = 7;
+
+			remixapi_MaterialInfo material{};
+			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+			material.pNext = &opaque;
+			material.hash = content_hash;
+			material.albedoTexture = (material_stage() >= 4) ? albedo_path : nullptr;
+			material.emissiveTexture = is_emissive ? albedo_path : nullptr;
+			material.emissiveIntensity = intensity;
+			material.emissiveColorConstant = is_emissive ? remixapi_Float3D{1.f, 1.f, 1.f} : remixapi_Float3D{0.f, 0.f, 0.f};
+			material.spriteSheetRow = 1;
+			material.spriteSheetCol = 1;
+			material.filterMode = 1;
+			material.wrapModeU = 1;
+			material.wrapModeV = 1;
+
+			remixapi_MaterialHandle replacement = nullptr;
+			const u32 status = guarded_create_material(api.CreateMaterial, &material, &replacement);
+
+			entry.generation = s_generation;
+
+			if (status != REMIXAPI_ERROR_CODE_SUCCESS || !replacement)
+			{
+				ERROR_LOG("Remix: CreateMaterial failed rebuilding {:016X} ({})", content_hash, error_name(status));
+				return;
+			}
+
+			if (entry.material)
+				s_retired.push_back({entry.material, frame});
+
+			entry.material = replacement;
+
+			if (is_emissive)
+				INFO_LOG("Remix: material {:016X} is now emissive (intensity {:g})", content_hash, intensity);
 		}
 
 		void destroy(const runtime& rt, material_entry& entry)
@@ -680,13 +871,23 @@ namespace remix_ps2::materials
 		last_signature = signature;
 
 		load_categories();
+		++s_generation;
 
-		INFO_LOG("Remix: {} texture category tags loaded from the Remix conf layers", s_category_tags);
+		INFO_LOG("Remix: {} texture category tags and {} emissive tags loaded from the Remix conf layers",
+			s_category_tags, s_emissive.size());
 
 		// Printed so a tag that silently failed to parse is visible as a hash that does not
 		// match anything in remix_textures.txt, rather than as "nothing happened".
 		for (const auto& [hash, flags] : s_categories)
 			INFO_LOG("Remix:   tag {:016X} -> categoryFlags 0x{:X}", hash, flags);
+
+		for (const u64 hash : s_emissive)
+			INFO_LOG("Remix:   tag {:016X} -> emissive", hash);
+	}
+
+	u64 generation()
+	{
+		return s_generation;
 	}
 
 	remixapi_InstanceCategoryFlags categories_for(u64 content_hash)
@@ -812,6 +1013,12 @@ namespace remix_ps2::materials
 		else
 		{
 			++s_stats.hits;
+
+			// The tag lists changed since this material was built, so its emissive state may be
+			// stale. Rebuilding is cheap (the texture is kept) and the caller folds
+			// generation() into its mesh hash, so meshes pick the new handle up too.
+			if (it->second.generation != s_generation)
+				rebuild_material(rt, content_hash, it->second, frame);
 		}
 
 		it->second.last_used_frame = frame;
@@ -829,6 +1036,24 @@ namespace remix_ps2::materials
 
 	void reap(const runtime& rt, u64 frame)
 	{
+		// Retired materials first: same age rule as the meshes, because a mesh built before a
+		// tag change still holds the handle Remix bound into it.
+		if (!s_retired.empty() && rt.ok())
+		{
+			const u64 window = mesh_idle_frames() + 1;
+			const remixapi_Interface& api = rt.api();
+
+			s_retired.erase(std::remove_if(s_retired.begin(), s_retired.end(),
+								[&](const retired_material& r) {
+									if (frame < r.frame + window)
+										return false;
+
+									guarded_destroy_material(api.DestroyMaterial, r.handle);
+									return true;
+								}),
+				s_retired.end());
+		}
+
 		if (s_entries.empty())
 			return;
 
@@ -867,7 +1092,12 @@ namespace remix_ps2::materials
 		{
 			for (auto& [hash, entry] : s_entries)
 				destroy(rt, entry);
+
+			for (const retired_material& r : s_retired)
+				guarded_destroy_material(rt.api().DestroyMaterial, r.handle);
 		}
+
+		s_retired.clear();
 
 		s_entries.clear();
 		s_seen_content.clear();
