@@ -205,6 +205,207 @@ namespace remix_ps2::materials
 		// measurement sets into a leak.
 		constexpr size_t s_max_measurement_entries = 200000;
 
+		// --- category tags from the runtime's own conf layers ---------------------------------
+		//
+		// Names and bits are paired against dxvk-remix's setupCategoriesForTexture()
+		// (rtx_types.cpp:348) and remix_c.h's remixapi_InstanceCategoryBit. The conf text format
+		// is HashSetLayer's (util_hash_set_layer.h:129-152, :157-183): a comma-separated list of
+		// "0x%016X", where a leading '-' negates an entry inherited from an earlier layer.
+		struct category_option
+		{
+			const char* key;
+			remixapi_InstanceCategoryFlags bit;
+		};
+
+		constexpr category_option s_category_options[] = {
+			{"rtx.worldSpaceUiTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI},
+			{"rtx.worldSpaceUiBackgroundTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_MATTE},
+			{"rtx.skyBoxTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_SKY},
+			{"rtx.ignoreTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE},
+			{"rtx.ignoreLights", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_LIGHTS},
+			{"rtx.antiCullingTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ANTI_CULLING},
+			{"rtx.motionBlurMaskOutTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_MOTION_BLUR},
+			{"rtx.opacityMicromapIgnoreTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_OPACITY_MICROMAP},
+			{"rtx.hideInstanceTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN},
+			{"rtx.particleTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE},
+			{"rtx.beamTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_BEAM},
+			{"rtx.decalTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC},
+			{"rtx.dynamicDecalTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC},
+			{"rtx.singleOffsetDecalTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET},
+			{"rtx.nonOffsetDecalTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_NO_OFFSET},
+			{"rtx.terrainTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_TERRAIN},
+			{"rtx.animatedWaterTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER},
+			{"rtx.playerModelTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL},
+			{"rtx.playerModelBodyTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY},
+			{"rtx.ignoreBakedLightingTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING},
+			{"rtx.ignoreAlphaOnTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL},
+			{"rtx.ignoreTransparencyLayerTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER},
+			{"rtx.particleEmitterTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER},
+		};
+
+		std::unordered_map<u64, remixapi_InstanceCategoryFlags> s_categories;
+		u64 s_category_tags = 0; // entries in s_categories, for the stats line
+		u64 s_category_hits = 0; // instances that picked a flag up
+
+		std::vector<std::string> conf_paths()
+		{
+			std::vector<std::string> paths;
+
+			// Layer order matters: rtx.conf is the mod layer, user.conf the user layer, and the
+			// developer menu writes to both. Later files win, and a '-' entry in a later file
+			// removes one an earlier file added.
+			const std::string dir(Path::GetDirectory(FileSystem::GetProgramPath()));
+			paths.push_back(Path::Combine(dir, "rtx.conf"));
+			paths.push_back(Path::Combine(dir, "user.conf"));
+
+			// Extra layers, semicolon-separated, for a mod kept outside the emulator directory.
+			if (const std::wstring extra = read_env(L"PCSX2_REMIX_CONF"); !extra.empty())
+			{
+				const std::string narrow(extra.begin(), extra.end());
+				size_t start = 0;
+				while (start <= narrow.size())
+				{
+					const size_t end = narrow.find(';', start);
+					std::string one = narrow.substr(start, (end == std::string::npos) ? std::string::npos : (end - start));
+					if (!one.empty())
+						paths.push_back(std::move(one));
+
+					if (end == std::string::npos)
+						break;
+
+					start = end + 1;
+				}
+			}
+
+			return paths;
+		}
+
+		void parse_hash_list(const std::string& value, remixapi_InstanceCategoryFlags bit)
+		{
+			// The list is comma-separated -- but the runtime's own writer emits each hash with
+			// digit-group commas as well. HashSetLayer::toString() (util_hash_set_layer.h:157)
+			// streams the value through std::hex on a stringstream that has picked up a
+			// grouping locale, so a single hash lands on disk as
+			//   rtx.ignoreTextures = 0x2,267,8AA,9EB,AF3,737
+			// (observed verbatim after the developer menu saved a tag we had planted).
+			// Splitting naively on ',' turns one hash into six garbage ones.
+			//
+			// The disambiguator is the "0x": the runtime always writes it, and only at the
+			// start of an entry. So a token beginning with 0x (or -0x) opens a new entry and
+			// anything else is a continuation of the digits of the current one.
+			std::vector<std::string> entries;
+
+			size_t start = 0;
+			while (start <= value.size())
+			{
+				const size_t end = value.find(',', start);
+				std::string token = value.substr(start, (end == std::string::npos) ? std::string::npos : (end - start));
+
+				const size_t first = token.find_first_not_of(" \t\r\n");
+				const size_t last = token.find_last_not_of(" \t\r\n");
+
+				if (first != std::string::npos)
+				{
+					token = token.substr(first, last - first + 1);
+
+					const bool opens =
+						(token.size() > 1 && token[0] == '-') ?
+							(token.size() > 3 && token[1] == '0' && (token[2] == 'x' || token[2] == 'X')) :
+							(token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X'));
+
+					if (opens || entries.empty())
+						entries.push_back(std::move(token));
+					else
+						entries.back() += token;
+				}
+
+				if (end == std::string::npos)
+					break;
+
+				start = end + 1;
+			}
+
+			for (std::string& entry : entries)
+			{
+				const bool negate = (!entry.empty() && entry[0] == '-');
+				if (negate)
+					entry.erase(0, 1);
+
+				// std::stoull with base 16 accepts the "0x" prefix the runtime writes.
+				u64 hash = 0;
+				try
+				{
+					size_t consumed = 0;
+					hash = std::stoull(entry, &consumed, 16);
+					if (consumed == 0)
+						hash = 0;
+				}
+				catch (...)
+				{
+					hash = 0;
+				}
+
+				if (hash == 0)
+					continue;
+
+				if (negate)
+					s_categories[hash] &= ~bit;
+				else
+					s_categories[hash] |= bit;
+			}
+		}
+
+		void load_categories()
+		{
+			s_categories.clear();
+
+			for (const std::string& path : conf_paths())
+			{
+				std::FILE* file = FileSystem::OpenCFile(path.c_str(), "r");
+				if (!file)
+					continue;
+
+				char line[8192];
+				while (std::fgets(line, sizeof(line), file))
+				{
+					std::string text(line);
+
+					// Strip a trailing comment and the newline; the runtime writes '#' comments.
+					if (const size_t hash_pos = text.find('#'); hash_pos != std::string::npos)
+						text.erase(hash_pos);
+
+					const size_t eq = text.find('=');
+					if (eq == std::string::npos)
+						continue;
+
+					std::string key = text.substr(0, eq);
+					const size_t kfirst = key.find_first_not_of(" \t");
+					const size_t klast = key.find_last_not_of(" \t\r\n");
+					if (kfirst == std::string::npos)
+						continue;
+
+					key = key.substr(kfirst, klast - kfirst + 1);
+
+					for (const category_option& option : s_category_options)
+					{
+						if (key == option.key)
+						{
+							parse_hash_list(text.substr(eq + 1), option.bit);
+							break;
+						}
+					}
+				}
+
+				std::fclose(file);
+			}
+
+			// Drop entries every layer cancelled out, so the count means what it says.
+			for (auto it = s_categories.begin(); it != s_categories.end();)
+				it = (it->second == 0) ? s_categories.erase(it) : std::next(it);
+
+			s_category_tags = s_categories.size();
+		}
+
 		void dump_write(const std::string& line)
 		{
 			static constexpr u32 max_lines = 8192;
@@ -443,6 +644,64 @@ namespace remix_ps2::materials
 		s_budget_left = texture_budget();
 	}
 
+	void refresh_categories()
+	{
+		// The developer menu writes the conf files live, so polling is what makes a tag take
+		// effect without restarting the emulator. One stat per layer per second is nothing.
+		static Common::Timer::Value last_check = 0;
+		static u64 last_signature = 0;
+		static bool first = true;
+
+		const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+		if (!first && Common::Timer::ConvertValueToMilliseconds(now - last_check) < 1000.0)
+			return;
+
+		last_check = now;
+
+		u64 signature = fnv_seed;
+		for (const std::string& path : conf_paths())
+		{
+			FILESYSTEM_STAT_DATA sd{};
+			if (FileSystem::StatFile(path.c_str(), &sd))
+			{
+				signature = fnv_mix(signature, static_cast<u64>(sd.ModificationTime));
+				signature = fnv_mix(signature, static_cast<u64>(sd.Size));
+			}
+			else
+			{
+				signature = fnv_mix(signature, 0);
+			}
+		}
+
+		if (!first && signature == last_signature)
+			return;
+
+		first = false;
+		last_signature = signature;
+
+		load_categories();
+
+		INFO_LOG("Remix: {} texture category tags loaded from the Remix conf layers", s_category_tags);
+
+		// Printed so a tag that silently failed to parse is visible as a hash that does not
+		// match anything in remix_textures.txt, rather than as "nothing happened".
+		for (const auto& [hash, flags] : s_categories)
+			INFO_LOG("Remix:   tag {:016X} -> categoryFlags 0x{:X}", hash, flags);
+	}
+
+	remixapi_InstanceCategoryFlags categories_for(u64 content_hash)
+	{
+		if (s_categories.empty() || content_hash == 0)
+			return 0;
+
+		const auto it = s_categories.find(content_hash);
+		if (it == s_categories.end())
+			return 0;
+
+		++s_category_hits;
+		return it->second;
+	}
+
 	binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame)
 	{
 		binding out{};
@@ -624,6 +883,7 @@ namespace remix_ps2::materials
 
 		s_stats = {};
 		s_budget_left = 0;
+		s_category_hits = 0;
 	}
 
 	std::string stats_line()
@@ -636,13 +896,14 @@ namespace remix_ps2::materials
 		return fmt::format(
 			"Remix: mat live {} | bind {} hit {} miss {} created {} destroyed {} deferred {} | "
 			"skip: nosrc {} target {} unsup {} failed {} | fail {} | "
-			"unique content {} tex0 {} (clut variants {}) | "
+			"unique content {} tex0 {} (clut variants {}) | tags {} hits {} | "
 			"hash {:.0f} ms ({:.2f} us/bind) decode {:.0f} ms",
 			s_entries.size(), s_stats.binds, s_stats.hits, s_stats.misses, s_stats.created,
 			s_stats.destroyed, s_stats.deferred, s_stats.skip_no_source, s_stats.skip_target,
 			s_stats.skip_unsupported, s_stats.skip_failed, s_stats.failures,
 			s_stats.unique_content, s_stats.unique_tex0,
 			(s_stats.unique_content > s_stats.unique_tex0) ? (s_stats.unique_content - s_stats.unique_tex0) : 0,
+			s_category_tags, s_category_hits,
 			hash_ms, hash_us_per_bind, decode_ms);
 	}
 

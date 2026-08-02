@@ -51,6 +51,23 @@ namespace remix_ps2
 		void reap(const runtime& rt, u64 frame);
 		void destroy_all(const runtime& rt);
 
+		// Instance category flags the user has tagged this texture with in the Remix developer
+		// menu (and saved), read from the runtime's own rtx.conf / user.conf hash lists.
+		//
+		// This has to be done here, and it is not a duplication of runtime behaviour we could
+		// have left alone. dxvk-remix applies those lists in
+		// DrawCallState::setupCategoriesForTexture() (rtx_types.cpp:348), whose *only* caller is
+		// the native D3D9 draw path (d3d9_rtx.cpp:1064). The Remix API instance path takes its
+		// categories exclusively from remixapi_InstanceInfo::categoryFlags
+		// (rtx_remix_api.cpp:803, :867). So without this, every tag the user makes -- sky,
+		// ignore, decal, particle -- is written to disk and then silently has no effect on
+		// anything we submit.
+		remixapi_InstanceCategoryFlags categories_for(u64 content_hash);
+
+		// Re-reads the conf layers if any of them changed on disk. Cheap (a stat per file, at
+		// most once a second); call once per frame.
+		void refresh_categories();
+
 		// One line for the periodic counter block.
 		std::string stats_line();
 

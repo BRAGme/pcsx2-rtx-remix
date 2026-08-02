@@ -98,6 +98,11 @@ namespace RemixSubmit
 			u64 skip_mesh_budget = 0; // over the per-frame CreateMesh budget
 			u64 skip_fbmsk = 0; // partial colour write mask: a multi-pass modulation term
 			u64 skip_coincident = 0; // identical geometry already submitted this frame
+			u64 skip_minw = 0; // draw sits at or inside the eye
+			// Histogram of each submitted draw's smallest w, by decade, so the min-w gate can be
+			// set from the measured distribution instead of a guess. Buckets are
+			// w < 1e-3, < 1e-2, < 1e-1, < 1, < 10, < 100, >= 100.
+			u64 w_histogram[7] = {};
 			u64 meshes_created = 0;
 			u64 meshes_destroyed = 0;
 			// Mesh creation rate, the strongest remaining lead on the device-loss exit: it is
@@ -1173,6 +1178,30 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// Smallest w (= 1/Q, the guest's own perspective divisor) a draw's furthest vertex may
+		// have and still be submitted.
+		//
+		// Set from the measured distribution, not guessed. Rainbow Six 3, 2,100 frames, max w
+		// per submitted draw:
+		//   <1e-3: 7   <1e-2: 111   <0.1: 1350   <1: 5760   <10: 28094   <100: 2679   >=100: 0
+		// The body of the scene is 1-10 and the first-person weapon -- the thing that must not
+		// be culled by accident -- sits in the 0.1-1 bucket. 0.01 is an order of magnitude below
+		// that and removes only ~118 draws in 2,100 frames, which are the ones collapsing onto
+		// the eye plane. 0 disables the gate.
+		float min_submitted_w()
+		{
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_MINW");
+				if (env.empty())
+					return 0.01f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 0.01f;
+			}();
+
+			return value;
+		}
+
 		// Quantum, in world units, that positions are snapped to before they are hashed into a
 		// mesh identity. 0 disables quantization and restores exact-bit hashing, which is the
 		// A/B handle for the measurement. The default is deliberately coarse relative to the
@@ -1353,8 +1382,8 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} | warn stq {} | "
-					 "cam world {} fallback {} | "
+					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
+					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} | mesh/frame peak {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
@@ -1362,9 +1391,18 @@ namespace RemixSubmit
 				s_stats.skip_const_q, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident,
+				s_stats.skip_minw,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.meshes_created_peak);
+
+			// The w distribution of everything submitted, which is what the min-w gate is set
+			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
+			INFO_LOG("Remix: submitted w (max per draw): <1e-3 {} <1e-2 {} <0.1 {} <1 {} <10 {} "
+					 "<100 {} >=100 {} | minw gate {:g}",
+				s_stats.w_histogram[0], s_stats.w_histogram[1], s_stats.w_histogram[2],
+				s_stats.w_histogram[3], s_stats.w_histogram[4], s_stats.w_histogram[5],
+				s_stats.w_histogram[6], min_submitted_w());
 
 			// Third line: the material bridge. Kept separate so the counter block stays
 			// readable, and because the two numbers the user has to act on -- unique content
@@ -1659,6 +1697,29 @@ namespace RemixSubmit
 			max_z = std::max(max_z, static_cast<u32>(v.XYZ.Z));
 		}
 
+		// The eye-plane gate. w = 1/Q is the depth the guest divided by; the per-vertex check
+		// above only rejects w <= 0, so a draw whose vertices all sit at w = 1e-4 still passes
+		// and un-projects to something degenerate at or inside the camera. It is invisible
+		// (zero projected area) but it is still a first hit for the runtime's object picking,
+		// which is what stops the user selecting anything else in the developer menu.
+		//
+		// The threshold is deliberately far below the first-person weapon -- culling that by
+		// accident is the obvious failure mode here -- and the histogram in the stats line is
+		// what it was set from. 0 disables the gate.
+		{
+			const float min_w_limit = min_submitted_w();
+			if (min_w_limit > 0.f && max_w < min_w_limit)
+			{
+				++s_stats.skip_minw;
+				return;
+			}
+
+			const u32 bucket = (max_w < 1e-3f) ? 0 : (max_w < 1e-2f) ? 1 :
+			                   (max_w < 1e-1f) ? 2 : (max_w < 1.f)   ? 3 :
+			                   (max_w < 10.f)  ? 4 : (max_w < 100.f) ? 5 : 6;
+			++s_stats.w_histogram[bucket];
+		}
+
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
 		// GSRendererHW.cpp:5557-5562). Widen u16 -> u32 and bounds-check as we go.
 		const u16* const src_indices = r.m_index->buff;
@@ -1862,10 +1923,17 @@ namespace RemixSubmit
 		const bool depth_write = r.m_cached_ctx.DepthWrite();
 		const bool is_sky = classify_sky(depth_read, depth_write, s_submitted_this_frame);
 
+		// The user's own tags, from the Remix conf layers. dxvk-remix only applies its hash
+		// lists on the native D3D9 path (setupCategoriesForTexture, rtx_types.cpp:348, whose one
+		// caller is d3d9_rtx.cpp:1064); an API instance's categories come solely from this
+		// field (rtx_remix_api.cpp:803). So a tag made in the developer menu does nothing at all
+		// unless we look it up ourselves and OR it in here.
+		const remixapi_InstanceCategoryFlags tagged = remix_ps2::materials::categories_for(material.content_hash);
+
 		remixapi_InstanceInfo instance{};
 		instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
 		instance.pNext = nullptr;
-		instance.categoryFlags = is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u;
+		instance.categoryFlags = tagged | (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u);
 		instance.mesh = it->second.handle;
 		// Identity: the positions are already in the submitted camera's space. Per-draw world
 		// transforms are phase 2.
@@ -2005,6 +2073,9 @@ namespace RemixSubmit
 		reap_idle_meshes();
 		remix_ps2::materials::reap(s_remix, s_frame_counter);
 		remix_ps2::materials::begin_frame();
+
+		// Picks up tags the user saved from the developer menu without an emulator restart.
+		remix_ps2::materials::refresh_categories();
 
 		log_stats(false);
 	}
