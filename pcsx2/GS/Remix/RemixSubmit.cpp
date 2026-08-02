@@ -507,6 +507,19 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// Crash bisection: instance ONE reused mesh handle, at the normal per-frame count.
+		// Mesh creation churn is untouched, so paired with the no-instancing arm (which
+		// survives 20/20 with full creation churn) this separates instancing *handle diversity*
+		// from instancing *call count* -- the two explanations the dose-response cannot tell
+		// apart.
+		bool reuse_one_handle()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_REUSEHANDLE", 0) != 0;
+			return value;
+		}
+
+		remixapi_MeshHandle s_reuse_handle = nullptr;
+
 		bool no_draw_instance()
 		{
 			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_NODRAWINSTANCE", 0) != 0;
@@ -1574,6 +1587,13 @@ namespace RemixSubmit
 						oldest = it;
 				}
 
+				if (oldest->second.handle == s_reuse_handle)
+				{
+					// Would dangle the handle every instance this frame points at.
+					oldest->second.last_used_frame = s_frame_counter;
+					break;
+				}
+
 				if (oldest->second.handle)
 				{
 					remix_ps2::guarded_destroy_mesh(api.DestroyMesh, oldest->second.handle);
@@ -1592,6 +1612,12 @@ namespace RemixSubmit
 			for (auto it = s_meshes.begin(); it != s_meshes.end();)
 			{
 				if (it->second.last_used_frame > cutoff)
+				{
+					++it;
+					continue;
+				}
+
+				if (it->second.handle == s_reuse_handle)
 				{
 					++it;
 					continue;
@@ -2376,7 +2402,19 @@ namespace RemixSubmit
 		instance.categoryFlags = tagged |
 		                         (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u) |
 		                         (is_cutout ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT) : 0u);
-		instance.mesh = it->second.handle;
+		if (reuse_one_handle())
+		{
+			// First game mesh of the session, held for its lifetime: real geometry rather than
+			// the debug triangle, so the BLAS being instanced is representative.
+			if (!s_reuse_handle)
+				s_reuse_handle = it->second.handle;
+
+			instance.mesh = s_reuse_handle;
+		}
+		else
+		{
+			instance.mesh = it->second.handle;
+		}
 		// Identity: the positions are already in the submitted camera's space. Per-draw world
 		// transforms are phase 2.
 		instance.transform = s_identity_transform;
@@ -2636,6 +2674,7 @@ namespace RemixSubmit
 		s_meshes.clear();
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
+		s_reuse_handle = nullptr;
 
 		if (s_debug_mesh)
 		{
