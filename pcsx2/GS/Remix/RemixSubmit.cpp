@@ -487,6 +487,16 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// Crash bisection arm 1: build every mesh exactly as normal, but never DrawInstance.
+		// Splits the fault across the one boundary nothing has tested -- acceleration-structure
+		// build from the geometry, versus instance/TLAS submission and everything the runtime
+		// does with it per frame.
+		bool no_draw_instance()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_NODRAWINSTANCE", 0) != 0;
+			return value;
+		}
+
 		bool no_debug_scene()
 		{
 			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_NODEBUGSCENE", 0) != 0;
@@ -2352,6 +2362,15 @@ namespace RemixSubmit
 		// transforms are phase 2.
 		instance.transform = s_identity_transform;
 		instance.doubleSided = 1;
+
+		if (no_draw_instance())
+		{
+			// The mesh was created and is resident; nothing is instanced. Counted as submitted
+			// so the rest of the accounting still lines up with a normal run.
+			++s_stats.draws_submitted;
+			++s_submitted_this_frame;
+			return;
+		}
 
 		const u32 status = remix_ps2::guarded_draw_instance(api.DrawInstance, &instance);
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
