@@ -96,6 +96,8 @@ namespace RemixSubmit
 			u64 skip_nonfinite = 0; // Q guard values poisoned the un-projected positions
 			u64 skip_poisoned = 0; // hash quarantined by an earlier faulting runtime call
 			u64 skip_mesh_budget = 0; // over the per-frame CreateMesh budget
+			u64 skip_fbmsk = 0; // partial colour write mask: a multi-pass modulation term
+			u64 skip_coincident = 0; // identical geometry already submitted this frame
 			u64 meshes_created = 0;
 			u64 meshes_destroyed = 0;
 			// Mesh creation rate, the strongest remaining lead on the device-loss exit: it is
@@ -195,6 +197,9 @@ namespace RemixSubmit
 
 		std::unordered_map<u64, mesh_entry> s_meshes;
 		std::unordered_set<u64> s_poisoned;
+
+		// Mesh hashes already submitted this frame, cleared at each VSync. See the dedupe gate.
+		std::unordered_set<u64> s_frame_submitted_hashes;
 
 		// Matrices already written to the PCSX2_REMIX_DUMP file, so the diagnostic stays one
 		// line per distinct matrix rather than one per frame per matrix.
@@ -1168,6 +1173,27 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// Quantum, in world units, that positions are snapped to before they are hashed into a
+		// mesh identity. 0 disables quantization and restores exact-bit hashing, which is the
+		// A/B handle for the measurement. The default is deliberately coarse relative to the
+		// camera's solve jitter but fine relative to real geometry: this title's submitted
+		// scene spans ~6-8 world units, so 0.01 is ~0.15% of the scene.
+		float mesh_hash_quantum()
+		{
+			// Not env_float(): 0 is a meaningful value here (exact hashing) and env_float
+			// treats anything <= 0 as "unset".
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_MESHQUANT");
+				if (env.empty())
+					return 0.01f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 0.01f;
+			}();
+
+			return value;
+		}
+
 		// Ceiling on CreateMesh calls in a single frame; 0 (the default) is unlimited, so this
 		// is inert until it is deliberately turned on. It exists because the remaining
 		// device-loss reports are all "while walking", and camera translation re-hashes every
@@ -1327,14 +1353,15 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} meshbudget {} | warn stq {} | cam world {} fallback {} | "
+					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} | warn stq {} | "
+					 "cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} | mesh/frame peak {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
 				s_stats.skip_const_q, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
-				s_stats.skip_mesh_budget,
+				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.meshes_created_peak);
@@ -1466,6 +1493,28 @@ namespace RemixSubmit
 		if (r.m_vt.m_eq.q)
 		{
 			++s_stats.skip_const_q;
+			return;
+		}
+
+		// A partial *colour* write mask means the draw is one channel of a multi-pass
+		// modulation, not a surface. The GS has a single texture unit, so a PS2 title
+		// multitextures by drawing the same geometry again with FBMSK set to leave two of the
+		// three colour channels alone. Measured in Rainbow Six 3: of 231 logged draws, 90 carry
+		// a colour mask, split exactly 30/30/30 across 0xff00ffff / 0xffff00ff / 0xffffff00 --
+		// every masked draw arrives as a set of three, one per channel, over geometry that was
+		// already drawn unmasked.
+		//
+		// Submitting them was producing four coincident surfaces per wall: z-fighting in the
+		// path tracer, which is what flickers, and a single colour channel of a modulation term
+		// is not a valid albedo in any case. Alpha-only masks (0xFF000000) are ordinary and are
+		// deliberately not caught here.
+		//
+		// The texture bound in one of these passes is the title's lightmap. Folding it into the
+		// base material is the next phase; the per-draw mask test is what will identify it
+		// there too, so nothing here needs a per-title texture-page list.
+		if ((r.m_cached_ctx.FRAME.FBMSK & 0x00FFFFFFu) != 0)
+		{
+			++s_stats.skip_fbmsk;
 			return;
 		}
 
@@ -1684,10 +1733,45 @@ namespace RemixSubmit
 		u64 hash = fnv_seed;
 
 		{
-			const u64* words = reinterpret_cast<const u64*>(s_scratch_vertices.data());
-			const size_t word_count = (s_scratch_vertices.size() * sizeof(remixapi_HardcodedVertex)) / sizeof(u64);
-			for (size_t i = 0; i < word_count; ++i)
-				hash = fnv_mix(hash, words[i]);
+			// Positions are quantized *for hashing only* -- the submitted vertex data stays at
+			// full precision.
+			//
+			// Why: the world position of a vertex is solved through the recovered camera, so
+			// sub-unit jitter in the camera solution shifts every position slightly every
+			// frame. Hashing the raw bytes therefore mints a new mesh for static geometry on a
+			// static camera, and Remix destroys and recreates the geometry each frame -- which
+			// is visible as flicker and makes the runtime's texture-categorisation UI
+			// unusable, because there is nothing on screen long enough to hover.
+			//
+			// Normals are deliberately excluded: they are derived from the positions, so they
+			// carry exactly the same jitter. Texcoords and colour come straight out of the
+			// guest's GSVertex and are bit-exact frame to frame, so they are hashed as-is and
+			// still distinguish genuinely different draws.
+			const float quantum = mesh_hash_quantum();
+			const float inv_quantum = (quantum > 0.f) ? (1.0f / quantum) : 0.f;
+
+			for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+			{
+				for (u32 k = 0; k < 3; ++k)
+				{
+					if (inv_quantum > 0.f)
+					{
+						hash = fnv_mix(hash, static_cast<u64>(static_cast<s64>(std::lround(v.position[k] * inv_quantum))));
+					}
+					else
+					{
+						u32 bits;
+						std::memcpy(&bits, &v.position[k], sizeof(bits));
+						hash = fnv_mix(hash, bits);
+					}
+				}
+
+				u32 st[2];
+				std::memcpy(&st[0], &v.texcoord[0], sizeof(u32));
+				std::memcpy(&st[1], &v.texcoord[1], sizeof(u32));
+				hash = fnv_mix(hash, (static_cast<u64>(st[1]) << 32) | st[0]);
+				hash = fnv_mix(hash, v.color);
+			}
 
 			for (const u32 index : s_scratch_indices)
 				hash = fnv_mix(hash, index);
@@ -1709,6 +1793,17 @@ namespace RemixSubmit
 		if (s_poisoned.count(hash) != 0)
 		{
 			++s_stats.skip_poisoned;
+			return;
+		}
+
+		// Coincident-geometry dedupe. Every instance goes out with the identity transform, so a
+		// second instance of the same mesh hash in the same frame is literally the same
+		// triangles in the same place -- overdraw the guest needed for its own blending, and
+		// z-fighting once a path tracer gets hold of it. 81% of the logged draws in Rainbow Six
+		// 3 were coincident with an earlier one.
+		if (!s_frame_submitted_hashes.insert(hash).second)
+		{
+			++s_stats.skip_coincident;
 			return;
 		}
 
@@ -1902,6 +1997,7 @@ namespace RemixSubmit
 
 		++s_frame_counter;
 		s_submitted_this_frame = 0;
+		s_frame_submitted_hashes.clear();
 
 		// Meshes first, then materials: a live mesh holds the material handle Remix bound into
 		// it at CreateMesh time, so releasing a material before the meshes referencing it would
@@ -1959,6 +2055,7 @@ namespace RemixSubmit
 
 		s_meshes.clear();
 		s_poisoned.clear();
+		s_frame_submitted_hashes.clear();
 
 		// Materials are content-keyed, so they survive a load by construction -- the same
 		// texture bytes produce the same hash. Only the per-frame budget is reset, which is
@@ -2001,6 +2098,7 @@ namespace RemixSubmit
 
 		s_meshes.clear();
 		s_poisoned.clear();
+		s_frame_submitted_hashes.clear();
 
 		if (s_debug_mesh)
 		{
