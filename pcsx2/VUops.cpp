@@ -7,6 +7,12 @@
 #include "Gif_Unit.h"
 #include "MTVU.h"
 
+// The RTX Remix backend's VU1 camera capture. Windows x86-64 only, like the rest of the
+// Remix module -- this file also builds for ARM64 and Linux.
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixVU1Capture.h"
+#endif
+
 #include <cmath>
 u32 laststall = 0;
 //Lower/Upper instructions can use that..
@@ -1871,6 +1877,15 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 		}
 		else*/
 		//{
+#if defined(_WIN32) && defined(_M_X64)
+			// The one instant at which VU1 data memory, the live microprogram and the GIF
+			// packet about to be drawn are all simultaneously consistent, on whichever
+			// thread is executing VU1. Everything the GS thread could read later is either
+			// up to two frames stale or, under MTVU, a live data race. Inert unless the
+			// Remix renderer is open.
+			if (RemixVU1Capture::Armed())
+				RemixVU1Capture::OnXGKick();
+#endif
 			gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize * 0x10, true);
 		//}
 

@@ -504,6 +504,108 @@ namespace remix_ps2
 		       std::abs(m[3][3] - 1.f) < tol;
 	}
 
+	bool split_view_projection_direct(const mat4& fused, vp_split& out)
+	{
+		if (!mat4_is_finite(fused))
+			return false;
+
+		return try_split_once(fused, out);
+	}
+
+	mat4 normalize_screen_clip(const mat4& fused, float scale_x, float offset_x, float scale_y, float offset_y)
+	{
+		mat4 result = fused;
+
+		const float inv_sx = (std::abs(scale_x) > 1e-12f) ? (1.f / scale_x) : 1.f;
+		const float inv_sy = (std::abs(scale_y) > 1e-12f) ? (1.f / scale_y) : 1.f;
+
+		for (u32 i = 0; i < 4; ++i)
+		{
+			result.m[i][0] = (fused.m[i][0] - (offset_x * fused.m[i][3])) * inv_sx;
+			result.m[i][1] = (fused.m[i][1] - (offset_y * fused.m[i][3])) * inv_sy;
+		}
+
+		return result;
+	}
+
+	bool make_clip_solver(const mat4& fused, clip_solver& out)
+	{
+		// Row-vector: clip_j = x*m[0][j] + y*m[1][j] + z*m[2][j] + m[3][j]. Take j in
+		// {0, 1, 3} and the three equations are exactly determined in (x, y, z).
+		constexpr u32 cols[3] = {0, 1, 3};
+
+		float b[3][3]{};
+		for (u32 k = 0; k < 3; ++k)
+		{
+			for (u32 i = 0; i < 3; ++i)
+				b[k][i] = fused.m[i][cols[k]];
+
+			out.bias[k] = fused.m[3][cols[k]];
+			if (!std::isfinite(out.bias[k]))
+				return false;
+		}
+
+		const float c00 = (b[1][1] * b[2][2]) - (b[1][2] * b[2][1]);
+		const float c01 = (b[1][2] * b[2][0]) - (b[1][0] * b[2][2]);
+		const float c02 = (b[1][0] * b[2][1]) - (b[1][1] * b[2][0]);
+
+		const float det = (b[0][0] * c00) + (b[0][1] * c01) + (b[0][2] * c02);
+		if (!std::isfinite(det) || std::abs(det) < 1e-20f)
+			return false;
+
+		const float inv_det = 1.f / det;
+
+		out.inverse[0][0] = c00 * inv_det;
+		out.inverse[1][0] = c01 * inv_det;
+		out.inverse[2][0] = c02 * inv_det;
+
+		out.inverse[0][1] = ((b[0][2] * b[2][1]) - (b[0][1] * b[2][2])) * inv_det;
+		out.inverse[1][1] = ((b[0][0] * b[2][2]) - (b[0][2] * b[2][0])) * inv_det;
+		out.inverse[2][1] = ((b[0][1] * b[2][0]) - (b[0][0] * b[2][1])) * inv_det;
+
+		out.inverse[0][2] = ((b[0][1] * b[1][2]) - (b[0][2] * b[1][1])) * inv_det;
+		out.inverse[1][2] = ((b[0][2] * b[1][0]) - (b[0][0] * b[1][2])) * inv_det;
+		out.inverse[2][2] = ((b[0][0] * b[1][1]) - (b[0][1] * b[1][0])) * inv_det;
+
+		for (u32 i = 0; i < 3; ++i)
+		{
+			for (u32 k = 0; k < 3; ++k)
+			{
+				if (!std::isfinite(out.inverse[i][k]))
+					return false;
+			}
+		}
+
+		return true;
+	}
+
+	void solve_world_position(const clip_solver& solver, float clip_x, float clip_y, float clip_w, float (&out)[3])
+	{
+		const float rhs[3] = {clip_x - solver.bias[0], clip_y - solver.bias[1], clip_w - solver.bias[2]};
+
+		for (u32 i = 0; i < 3; ++i)
+			out[i] = (solver.inverse[i][0] * rhs[0]) + (solver.inverse[i][1] * rhs[1]) + (solver.inverse[i][2] * rhs[2]);
+	}
+
+	mat4 rebuild_projection_z(const mat4& projection, float near_plane, float far_plane)
+	{
+		mat4 result = projection;
+
+		const float range = far_plane - near_plane;
+		if (!(range > 1e-6f))
+			return result;
+
+		// classify_perspective has already pinned |m[2][3]| to 1; its sign is the handedness.
+		const float w_sign = (projection.m[2][3] < 0.f) ? -1.f : 1.f;
+
+		result.m[0][2] = 0.f;
+		result.m[1][2] = 0.f;
+		result.m[2][2] = w_sign * (far_plane / range);
+		result.m[3][2] = -w_sign * ((near_plane * far_plane) / range);
+
+		return result;
+	}
+
 	bool split_view_projection(const mat4& fused, vp_split& out)
 	{
 		if (!mat4_is_finite(fused))

@@ -1695,8 +1695,28 @@ mVUop(mVU_XITOP)
 // XGkick
 //------------------------------------------------------------------
 
+// The RTX Remix backend's VU1 camera capture. The microVU translation unit is x86-64 only,
+// but it still builds for Linux, so the Windows guard stays.
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixVU1Capture.h"
+#endif
+
+// Called at the two points below, which are the only instants at which VU1 data memory, the
+// live microprogram and the GIF packet about to be drawn are simultaneously consistent --
+// and they run on whichever thread is executing VU1, so nothing here crosses to the GS
+// thread except through the capture module's seqlock. Inert unless Remix is open.
+static __fi void mVUcaptureXGKick()
+{
+#if defined(_WIN32) && defined(_M_X64)
+	if (RemixVU1Capture::Armed())
+		RemixVU1Capture::OnXGKick();
+#endif
+}
+
 void mVU_XGKICK_(u32 addr)
 {
+	mVUcaptureXGKick();
+
 	addr = (addr & 0x3ff) * 16;
 	u32 diff = 0x4000 - addr;
 	u32 size = gifUnit.GetGSPacketSize(GIF_PATH_1, vuRegs[1].Mem, addr, ~0u, true);
@@ -1752,6 +1772,8 @@ void _vuXGKICKTransfermVU(bool flush)
 
 		// Would be "nicer" to do the copy until it's all up, however this really screws up PATH3 masking stuff
 		// So lets just do it the other way :)
+		mVUcaptureXGKick();
+
 		if (THREAD_VU1)
 		{
 			if (transfersize < VU1.xgkicksizeremaining)

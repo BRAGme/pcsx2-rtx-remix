@@ -1,0 +1,469 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#include "GS/Remix/RemixVU1Capture.h"
+
+// RemixRuntime.h first: it pulls RedtapeWindows.h (NOMINMAX) ahead of remix_c.h's raw
+// <windows.h>, which would otherwise macro-poison min/max for everything after it.
+#include "GS/Remix/RemixRuntime.h"
+
+#include "VU.h"
+#include "VUmicro.h"
+
+#include "Config.h"
+
+#include "common/FileSystem.h"
+#include "common/Path.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace RemixVU1Capture
+{
+	namespace
+	{
+		constexpr u32 s_qword = 16;
+		constexpr u32 s_matrix_bytes = 64;
+
+		constexpr u64 s_fnv_seed = 0xCBF29CE484222325ULL;
+		constexpr u64 s_fnv_prime = 0x100000001B3ULL;
+
+		// Positions beyond this are not matrix coefficients, they are reinterpreted pointers
+		// or packed integer data that happens to sit in the scan window.
+		constexpr float s_max_coefficient = 1.0e9f;
+
+		// Per-frame scan budget. A frame issues hundreds of kicks and the camera matrix stays
+		// resident in VU1 memory across all of them, so scanning the first few is enough and
+		// keeps the cost off the EE/MTVU thread's critical path.
+		//
+		// Read once from SetArmed on the GS thread, deliberately NOT a function-local static:
+		// magic-static initialisation would put a CRT lock and a GetEnvironmentVariableW
+		// allocation inside a call made from recompiled VU code, on whichever thread got
+		// there first.
+		u32 s_scan_budget = 0;
+
+		u32 read_scan_budget()
+		{
+			const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_SCANKICKS", 16);
+			if (env <= 0)
+				return 0u;
+
+			return static_cast<u32>(std::min<s64>(env, 4096));
+		}
+
+		// ---- seqlock slot: written by the VU thread, read by the GS thread -----------------
+		std::atomic<u32> s_seq{0};
+		Frame s_published{};
+
+		// ---- VU-thread private state -------------------------------------------------------
+		Frame s_frame{};
+		u64 s_frame_hashes[max_candidates]{};
+		u32 s_generation_seen = 0;
+
+		// Bumped by the GS thread at every latch; the VU thread starts a new frame when it
+		// changes. One relaxed atomic either way -- this is a rate signal, not a barrier.
+		std::atomic<u32> s_generation{0};
+
+		// Single-entry guard for the whole scan. Uncontended this is one atomic exchange.
+		std::atomic<bool> s_scanning{false};
+
+		constexpr u32 s_no_pin = 0xFFFFFFFFu;
+		std::atomic<u32> s_pinned_offset{s_no_pin};
+
+		struct scan_guard
+		{
+			~scan_guard() { s_scanning.store(false, std::memory_order_release); }
+		};
+
+		// PCSX2_REMIX_SCANTRACE=1: an unbuffered, bounded step trace of the scan, written from
+		// whichever thread is executing VU1. The emulator log is buffered and goes through
+		// another thread, so it loses the last few lines exactly when they matter -- this is
+		// the only thing that survives an abrupt process exit.
+		bool s_trace_enabled = false;
+		std::FILE* s_trace_file = nullptr;
+		u32 s_trace_lines = 0;
+
+		void trace(const char* what, u64 a = 0, u64 b = 0)
+		{
+			if (!s_trace_enabled || !s_trace_file || s_trace_lines >= 400)
+				return;
+
+			++s_trace_lines;
+			std::fprintf(s_trace_file, "%s %llu %llu\n", what, static_cast<unsigned long long>(a),
+				static_cast<unsigned long long>(b));
+			std::fflush(s_trace_file);
+		}
+
+		__fi float dot3(const float (&a)[3], const float (&b)[3])
+		{
+			return (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]);
+		}
+
+		__fi float length3(const float (&a)[3])
+		{
+			return std::sqrt(dot3(a, a));
+		}
+
+		u64 hash_bits(const float* values, u32 count)
+		{
+			u64 hash = s_fnv_seed;
+
+			for (u32 i = 0; i < count; ++i)
+			{
+				u32 bits;
+				std::memcpy(&bits, &values[i], sizeof(bits));
+				hash = (hash ^ bits) * s_fnv_prime;
+			}
+
+			return hash;
+		}
+
+		// Fingerprint of the running microprogram. vuRegs[1].Micro is the live, genuinely
+		// verbatim copy (microVU's prog.cur->data is not -- doWholeProgCompare is false), and
+		// start_pc is the same key mVUsearchProg uses. Recorded for the phase-2 ucode
+		// back-slice, which is what a null scan escalates to.
+		u64 hash_ucode()
+		{
+			const u8* const micro = vuRegs[1].Micro;
+			if (!micro)
+				return 0;
+
+			const u64* words = reinterpret_cast<const u64*>(micro);
+			u64 hash = s_fnv_seed;
+
+			for (u32 i = 0; i < (VU1_PROGSIZE / sizeof(u64)); ++i)
+				hash = (hash ^ words[i]) * s_fnv_prime;
+
+			return hash;
+		}
+
+		// Viewport-independent structural test, which is the only kind the VU thread can run:
+		// it has no idea what XYOFFSET or the render target size are.
+		//
+		// A fused world->screen matrix is M = worldToView * projection * viewport in the
+		// row-vector convention. Multiplying that out column by column:
+		//
+		//   * column 3 of M IS column 2 of worldToView, because the projection contributes
+		//     only m[2][3] = 1 and the viewport fold leaves column 3 alone. worldToView's
+		//     linear part is a rotation, so the xyz of that column is a UNIT vector -- and
+		//     that holds whether or not the guest folded the 12.4 viewport scale in, which is
+		//     exactly the thing this side cannot determine. That is the hard prefilter.
+		//   * the viewport x/y offsets are determined by the matrix itself:
+		//     ox = dot(col0, col3) / |col3|^2 makes u = col0 - ox*col3 equal to the rotation's
+		//     column 0 times a scalar, and likewise v from col1, so u and v must come out
+		//     mutually orthogonal.
+		//   * column 2 is a scalar multiple of column 3 across rows 0..2, because clip z and
+		//     clip w both depend on view z alone.
+		//
+		// The last two are scored, not enforced: a guest that computes z separately, or folds
+		// a world scale into the view, still deserves to reach the GS-side splitter. Ranking
+		// by this score only decides which candidates make the cut, never whether a frame has
+		// a camera.
+		bool shape_test(const float* m, bool transposed, float& out_score)
+		{
+			// M_rowvector[i][j]. If the guest stored the transpose, that entry is m[j*4 + i].
+			const auto at = [m, transposed](u32 i, u32 j) -> float {
+				return transposed ? m[(j * 4) + i] : m[(i * 4) + j];
+			};
+
+			const float c3[3] = {at(0, 3), at(1, 3), at(2, 3)};
+			const float len3 = length3(c3);
+
+			// Exactly 1 for a rigid view with a unit-w projection; the band allows a folded
+			// world scale or a projection that scales w.
+			if (!(len3 > 0.25f) || !(len3 < 4.0f))
+				return false;
+
+			const float c0[3] = {at(0, 0), at(1, 0), at(2, 0)};
+			const float c1[3] = {at(0, 1), at(1, 1), at(2, 1)};
+			const float c2[3] = {at(0, 2), at(1, 2), at(2, 2)};
+
+			const float inv_len_sq = 1.0f / (len3 * len3);
+			const float ox = dot3(c0, c3) * inv_len_sq;
+			const float oy = dot3(c1, c3) * inv_len_sq;
+
+			const float u[3] = {c0[0] - (ox * c3[0]), c0[1] - (ox * c3[1]), c0[2] - (ox * c3[2])};
+			const float v[3] = {c1[0] - (oy * c3[0]), c1[1] - (oy * c3[1]), c1[2] - (oy * c3[2])};
+
+			const float len_u = length3(u);
+			const float len_v = length3(v);
+
+			// A degenerate x or y axis is not a camera.
+			if (!(len_u > 1e-4f) || !(len_v > 1e-4f))
+				return false;
+
+			// Each term is a sharp reciprocal rather than a clamped ramp, and that choice is
+			// load-bearing. A real camera satisfies all three identities to float precision,
+			// so 1/(1 + k*error) puts it around the theoretical maximum while a window that
+			// merely happens to hold three plausible-looking vectors lands an order of
+			// magnitude lower. With a saturating ramp every near-miss also scored the maximum,
+			// the top-N filled with whichever windows the scan reached first (lowest address),
+			// and the true camera -- measured at offset 0x2970 in Rainbow Six 3 -- was crowded
+			// out of the set it had already qualified for.
+			float score = 2.0f / (1.0f + (100.0f * std::abs(len3 - 1.0f)));
+
+			const float cos_uv = std::abs(dot3(u, v)) / (len_u * len_v);
+			score += 2.0f / (1.0f + (100.0f * cos_uv));
+
+			const float len_c2 = length3(c2);
+			if (len_c2 > 1e-6f)
+			{
+				const float cross[3] = {
+					(c2[1] * c3[2]) - (c2[2] * c3[1]),
+					(c2[2] * c3[0]) - (c2[0] * c3[2]),
+					(c2[0] * c3[1]) - (c2[1] * c3[0])};
+
+				const float sin_23 = length3(cross) / (len_c2 * len3);
+				score += 1.0f / (1.0f + (100.0f * sin_23));
+			}
+			else
+			{
+				// The guest writes GS Z from somewhere else. Neither evidence for nor against.
+				score += 0.25f;
+			}
+
+			// |u| and |v| are |p00*sx| and |p11*sy| -- an aspect ratio apart, not orders.
+			const float ratio = (len_u > len_v) ? (len_u / len_v) : (len_v / len_u);
+			score += 1.0f / (1.0f + std::max(0.0f, ratio - 1.0f));
+
+			out_score = score;
+			return std::isfinite(score);
+		}
+
+		bool finite_window(const float* m)
+		{
+			for (u32 i = 0; i < 16; ++i)
+			{
+				if (!std::isfinite(m[i]) || std::abs(m[i]) > s_max_coefficient)
+					return false;
+			}
+
+			return true;
+		}
+
+		// Keeps the frame's top max_candidates by shape score, de-duplicated by content.
+		// VU1 memory is double-buffered through VIF1.TOPS, so the same matrix routinely
+		// appears at two addresses in the same scan.
+		void insert_candidate(const float* m, float score, u32 offset, u32 start_pc, u64 ucode)
+		{
+			const u64 content = hash_bits(m, 16);
+
+			const u32 live = std::min(s_frame.count, max_candidates);
+			for (u32 i = 0; i < live; ++i)
+			{
+				if (s_frame_hashes[i] == content)
+					return;
+			}
+
+			u32 slot = live;
+
+			// '>=' not '==': the accumulator is written from whichever thread executes VU1,
+			// and under MTVU that is not always the same one. The scan itself is serialised
+			// (see the reentrancy guard in OnXGKick), but a count that ever slipped past the
+			// array bound here would write straight off the end of items[] into the statics
+			// behind it, which is silent corruption rather than an honest failure.
+			if (slot >= max_candidates)
+			{
+				u32 worst = 0;
+				for (u32 i = 1; i < max_candidates; ++i)
+				{
+					if (s_frame.items[i].score < s_frame.items[worst].score)
+						worst = i;
+				}
+
+				if (score <= s_frame.items[worst].score)
+					return;
+
+				slot = worst;
+			}
+			else
+			{
+				++s_frame.count;
+			}
+
+			Candidate& out = s_frame.items[slot];
+			std::memcpy(out.m, m, sizeof(out.m));
+			out.score = score;
+			out.mem_offset = offset;
+			out.start_pc = start_pc;
+			out.ucode_hash = ucode;
+			s_frame_hashes[slot] = content;
+		}
+
+		void publish()
+		{
+			const u32 seq = s_seq.load(std::memory_order_relaxed);
+
+			s_seq.store(seq + 1, std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_release);
+
+			std::memcpy(&s_published, &s_frame, sizeof(Frame));
+
+			std::atomic_thread_fence(std::memory_order_release);
+			s_seq.store(seq + 2, std::memory_order_release);
+		}
+	} // namespace
+
+	std::atomic<bool> g_armed{false};
+
+	void SetArmed(bool enabled)
+	{
+		if (enabled)
+		{
+			// A fresh session must not inherit the previous one's candidates.
+			s_seq.store(0, std::memory_order_relaxed);
+			s_published = Frame{};
+			s_frame = Frame{};
+			s_generation.store(0, std::memory_order_relaxed);
+			s_generation_seen = 0;
+			s_scanning.store(false, std::memory_order_relaxed);
+			s_scan_budget = read_scan_budget();
+
+			const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_SCANTRACE");
+			s_trace_enabled = !env.empty() && env[0] != L'0';
+			if (s_trace_enabled && !s_trace_file)
+			{
+				const std::string& dir = EmuFolders::Logs.empty() ? EmuFolders::AppRoot : EmuFolders::Logs;
+				s_trace_file = FileSystem::OpenCFile(Path::Combine(dir, "remix_scantrace.txt").c_str(), "w");
+			}
+		}
+
+		if (enabled)
+		{
+			// PCSX2_REMIX_PINOFFSET seeds the pin by hand, so a title whose camera address is
+			// already known does not have to win the shape ranking once before it locks.
+			const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_PINOFFSET", -1);
+			const bool valid = (env >= 0) && ((env + s_matrix_bytes) <= VU1_MEMSIZE);
+			s_pinned_offset.store(valid ? static_cast<u32>(env) : s_no_pin, std::memory_order_relaxed);
+		}
+
+		g_armed.store(enabled, std::memory_order_relaxed);
+	}
+
+	void SetPinnedOffset(u32 offset)
+	{
+		s_pinned_offset.store(offset, std::memory_order_relaxed);
+	}
+
+	void OnXGKick()
+	{
+		// VU1 is executed by the EE thread, or by the MTVU thread, or by both in the same
+		// session (vif1's _vuXGKICKTransfer runs on the EE side while vu1Thread executes the
+		// program). Everything below writes one shared per-frame accumulator, so let exactly
+		// one thread in at a time and count what was dropped rather than interleaving.
+		if (s_scanning.exchange(true, std::memory_order_acquire))
+		{
+			++s_frame.kicks_reentrant;
+			return;
+		}
+
+		const scan_guard guard;
+
+		const u32 generation = s_generation.load(std::memory_order_relaxed);
+		if (generation != s_generation_seen)
+		{
+			s_generation_seen = generation;
+			s_frame = Frame{};
+		}
+
+		++s_frame.kicks_seen;
+
+		if (s_frame.kicks_scanned >= s_scan_budget)
+			return;
+
+		const u8* const mem = vuRegs[1].Mem;
+		if (!mem)
+			return;
+
+		++s_frame.kicks_scanned;
+
+		trace("enter", s_frame.kicks_scanned, reinterpret_cast<u64>(mem));
+
+		const u64 ucode = hash_ucode();
+		const u32 start_pc = vuRegs[1].start_pc;
+
+		trace("ucode", ucode, start_pc);
+
+		for (u32 offset = 0; (offset + s_matrix_bytes) <= VU1_MEMSIZE; offset += s_qword)
+		{
+			++s_frame.windows_examined;
+
+			float m[16];
+			std::memcpy(m, mem + offset, sizeof(m));
+
+			if (!finite_window(m))
+				continue;
+
+			float row_score = 0.0f;
+			float column_score = 0.0f;
+			const bool as_row = shape_test(m, false, row_score);
+			const bool as_column = shape_test(m, true, column_score);
+
+			if (!as_row && !as_column)
+				continue;
+
+			++s_frame.windows_survived;
+
+			// The GS side tries both majorness hypotheses regardless; the better of the two
+			// scores is what ranks this window against the others.
+			const float score = std::max(as_row ? row_score : 0.0f, as_column ? column_score : 0.0f);
+			if (score < 0.5f)
+				continue;
+
+			insert_candidate(m, score, offset, start_pc, ucode);
+		}
+
+		// The pinned window goes in unconditionally and at the top of the ranking, because the
+		// address it sits at is evidence the shape score cannot supply: a camera was actually
+		// recovered from there.
+		// Bounded to the first few kicks of a frame: the address is re-uploaded per frame but
+		// its contents are rewritten between kicks, and letting every kick contribute a
+		// 1000-scored entry would evict the whole rest of the set.
+		const u32 pinned = s_pinned_offset.load(std::memory_order_relaxed);
+		if (pinned != s_no_pin && s_frame.kicks_scanned <= 4 && (pinned + s_matrix_bytes) <= VU1_MEMSIZE)
+		{
+			float m[16];
+			std::memcpy(m, mem + pinned, sizeof(m));
+
+			if (finite_window(m))
+				insert_candidate(m, 1000.f, pinned, start_pc, ucode);
+		}
+
+		trace("scanned", s_frame.windows_survived, s_frame.count);
+
+		// Publish every scanned kick, empty set included: a frame in which nothing qualified
+		// must not present the previous frame's winner as its own.
+		publish();
+
+		trace("published", s_seq.load(std::memory_order_relaxed), 0);
+	}
+
+	bool Latch(Frame& out)
+	{
+		bool have = false;
+
+		for (u32 attempt = 0; attempt < 16; ++attempt)
+		{
+			const u32 seq = s_seq.load(std::memory_order_acquire);
+			if (seq == 0)
+				break; // nothing has ever been published
+
+			if (seq & 1u)
+				continue; // a publish is in flight
+
+			std::memcpy(&out, &s_published, sizeof(Frame));
+			std::atomic_thread_fence(std::memory_order_acquire);
+
+			if (s_seq.load(std::memory_order_relaxed) == seq)
+			{
+				have = true;
+				break;
+			}
+		}
+
+		s_generation.fetch_add(1, std::memory_order_relaxed);
+		return have;
+	}
+} // namespace RemixVU1Capture

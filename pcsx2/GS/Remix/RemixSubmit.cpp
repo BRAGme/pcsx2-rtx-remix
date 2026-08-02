@@ -4,16 +4,26 @@
 #include "GS/Remix/RemixSubmit.h"
 #include "GS/Remix/RemixRuntime.h"
 #include "GS/Remix/RemixTransforms.h"
+#include "GS/Remix/RemixVU1Capture.h"
 
 #include "GS/Renderers/HW/GSRendererHW.h"
 
+#include "Config.h"
+
 #include "common/Console.h"
+#include "common/FileSystem.h"
+#include "common/Path.h"
 #include "common/WindowInfo.h"
+
+#include "fmt/format.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -78,12 +88,51 @@ namespace RemixSubmit
 			u64 meshes_destroyed = 0;
 			u64 cam_world = 0;
 			u64 cam_fallback = 0;
+			// World-anchor (step 9) accounting. Every one of these has to be readable in a
+			// null result: "no candidate" and "candidates that never split" and "splits that
+			// scored zero" are three completely different findings.
+			u64 vu_kicks = 0;
+			u64 vu_kicks_scanned = 0;
+			u64 vu_windows = 0;
+			u64 vu_survivors = 0; // passed the VU-side shape prefilter
+			u64 vu_reentrant = 0; // kicks dropped because two threads executed VU1 at once
+			u64 cam_candidates = 0; // offered to the GS side, summed over frames
+			u64 cam_reject_split = 0; // split_view_projection_direct refused
+			u64 cam_reject_score = 0; // split worked, score_perspective refused
+			u64 cam_accept = 0;
+			u32 cam_last_candidates = 0;
 		};
 
 		struct mesh_entry
 		{
 			remixapi_MeshHandle handle = nullptr;
 			u64 last_used_frame = 0;
+		};
+
+		// The un-projection inputs of the frame's dominant 3D draw. Recorded per draw and
+		// consumed at VSync, because the screen-clip normaliser needs exactly the constants
+		// the vertex un-projection used.
+		struct viewport_constants
+		{
+			bool valid = false;
+			float ofx = 0.f;
+			float ofy = 0.f;
+			int width = 0;
+			int height = 0;
+			u32 weight = 0; // vertex count of the draw that supplied it
+		};
+
+		struct world_camera
+		{
+			bool valid = false;
+			remix_ps2::mat4 view = remix_ps2::mat4_identity();
+			remix_ps2::mat4 projection = remix_ps2::mat4_identity();
+			remix_ps2::clip_solver solver{};
+			float position[3] = {0.f, 0.f, 0.f};
+			float near_plane = 0.1f;
+			float far_plane = 1000.f;
+			u64 matrix_hash = 0;
+			float score = 0.f;
 		};
 
 		remix_ps2::runtime s_remix;
@@ -127,9 +176,32 @@ namespace RemixSubmit
 		std::unordered_map<u64, mesh_entry> s_meshes;
 		std::unordered_set<u64> s_poisoned;
 
+		// Matrices already written to the PCSX2_REMIX_DUMP file, so the diagnostic stays one
+		// line per distinct matrix rather than one per frame per matrix.
+		std::unordered_set<u64> s_dumped;
+
 		// Reused across draws to keep the hot path allocation free.
 		std::vector<remixapi_HardcodedVertex> s_scratch_vertices;
 		std::vector<u32> s_scratch_indices;
+
+		// Un-projection constants: accumulating for the frame in flight, and the finished
+		// frame's winner that resolve_world_camera() normalises against.
+		viewport_constants s_frame_viewport{};
+		viewport_constants s_last_viewport{};
+
+		world_camera s_active_camera{};
+
+		// Frames the last accepted camera may be re-used for when a frame fails to resolve.
+		// Short on purpose: holding a stale camera while the player moves reproduces exactly
+		// the failure the milestone test looks for (geometry gliding with the view), so this
+		// is only long enough to ride out a single-frame hiccup.
+		constexpr u64 s_camera_hold_frames = 3;
+		u64 s_camera_last_accept_frame = 0;
+		bool s_logged_world_camera = false;
+
+		float s_light_position[3] = {0.f, -1.f, 0.f};
+		float s_light_scale = 1.f;
+		bool s_light_placed = false;
 
 		float debug_light_radius()
 		{
@@ -195,9 +267,26 @@ namespace RemixSubmit
 			}
 		}
 
-		void place_debug_light(const float (&position)[3])
+		// 'scale' rescales the light for the recovered world's unit size: the defaults are
+		// tuned for the synthetic view-space camera (near 0.1), and a title whose world unit
+		// is a centimetre would otherwise be lit by a pinprick. Radiance follows the inverse
+		// square so the apparent brightness is unchanged.
+		void place_debug_light(const float (&position)[3], float scale = 1.f)
 		{
 			const remixapi_Interface& api = s_remix.api();
+
+			if (s_light_placed &&
+				s_light_position[0] == position[0] && s_light_position[1] == position[1] &&
+				s_light_position[2] == position[2] && s_light_scale == scale)
+			{
+				return;
+			}
+
+			s_light_position[0] = position[0];
+			s_light_position[1] = position[1];
+			s_light_position[2] = position[2];
+			s_light_scale = scale;
+			s_light_placed = true;
 
 			if (s_debug_light)
 			{
@@ -209,14 +298,14 @@ namespace RemixSubmit
 			sphere_light.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
 			sphere_light.pNext = nullptr;
 			sphere_light.position = {position[0], position[1], position[2]};
-			sphere_light.radius = debug_light_radius();
+			sphere_light.radius = debug_light_radius() * scale;
 			sphere_light.shaping_hasvalue = 0;
 			// Zero-init leaves this at 0, but the runtime's own default is 1.0
 			// (rtx_lights.h kVolumetricRadianceScaleDefaultValue). At 0 the light contributes
 			// nothing volumetrically.
 			sphere_light.volumetricRadianceScale = 1.f;
 
-			const float radiance = debug_light_radiance();
+			const float radiance = debug_light_radiance() * scale * scale;
 
 			remixapi_LightInfo light_info{};
 			light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
@@ -318,6 +407,314 @@ namespace RemixSubmit
 			remix_ps2::guarded_setup_camera(api.SetupCamera, &camera_info);
 		}
 
+		// --- the world-anchored camera ----------------------------------------------------
+
+		// Far plane for a recovered world camera. Unless PCSX2_REMIX_FARPLANE is set
+		// explicitly it follows the recovered near plane, because a PS2 title's world unit
+		// could be a metre or a centimetre and a fixed 1000 would either clip the level away
+		// or crush the whole scene into the first depth slice.
+		float world_far_plane(float near_plane)
+		{
+			static const bool explicit_far = !remix_ps2::read_env(L"PCSX2_REMIX_FARPLANE").empty();
+			if (explicit_far)
+				return remix_ps2::hardcoded_far_plane();
+
+			return near_plane * 4096.f;
+		}
+
+		u64 hash_floats(const float* values, u32 count)
+		{
+			u64 hash = fnv_seed;
+
+			for (u32 i = 0; i < count; ++i)
+			{
+				u32 bits;
+				std::memcpy(&bits, &values[i], sizeof(bits));
+				hash = (hash ^ bits) * fnv_prime;
+			}
+
+			return hash;
+		}
+
+		// PCSX2_REMIX_DUMP=1: one line per unique scanned matrix, in its own file because the
+		// emulator log is noisy and gets rotated. This file is the deliverable when the world
+		// tier does not resolve -- it is what distinguishes "the scan found nothing" from
+		// "found matrices that would not split" from "split but the perspective filter
+		// rejected every one".
+		void dump_write(const std::string& line)
+		{
+			static constexpr u32 max_lines = 20000;
+			static u32 written = 0;
+			static bool tried = false;
+			static std::FILE* file = nullptr;
+
+			if (!tried)
+			{
+				tried = true;
+
+				const std::string& dir = EmuFolders::Logs.empty() ? EmuFolders::AppRoot : EmuFolders::Logs;
+				const std::string path = Path::Combine(dir, "remix_matrices.txt");
+				file = FileSystem::OpenCFile(path.c_str(), "w");
+
+				if (file)
+					INFO_LOG("Remix: writing scanned-matrix diagnostics to '{}'", path);
+				else
+					ERROR_LOG("Remix: could not open '{}' for the matrix dump", path);
+			}
+
+			if (!file || written >= max_lines)
+				return;
+
+			++written;
+			std::fputs(line.c_str(), file);
+			std::fputc('\n', file);
+			std::fflush(file);
+		}
+
+		void submit_camera()
+		{
+			if (!s_active_camera.valid)
+			{
+				submit_fallback_camera();
+				++s_stats.cam_fallback;
+
+				const float origin_light[3] = {0.f, -1.f, 0.f};
+				place_debug_light(origin_light);
+				return;
+			}
+
+			remixapi_CameraInfo camera_info{};
+			camera_info.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+			camera_info.pNext = nullptr;
+			camera_info.type = REMIXAPI_CAMERA_TYPE_WORLD;
+			// Straight copies: remixapi_CameraInfo's matrices are row-vector, the same
+			// convention as everything in RemixTransforms. remixapi_Transform is the one
+			// exception and is not involved here.
+			remix_ps2::to_camera_matrix(s_active_camera.view, camera_info.view);
+			remix_ps2::to_camera_matrix(s_active_camera.projection, camera_info.projection);
+
+			remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &camera_info);
+			++s_stats.cam_world;
+
+			// The debug light rides the camera, as in RPCS3: a world-space scene lit from
+			// wherever the origin happens to be is usually a black scene.
+			place_debug_light(s_active_camera.position, std::max(1.f, s_active_camera.near_plane / 0.1f));
+		}
+
+		void drop_stale_camera()
+		{
+			if (s_active_camera.valid && (s_frame_counter - s_camera_last_accept_frame) > s_camera_hold_frames)
+			{
+				s_active_camera.valid = false;
+				s_active_camera.matrix_hash = 0;
+			}
+		}
+
+		// Latches the VU thread's candidates and turns the best one into a world camera.
+		// Runs after Present, so the camera resolved here is the one both the next frame's
+		// draws and the next frame's SetupCamera use -- geometry and camera always reference
+		// the same matrix (RPCS3's one-frame latch).
+		void resolve_world_camera()
+		{
+			RemixVU1Capture::Frame frame{};
+			const bool have = RemixVU1Capture::Latch(frame);
+
+			// The producer is on another thread behind a seqlock; never let its count index
+			// this side's loop without a bound of our own.
+			frame.count = std::min(frame.count, RemixVU1Capture::max_candidates);
+
+			s_stats.vu_kicks += frame.kicks_seen;
+			s_stats.vu_kicks_scanned += frame.kicks_scanned;
+			s_stats.vu_windows += frame.windows_examined;
+			s_stats.vu_survivors += frame.windows_survived;
+			s_stats.vu_reentrant += frame.kicks_reentrant;
+			s_stats.cam_candidates += frame.count;
+			s_stats.cam_last_candidates = frame.count;
+
+			const viewport_constants vp = s_last_viewport;
+
+			if (remix_ps2::nocam_enabled() || !have || frame.count == 0 || !vp.valid)
+			{
+				drop_stale_camera();
+				return;
+			}
+
+			const float width = static_cast<float>(vp.width);
+			const float height = static_cast<float>(vp.height);
+			const float reference_aspect = (height > 0.f) ? (width / height) : (4.f / 3.f);
+
+			// The guest's post-divide output space is not knowable in advance: the fused
+			// matrix may already carry the full 12.4 viewport fold, or emit pixels, or emit
+			// plain NDC and leave the viewport to a post-divide multiply-add in the VU. Try
+			// each, both majorness ways round, and let score_perspective decide. That is a
+			// handful of 4x4 inversions per frame.
+			struct hypothesis
+			{
+				const char* name;
+				float scale_x;
+				float offset_x;
+				float scale_y;
+				float offset_y;
+			};
+
+			const hypothesis hypotheses[] = {
+				// GS 12.4 subpixels: the exact inverse of the per-vertex un-projection.
+				{"gs", width * 8.f, vp.ofx + (width * 8.f) - 8.f + 0.05f,
+					-(height * 8.f), vp.ofy + (height * 8.f) - 8.f + 0.05f},
+				// Pixels, origin top-left. XYOFFSET cancels: it is added after this stage.
+				{"px", width * 0.5f, (width * 0.5f) - 0.5f, -(height * 0.5f), (height * 0.5f) - 0.5f},
+				// Already NDC, +Y up like Remix.
+				{"ndc", 1.f, 0.f, 1.f, 0.f},
+				// Already NDC, +Y down like the GS.
+				{"ndcY", 1.f, 0.f, -1.f, 0.f},
+			};
+
+			float best_score = 0.f;
+			remix_ps2::vp_split best_split{};
+			remix_ps2::mat4 best_normalized = remix_ps2::mat4_identity();
+			u64 best_hash = 0;
+			u32 best_offset = 0;
+			const char* best_name = "";
+			bool best_transposed = false;
+
+			for (u32 c = 0; c < frame.count; ++c)
+			{
+				const RemixVU1Capture::Candidate& candidate = frame.items[c];
+
+				remix_ps2::mat4 raw{};
+				std::memcpy(&raw.m[0][0], candidate.m, sizeof(candidate.m));
+
+				const u64 content = hash_floats(candidate.m, 16);
+				const bool dump = remix_ps2::dump_enabled() && s_dumped.insert(content).second;
+
+				std::string detail;
+				float candidate_best = 0.f;
+				const char* candidate_name = "none";
+				remix_ps2::projection_params candidate_params{};
+
+				for (u32 major = 0; major < 2; ++major)
+				{
+					const remix_ps2::mat4 oriented = (major == 0) ? raw : remix_ps2::mat4_transpose(raw);
+
+					for (const hypothesis& hyp : hypotheses)
+					{
+						const remix_ps2::mat4 normalized = remix_ps2::normalize_screen_clip(
+							oriented, hyp.scale_x, hyp.offset_x, hyp.scale_y, hyp.offset_y);
+
+						remix_ps2::vp_split split{};
+						if (!remix_ps2::split_view_projection_direct(normalized, split))
+						{
+							++s_stats.cam_reject_split;
+							if (dump)
+								fmt::format_to(std::back_inserter(detail), " {}/{}=-", hyp.name, major ? 'C' : 'R');
+
+							continue;
+						}
+
+						float score = remix_ps2::score_perspective(split.projection, reference_aspect);
+						if (dump)
+							fmt::format_to(std::back_inserter(detail), " {}/{}={:.2f}", hyp.name, major ? 'C' : 'R', score);
+
+						if (!(score > 0.f))
+						{
+							++s_stats.cam_reject_score;
+							continue;
+						}
+
+						// Latch hysteresis: prefer the matrix that already won, so a tie does
+						// not make the world snap between two equally plausible anchors.
+						if (content == s_active_camera.matrix_hash)
+							score += 0.5f;
+
+						if (score > candidate_best)
+						{
+							candidate_best = score;
+							candidate_name = hyp.name;
+							remix_ps2::describe_projection(split.projection, candidate_params);
+						}
+
+						if (score > best_score)
+						{
+							best_score = score;
+							best_split = split;
+							best_normalized = normalized;
+							best_hash = content;
+							best_offset = candidate.mem_offset;
+							best_name = hyp.name;
+							best_transposed = (major != 0);
+						}
+					}
+				}
+
+				if (dump)
+				{
+					dump_write(fmt::format(
+						"f={} off=0x{:04x} pc=0x{:04x} ucode=0x{:016x} shape={:.2f} res=[{} ] best={} "
+						"score={:.2f} fovY={:.2f} aspect={:.3f} near={:.5g} M={}",
+						s_frame_counter, candidate.mem_offset, candidate.start_pc, candidate.ucode_hash,
+						candidate.score, detail, candidate_name, candidate_best,
+						candidate_params.fov_y_degrees, candidate_params.aspect, candidate_params.near_plane,
+						remix_ps2::format_matrix(raw)));
+				}
+			}
+
+			if (!(best_score > 0.f))
+			{
+				drop_stale_camera();
+				return;
+			}
+
+			world_camera camera{};
+			camera.view = best_split.view;
+
+			remix_ps2::projection_params params{};
+			const bool described = remix_ps2::describe_projection(best_split.projection, params);
+
+			// near = |m[3][2] / m[2][2]| is scale-invariant in the z column, so it is a real
+			// world-unit distance even though the z column itself is in raw GS Z units.
+			camera.near_plane = (described && std::isfinite(params.near_plane) &&
+									params.near_plane > 1e-4f && params.near_plane < 1e6f) ?
+			                        params.near_plane :
+			                        0.1f;
+			camera.far_plane = world_far_plane(camera.near_plane);
+			camera.projection = remix_ps2::rebuild_projection_z(best_split.projection, camera.near_plane, camera.far_plane);
+
+			remix_ps2::mat4 view_to_world{};
+			if (!remix_ps2::make_clip_solver(best_normalized, camera.solver) ||
+				!remix_ps2::mat4_invert(camera.view, view_to_world))
+			{
+				++s_stats.cam_reject_split;
+				drop_stale_camera();
+				return;
+			}
+
+			camera.position[0] = view_to_world.m[3][0];
+			camera.position[1] = view_to_world.m[3][1];
+			camera.position[2] = view_to_world.m[3][2];
+			camera.matrix_hash = best_hash;
+			camera.score = best_score;
+			camera.valid = true;
+
+			s_active_camera = camera;
+			s_camera_last_accept_frame = s_frame_counter;
+			++s_stats.cam_accept;
+
+			// Pin the address the winner came from. A camera actually recovered from an
+			// offset is stronger evidence than any shape score, and without it the true
+			// matrix has to out-rank thousands of shape-plausible windows every frame.
+			RemixVU1Capture::SetPinnedOffset(best_offset);
+
+			if (!s_logged_world_camera)
+			{
+				s_logged_world_camera = true;
+				INFO_LOG("Remix: world camera resolved -- hypothesis {}/{}, score {:.2f}, fovY {:.1f} deg, "
+						 "near {:.5g}, far {:.5g}, eye ({:.3f}, {:.3f}, {:.3f})",
+					best_name, best_transposed ? "column-major" : "row-major", best_score,
+					params.fov_y_degrees, camera.near_plane, camera.far_plane,
+					camera.position[0], camera.position[1], camera.position[2]);
+			}
+		}
+
 		void submit_debug_triangle()
 		{
 			const remixapi_Interface& api = s_remix.api();
@@ -361,12 +758,15 @@ namespace RemixSubmit
 			if (!s_remix.initialize(s_hwnd))
 			{
 				ERROR_LOG("Remix: runtime unavailable, degrading to a no-op");
+				// Nothing will ever latch the VU1 candidates now, so stop paying for them.
+				RemixVU1Capture::SetArmed(false);
 				return;
 			}
 
 			if (!create_debug_scene())
 			{
 				ERROR_LOG("Remix: debug scene setup failed, degrading to a no-op");
+				RemixVU1Capture::SetArmed(false);
 				return;
 			}
 
@@ -420,6 +820,18 @@ namespace RemixSubmit
 				s_stats.skip_const_q, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback);
+
+			// Second line: the world anchor. Every stage of the pipeline is separately
+			// visible, so a null result names the stage that produced it -- no kicks, no
+			// windows through the shape prefilter, no candidates, no split, or no score.
+			INFO_LOG("Remix: vu kicks {} scanned {} reentrant {} windows {} shape-ok {} | cand {} (now {}) | "
+					 "split-reject {} score-reject {} accept {} | camera {}{}",
+				s_stats.vu_kicks, s_stats.vu_kicks_scanned, s_stats.vu_reentrant, s_stats.vu_windows,
+				s_stats.vu_survivors,
+				s_stats.cam_candidates, s_stats.cam_last_candidates, s_stats.cam_reject_split,
+				s_stats.cam_reject_score, s_stats.cam_accept,
+				s_active_camera.valid ? "world score " : "view-space",
+				s_active_camera.valid ? fmt::format("{:.2f} near {:.5g}", s_active_camera.score, s_active_camera.near_plane) : "");
 		}
 	} // namespace
 
@@ -435,6 +847,10 @@ namespace RemixSubmit
 	{
 		s_renderer_is_remix = enabled;
 		g_armed = enabled || (SpikeMode() > 0);
+
+		// Arm the VU1 matrix scan with the renderer, not with the spike: the spike has no
+		// camera to feed, and an armed scan costs the EE/MTVU thread real work per XGKICK.
+		RemixVU1Capture::SetArmed(enabled);
 	}
 
 	bool RendererIsRemix()
@@ -567,12 +983,31 @@ namespace RemixSubmit
 		const float offset_x = (ox * sx) + ox2 + 1.0f;
 		const float offset_y = (oy * sy) + oy2 + 1.0f;
 
+		// Hand these constants to the world tier: the screen-clip normaliser has to invert
+		// exactly the map used here, and the biggest 3D draw is the best proxy for "the
+		// frame's main 3D target". Ties keep the first, which is stable frame to frame.
+		if (vertex_count > s_frame_viewport.weight)
+		{
+			s_frame_viewport.valid = true;
+			s_frame_viewport.ofx = ox;
+			s_frame_viewport.ofy = oy;
+			s_frame_viewport.width = rt_unscaled_width;
+			s_frame_viewport.height = rt_unscaled_height;
+			s_frame_viewport.weight = vertex_count;
+		}
+
 		// The synthetic projection the recovered geometry is expressed against. Only its two
 		// scale terms are needed: a point at eye depth w projects to ndc = (vx*a/w, vy*b/w).
 		const remix_ps2::mat4 projection = remix_ps2::make_perspective(
 			s_debug_fov_y_degrees, window_aspect(), 0.1f, remix_ps2::hardcoded_far_plane());
 		const float inv_a = 1.0f / projection.m[0][0];
 		const float inv_b = 1.0f / projection.m[1][1];
+
+		// World tier: positions are solved against the frame's fused matrix instead of being
+		// expressed in the synthetic camera's space. Both paths consume the same NDC, so the
+		// only difference is the three lines that turn (ndc, w) into a position.
+		const bool world_mode = s_active_camera.valid;
+		const remix_ps2::clip_solver& solver = s_active_camera.solver;
 
 		const GSVertex* const verts = r.m_vertex->buff;
 
@@ -593,9 +1028,25 @@ namespace RemixSubmit
 			const float w = 1.0f / q;
 
 			remixapi_HardcodedVertex& out = s_scratch_vertices[i];
-			out.position[0] = ndc_x * w * inv_a;
-			out.position[1] = ndc_y * w * inv_b;
-			out.position[2] = w;
+
+			if (world_mode)
+			{
+				// clip = (ndc_x*w, ndc_y*w, ., w). The z equation is deliberately not used:
+				// a PS2 vertex's GS Z is a raw integer in a per-title convention, and w
+				// already carries the absolute depth, so x/y/w is exactly determined.
+				float world[3];
+				remix_ps2::solve_world_position(solver, ndc_x * w, ndc_y * w, w, world);
+				out.position[0] = world[0];
+				out.position[1] = world[1];
+				out.position[2] = world[2];
+			}
+			else
+			{
+				out.position[0] = ndc_x * w * inv_a;
+				out.position[1] = ndc_y * w * inv_b;
+				out.position[2] = w;
+			}
+
 			out.normal[0] = 0.f;
 			out.normal[1] = 0.f;
 			out.normal[2] = -1.f;
@@ -776,10 +1227,11 @@ namespace RemixSubmit
 			return;
 
 		// Frame order mirrors RPCS3's flip(): camera -> Present -> latch -> reap -> stats.
-		// The world-anchored camera is a later step; phase 1 always runs the fallback.
+		// The camera submitted here was resolved at the previous VSync, which is the same one
+		// this frame's draws un-projected against -- geometry and camera always reference one
+		// matrix, at the cost of a bounded one-frame lag under motion.
 		refresh_window_size();
-		submit_fallback_camera();
-		++s_stats.cam_fallback;
+		submit_camera();
 
 		// The beacon only appears when nothing of the guest's own geometry survived the gates,
 		// so it never clutters a working scene but still says "the runtime is alive".
@@ -802,6 +1254,15 @@ namespace RemixSubmit
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
 			ERROR_LOG("Remix: Present failed ({})", remix_ps2::error_name(status));
 
+		// The frame that just presented is the one whose un-projection constants the world
+		// tier has to normalise against.
+		if (s_frame_viewport.valid)
+			s_last_viewport = s_frame_viewport;
+
+		s_frame_viewport = viewport_constants{};
+
+		resolve_world_camera();
+
 		++s_frame_counter;
 		s_submitted_this_frame = 0;
 
@@ -811,6 +1272,17 @@ namespace RemixSubmit
 
 	void OnGSClose()
 	{
+		// Unconditional, and before the runtime check: the scan must stop costing the VU
+		// thread work even when the runtime never came up.
+		RemixVU1Capture::SetArmed(false);
+
+		s_active_camera = world_camera{};
+		s_frame_viewport = viewport_constants{};
+		s_last_viewport = viewport_constants{};
+		s_camera_last_accept_frame = 0;
+		s_logged_world_camera = false;
+		s_light_placed = false;
+
 		if (!s_remix.ok())
 			return;
 

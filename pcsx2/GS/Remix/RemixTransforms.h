@@ -91,6 +91,46 @@ namespace remix_ps2
 
 	bool split_view_projection(const mat4& fused, vp_split& out);
 
+	// Single-orientation split: does NOT retry the transpose. The PS2 screen-clip normaliser
+	// has to be applied in a known majorness, so the caller resolves row-vs-column itself and
+	// asks for the split of each hypothesis separately -- split_view_projection's internal
+	// retry would transpose a matrix the normaliser had already been composed into, which
+	// mixes conventions and can accept a meaningless answer.
+	bool split_view_projection_direct(const mat4& fused, vp_split& out);
+
+	// ---------------------------------------------------------------------------------------
+	// PS2 joint: screen-clip normalisation and the world un-projection
+	// ---------------------------------------------------------------------------------------
+
+	// Composes a matrix that emits the guest's own post-divide output space with the inverse
+	// of the x/y viewport map, so its clip x/w and y/w become the same NDC the per-vertex
+	// un-projection produces: result = fused * inverse(S), with
+	//     S = [[sx 0 0 0] [0 sy 0 0] [0 0 1 0] [ox oy 0 1]].
+	// The z column is deliberately left alone -- see make_clip_solver.
+	mat4 normalize_screen_clip(const mat4& fused, float scale_x, float offset_x, float scale_y, float offset_y);
+
+	// Recovers world positions from a normalised fused matrix using clip x, y and w ONLY.
+	// A PS2 vertex's GS Z is a raw integer in a per-title convention (usually reversed, and
+	// scaled by the ZBUF format's max depth), so the fused matrix's z column cannot be
+	// trusted. Dropping it costs nothing: three equations in three unknowns is exactly
+	// determined, because w = 1/Q already carries the absolute depth.
+	struct clip_solver
+	{
+		float inverse[3][3]; // of B, where B[k][i] = fused.m[i][c] for c in {0, 1, 3}
+		float bias[3]; // fused.m[3][0], fused.m[3][1], fused.m[3][3]
+	};
+
+	bool make_clip_solver(const mat4& fused, clip_solver& out);
+	void solve_world_position(const clip_solver& solver, float clip_x, float clip_y, float clip_w, float (&out)[3]);
+
+	// Replaces a recovered projection's z output column with a synthetic one spanning
+	// near..far. fold_viewport_z would be the RPCS3 move, but a PS2 fused matrix's z column
+	// emits raw GS Z in an unknown convention and the world un-projection never reads it, so
+	// there is nothing meaningful to fold. Rebuilding is correct-by-construction for Remix's
+	// D3D-style [0,1] depth and stays consistent with geometry that has no z dependence.
+	// The sign of m[2][3] (already pinned to +-1 by classify_perspective) carries handedness.
+	mat4 rebuild_projection_z(const mat4& projection, float near_plane, float far_plane);
+
 	// Builds a synthetic row-vector perspective projection in Remix's left-handed, +Y-up
 	// convention, mapping z to D3D-style [0,1]. This is the projection the view-space tier
 	// un-projects through: the geometry it produces is exactly what the parameterized debug

@@ -713,12 +713,14 @@ if(WIN32)
 			GS/Remix/RemixRuntime.cpp
 			GS/Remix/RemixSubmit.cpp
 			GS/Remix/RemixTransforms.cpp
+			GS/Remix/RemixVU1Capture.cpp
 		)
 		list(APPEND pcsx2GSHeaders
 			GS/Remix/remix_c.h
 			GS/Remix/RemixRuntime.h
 			GS/Remix/RemixSubmit.h
 			GS/Remix/RemixTransforms.h
+			GS/Remix/RemixVU1Capture.h
 		)
 	endif()
 elseif(LINUX)
