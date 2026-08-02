@@ -111,6 +111,7 @@ namespace RemixSubmit
 			u64 meshes_created_peak = 0;
 			u64 sky_tagged = 0; // instances categorised REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
 			u64 cutout_tagged = 0; // instances categorised ALPHA_BLEND_TO_CUTOUT
+			u64 skip_submit_delay = 0; // withheld by PCSX2_REMIX_SUBMITDELAY
 			u64 cam_world = 0;
 			u64 cam_fallback = 0;
 			// World-anchor (step 9) accounting. Every one of these has to be readable in a
@@ -451,6 +452,29 @@ namespace RemixSubmit
 		// Getting this wrong is what made world mode dark past a few metres: with R fixed at
 		// 0.1 in a world thousands of units across, everything but the nearest surface was
 		// receiving essentially nothing.
+		// Crash-bisection arms. Both default off, so they change nothing until asked for.
+		//
+		//   PCSX2_REMIX_SUBMITDELAY  frames of game geometry to withhold after the renderer goes
+		//                            live -- isolates "is it the geometry we submit?"
+		//   PCSX2_REMIX_NODEBUGSCENE build no debug mesh and no debug light at all -- isolates
+		//                            "is it the debug scene itself?". The debug light is a
+		//                            camera-attached emitter in a scene that has no other
+		//                            lights, which is an unusual thing to hand a path tracer,
+		//                            and its radiance and radius have been tested but its
+		//                            *existence* never has.
+		u64 submit_delay_frames()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_SUBMITDELAY", 0)));
+			return value;
+		}
+
+		bool no_debug_scene()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_NODEBUGSCENE", 0) != 0;
+			return value;
+		}
+
 		// Defined with the rest of the world-camera parameters further down.
 		float world_near_plane();
 		float world_far_plane(float near_plane);
@@ -458,6 +482,9 @@ namespace RemixSubmit
 
 		void place_debug_light(const float (&position)[3], float scene_radius)
 		{
+			if (no_debug_scene())
+				return;
+
 			const remixapi_Interface& api = s_remix.api();
 
 			const float radius_override = debug_light_radius_override();
@@ -526,7 +553,7 @@ namespace RemixSubmit
 		void place_sun_light(const float (&direction)[3])
 		{
 			const float radiance = sun_radiance();
-			if (radiance <= 0.f)
+			if (radiance <= 0.f || no_debug_scene())
 				return;
 
 			const remixapi_Interface& api = s_remix.api();
@@ -1286,7 +1313,12 @@ namespace RemixSubmit
 				return;
 			}
 
-			if (!create_debug_scene())
+			if (no_debug_scene())
+			{
+				WARNING_LOG("Remix: PCSX2_REMIX_NODEBUGSCENE -- no debug mesh and no debug light "
+							"will be created (crash bisection arm C)");
+			}
+			else if (!create_debug_scene())
 			{
 				ERROR_LOG("Remix: debug scene setup failed, degrading to a no-op");
 				RemixVU1Capture::SetArmed(false);
@@ -1745,6 +1777,12 @@ namespace RemixSubmit
 			return;
 
 		++s_stats.draws_seen;
+
+		if (s_frame_counter < submit_delay_frames())
+		{
+			++s_stats.skip_submit_delay;
+			return;
+		}
 
 		// --- classification gates -----------------------------------------------------------
 		// Order matters only for the counters: the first gate that refuses is the one blamed.
