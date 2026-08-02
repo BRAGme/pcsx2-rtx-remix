@@ -119,6 +119,13 @@ namespace RemixSubmit
 			// effect under an instance cap. These tell the two apart.
 			u64 meshes_destroyed_frame = 0;
 			u64 meshes_destroyed_peak = 0;
+			// Distinct mesh handles instanced in one frame -- the success metric for stable
+			// mesh identity. Today this tracks the draw count, because identity is hashed over
+			// camera-derived positions; if identity becomes stable it should collapse toward
+			// the number of genuinely distinct objects and stay flat while the camera moves.
+			u64 distinct_instanced_peak = 0;
+			u64 distinct_instanced_total = 0;
+			u64 distinct_instanced_frames = 0;
 			u64 degenerate_triangles = 0; // zero-area triangles dropped before CreateMesh
 			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
@@ -1199,7 +1206,15 @@ namespace RemixSubmit
 				}
 			}
 
-			if (s_last_bounds.valid)
+			// ONLY when the previous frame was itself world-anchored. s_last_bounds holds the
+			// extent of whatever space the previous frame submitted in, so on the first
+			// acceptance it is view-space geometry centred near the origin while the candidate
+			// eye is in world coordinates -- comparing them is a units error, and it rejected
+			// every camera Rainbow Six 3 had been resolving happily (cam world 0 / fallback 900,
+			// where it used to be 3958/2). The origin check above is unconditional and catches
+			// the SOCOM collapse this gate was written for; this one only guards against drift
+			// once world mode is already established.
+			if (s_last_bounds.valid && s_active_camera.valid)
 			{
 				const float cx = 0.5f * (s_last_bounds.min[0] + s_last_bounds.max[0]);
 				const float cy = 0.5f * (s_last_bounds.min[1] + s_last_bounds.max[1]);
@@ -1730,7 +1745,7 @@ namespace RemixSubmit
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
-					 "mesh/frame peak +{} -{} | instbudget-skip {}",
+					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -1742,7 +1757,10 @@ namespace RemixSubmit
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
 				s_stats.skip_all_degenerate, s_stats.meshes_created_peak,
-				s_stats.meshes_destroyed_peak, s_stats.skip_inst_budget);
+				s_stats.meshes_destroyed_peak, s_stats.skip_inst_budget,
+				(s_stats.distinct_instanced_frames > 0) ?
+					(s_stats.distinct_instanced_total / s_stats.distinct_instanced_frames) : 0,
+				s_stats.distinct_instanced_peak);
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -2564,6 +2582,14 @@ namespace RemixSubmit
 		s_stats.meshes_created_frame = 0;
 		s_stats.meshes_destroyed_peak = std::max(s_stats.meshes_destroyed_peak, s_stats.meshes_destroyed_frame);
 		s_stats.meshes_destroyed_frame = 0;
+
+		if (!s_frame_submitted_hashes.empty())
+		{
+			const u64 distinct = s_frame_submitted_hashes.size();
+			s_stats.distinct_instanced_peak = std::max(s_stats.distinct_instanced_peak, distinct);
+			s_stats.distinct_instanced_total += distinct;
+			++s_stats.distinct_instanced_frames;
+		}
 
 		++s_frame_counter;
 		s_submitted_this_frame = 0;
