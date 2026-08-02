@@ -27,6 +27,10 @@ static constexpr RendererInfo s_renderer_info[] = {
 	//: Graphics backend/engine type. Leave as-is.
 	{QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "Direct3D 12"), GSRendererType::DX12},
 #endif
+#if defined(_WIN32) && defined(_M_X64)
+	//: Graphics backend/engine type. Leave as-is.
+	{QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "RTX Remix"), GSRendererType::Remix},
+#endif
 #ifdef ENABLE_OPENGL
 	//: Graphics backend/engine type. Leave as-is.
 	{QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "OpenGL"), GSRendererType::OGL},
@@ -1006,7 +1010,8 @@ void GraphicsSettingsWidget::updateRendererDependentOptions()
 #endif
 
 	const bool is_hardware = (type == GSRendererType::DX11 || type == GSRendererType::DX12 || type == GSRendererType::OGL ||
-							  type == GSRendererType::VK || type == GSRendererType::Metal);
+							  type == GSRendererType::VK || type == GSRendererType::Metal ||
+							  type == GSRendererType::Remix);
 	const bool is_software = (type == GSRendererType::SW);
 	const bool is_auto = (type == GSRendererType::Auto);
 	const bool is_vk = (type == GSRendererType::VK);

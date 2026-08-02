@@ -96,6 +96,8 @@ oprofile_data/
 /bin/videos
 /bin/portable.ini
 /bin/portable.txt
+# RTX Remix runtime, deployed (not vendored) beside the executable.
+/bin/remix
 
 # Resources and docs copied from /bin
 /bin-arm64

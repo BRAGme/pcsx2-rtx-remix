@@ -10,6 +10,10 @@
 #include "GS/GSState.h"
 #include "GS/MultiISA.h"
 
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixSubmit.h"
+#endif
+
 class GSRendererHW;
 MULTI_ISA_DEF(class GSRendererHWFunctions;)
 MULTI_ISA_DEF(void GSRendererHWPopulateFunctions(GSRendererHW& renderer);)
@@ -27,6 +31,11 @@ class GSRendererHW : public GSRenderer
 {
 	MULTI_ISA_FRIEND(GSRendererHWFunctions);
 	friend GSHwHack;
+#if defined(_WIN32) && defined(_M_X64)
+	// The RTX Remix tee reads the committed draw's pristine vertex/index/context state from
+	// the top of DrawPrims. Third friend, after GSHwHack and the multi-ISA functions.
+	friend void RemixSubmit::OnDrawPrims(const GSRendererHW& renderer, int rt_unscaled_width, int rt_unscaled_height);
+#endif
 
 public:
 	static constexpr int MAX_FRAMEBUFFER_HEIGHT = 1280;

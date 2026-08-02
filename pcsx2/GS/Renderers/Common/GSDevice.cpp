@@ -7,6 +7,10 @@
 #include "GS/GSUtil.h"
 #include "Host.h"
 
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixSubmit.h"
+#endif
+
 #include "common/Console.h"
 #include "common/BitUtils.h"
 #include "common/FileSystem.h"
@@ -398,6 +402,13 @@ bool GSDevice::AcquireWindow(bool recreate_window)
 		Host::ReportErrorAsync("Error", "Failed to acquire render window. The log may have more information.");
 		return false;
 	}
+
+#if defined(_WIN32) && defined(_M_X64)
+	// The single funnel every backend goes through to get the render window. When the Remix
+	// renderer is selected it takes the real HWND from here and rewrites the surface to
+	// Surfaceless, so only one presenter ever owns the window. Inert otherwise.
+	RemixSubmit::OnAcquireWindow(wi.value());
+#endif
 
 	m_window_info = std::move(wi.value());
 	return true;

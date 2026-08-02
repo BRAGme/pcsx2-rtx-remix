@@ -2757,6 +2757,9 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 		FSUI_NSTR("Direct3D 11 (Legacy)"),
 		FSUI_NSTR("Direct3D 12"),
 #endif
+#if defined(_WIN32) && defined(_M_X64)
+		FSUI_NSTR("RTX Remix"),
+#endif
 #ifdef ENABLE_OPENGL
 		FSUI_NSTR("OpenGL"),
 #endif
@@ -2774,6 +2777,9 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 #ifdef _WIN32
 		"3", //GSRendererType::DX11,
 		"15", //GSRendererType::DX12,
+#endif
+#if defined(_WIN32) && defined(_M_X64)
+		"16", //GSRendererType::Remix,
 #endif
 #ifdef ENABLE_OPENGL
 		"12", //GSRendererType::OGL,
@@ -2931,7 +2937,8 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 	const GSRendererType effective_renderer =
 		(renderer == GSRendererType::Auto) ? GSUtil::GetPreferredRenderer() : renderer;
 	const bool is_hardware = (renderer == GSRendererType::Auto || renderer == GSRendererType::DX11 || renderer == GSRendererType::DX12 ||
-							  renderer == GSRendererType::OGL || renderer == GSRendererType::VK || renderer == GSRendererType::Metal);
+							  renderer == GSRendererType::OGL || renderer == GSRendererType::VK || renderer == GSRendererType::Metal ||
+							  renderer == GSRendererType::Remix);
 	//const bool is_software = (renderer == GSRendererType::SW);
 
 	static std::optional<GSRendererType> s_last_adapter_list_renderer;
@@ -6361,6 +6368,7 @@ TRANSLATE_NOOP("FullscreenUI", "Extra");
 TRANSLATE_NOOP("FullscreenUI", "Automatic (Default)");
 TRANSLATE_NOOP("FullscreenUI", "Direct3D 11 (Legacy)");
 TRANSLATE_NOOP("FullscreenUI", "Direct3D 12");
+TRANSLATE_NOOP("FullscreenUI", "RTX Remix");
 TRANSLATE_NOOP("FullscreenUI", "OpenGL");
 TRANSLATE_NOOP("FullscreenUI", "Vulkan");
 TRANSLATE_NOOP("FullscreenUI", "Metal");

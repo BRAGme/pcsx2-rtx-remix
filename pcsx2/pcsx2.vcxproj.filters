@@ -220,6 +220,9 @@
     <Filter Include="System\Ps2\GS\Shaders\Direct3D">
       <UniqueIdentifier>{eb697f5b-85f5-424a-a7e4-8d8b73d3426e}</UniqueIdentifier>
     </Filter>
+    <Filter Include="System\Ps2\GS\Remix">
+      <UniqueIdentifier>{cd7ee899-792c-4eff-8729-761ae6e716ee}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Tools">
       <UniqueIdentifier>{9153e32b-e1e3-49ac-b490-b56adfd1692f}</UniqueIdentifier>
     </Filter>
@@ -1452,6 +1455,15 @@
     <ClCompile Include="GS\GSDrawingEnvironment.cpp">
       <Filter>System\Ps2\GS\Renderers\Software</Filter>
     </ClCompile>
+    <ClCompile Include="GS\Remix\RemixRuntime.cpp">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClCompile>
+    <ClCompile Include="GS\Remix\RemixSubmit.cpp">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClCompile>
+    <ClCompile Include="GS\Remix\RemixTransforms.cpp">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Patch.h">
@@ -2418,6 +2430,18 @@
     </ClInclude>
     <ClInclude Include="SIO\Pad\PadNegcon.h">
       <Filter>System\Ps2\Iop\SIO\PAD</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Remix\remix_c.h">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Remix\RemixRuntime.h">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Remix\RemixSubmit.h">
+      <Filter>System\Ps2\GS\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Remix\RemixTransforms.h">
+      <Filter>System\Ps2\GS\Remix</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

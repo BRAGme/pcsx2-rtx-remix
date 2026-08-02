@@ -278,6 +278,9 @@ enum class GSRendererType : s8
 	VK = 14,
 	Metal = 17,
 	DX12 = 15,
+	// Values are persisted as raw integers (Pcsx2Config.cpp, SettingsWrapIntEnumEx), so new
+	// entries are appended into free slots and never shift an existing one. 16 was free.
+	Remix = 16,
 };
 
 enum class GSVSyncMode : u8

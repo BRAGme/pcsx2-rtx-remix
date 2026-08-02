@@ -42,6 +42,10 @@
 
 #endif
 
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixSubmit.h"
+#endif
+
 #include "common/Console.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
@@ -93,6 +97,14 @@ static RenderAPI GetAPIForRenderer(GSRendererType renderer)
 			return RenderAPI::D3D12;
 #endif
 
+#if defined(_WIN32) && defined(_M_X64)
+		// The Remix backend is a tee, not a device: a real D3D11 device still services every
+		// GS-memory semantic. It is created surfaceless (see GSDevice::AcquireWindow) because
+		// the Remix runtime owns the window.
+		case GSRendererType::Remix:
+			return RenderAPI::D3D11;
+#endif
+
 #ifdef __APPLE__
 		case GSRendererType::Metal:
 			return RenderAPI::Metal;
@@ -107,6 +119,12 @@ static RenderAPI GetAPIForRenderer(GSRendererType renderer)
 static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool recreate_window,
 	GSVSyncMode vsync_mode, bool allow_present_throttle)
 {
+#if defined(_WIN32) && defined(_M_X64)
+	// Must be set before Create(), which is what calls AcquireWindow(). GSCurrentRenderer is
+	// not usable here: it is only assigned later, in OpenGSRenderer().
+	RemixSubmit::SetRendererIsRemix(renderer == GSRendererType::Remix);
+#endif
+
 	const RenderAPI new_api = GetAPIForRenderer(renderer);
 	switch (new_api)
 	{
@@ -372,6 +390,12 @@ void GSclose()
 {
 	if (GSCapture::IsCapturing())
 		GSCapture::EndCapture();
+
+#if defined(_WIN32) && defined(_M_X64)
+	// Releases the Remix meshes/lights before the window goes away. The runtime itself is a
+	// process-lifetime singleton -- a second Startup after Shutdown is unproven in dxvk-remix.
+	RemixSubmit::OnGSClose();
+#endif
 
 	CloseGSRenderer();
 	CloseGSDevice(true);

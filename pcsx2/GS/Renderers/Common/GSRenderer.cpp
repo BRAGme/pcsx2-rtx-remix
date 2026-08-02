@@ -21,6 +21,10 @@
 #include "common/StringUtil.h"
 #include "common/Timer.h"
 
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixSubmit.h"
+#endif
+
 #include "fmt/format.h"
 #include "IconsFontAwesome.h"
 
@@ -634,6 +638,12 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 	m_last_draw_n = s_n;
 	m_last_transfer_n = s_transfer_n;
+
+#if defined(_WIN32) && defined(_M_X64)
+	// Remix's own frame boundary: camera, present, latch, reap, stats. Inert unless the Remix
+	// renderer is selected. Runs before the device present block so the two never interleave.
+	RemixSubmit::OnVSync();
+#endif
 
 	// Skip presentation when running uncapped while vsync is on.
 	if (skip_frame || g_gs_device->ShouldSkipPresentingFrame())

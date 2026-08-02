@@ -659,6 +659,9 @@ void MainWindow::createRendererSwitchMenu()
 #if defined(_WIN32)
 		GSRendererType::DX11,
 		GSRendererType::DX12,
+#if defined(_M_X64)
+		GSRendererType::Remix,
+#endif
 #elif defined(__APPLE__)
 		GSRendererType::Metal,
 #endif

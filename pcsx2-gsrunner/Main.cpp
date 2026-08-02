@@ -670,6 +670,10 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				else if (StringUtil::Strcasecmp(rname, "dx12") == 0)
 					type = GSRendererType::DX12;
 #endif
+#if defined(_WIN32) && defined(_M_X64)
+				else if (StringUtil::Strcasecmp(rname, "remix") == 0)
+					type = GSRendererType::Remix;
+#endif
 #ifdef ENABLE_OPENGL
 				else if (StringUtil::Strcasecmp(rname, "gl") == 0)
 					type = GSRendererType::OGL;

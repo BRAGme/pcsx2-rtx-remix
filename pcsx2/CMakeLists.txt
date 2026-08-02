@@ -704,6 +704,23 @@ if(WIN32)
 		GS/Renderers/DX12/GSDevice12.h
 		GS/Renderers/DX12/GSTexture12.h
 	)
+
+	# RTX Remix API backend. Windows x86-64 only -- there is no Remix runtime for
+	# Windows-on-ARM, so this block is excluded on ARM64 the same way the vcxproj
+	# excludes it from that platform.
+	if(NOT ARCH_ARM64)
+		list(APPEND pcsx2GSSources
+			GS/Remix/RemixRuntime.cpp
+			GS/Remix/RemixSubmit.cpp
+			GS/Remix/RemixTransforms.cpp
+		)
+		list(APPEND pcsx2GSHeaders
+			GS/Remix/remix_c.h
+			GS/Remix/RemixRuntime.h
+			GS/Remix/RemixSubmit.h
+			GS/Remix/RemixTransforms.h
+		)
+	endif()
 elseif(LINUX)
 	list(APPEND pcsx2USBSources
 		USB/usb-eyetoy/cam-linux.cpp

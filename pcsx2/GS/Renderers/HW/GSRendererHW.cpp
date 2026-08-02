@@ -9272,6 +9272,16 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 		area_out.x, area_out.y, area_out.z, area_out.w);
 #endif
 
+#if defined(_WIN32) && defined(_M_X64)
+	// The RTX Remix tee. This is the one point where the draw is committed AND m_vertex->buff
+	// still carries unmutilated Q: EmulateChannelShuffle (below), MergeSprite,
+	// EmulateTextureShuffleAndFbmask, HandleFlatShadedVertices and SetupIA all rewrite the
+	// vertex buffer in place, and Lines2Sprites / the accurate_stq triangle path inside
+	// SetupIA set Q to 1.0 outright. Inert unless the Remix renderer is selected.
+	if (RemixSubmit::Armed())
+		RemixSubmit::OnDrawPrims(*this, rt ? rt->GetUnscaledWidth() : 0, rt ? rt->GetUnscaledHeight() : 0);
+#endif
+
 	const GSDrawingEnvironment& env = *m_draw_env;
 
 	DATEOptions date_options;
