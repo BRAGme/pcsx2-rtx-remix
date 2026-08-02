@@ -110,6 +110,7 @@ namespace RemixSubmit
 			u64 meshes_created_frame = 0;
 			u64 meshes_created_peak = 0;
 			u64 sky_tagged = 0; // instances categorised REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
+			u64 cutout_tagged = 0; // instances categorised ALPHA_BLEND_TO_CUTOUT
 			u64 cam_world = 0;
 			u64 cam_fallback = 0;
 			// World-anchor (step 9) accounting. Every one of these has to be readable in a
@@ -1115,18 +1116,84 @@ namespace RemixSubmit
 
 		// Lazy first-frame init. Runs on the GS thread, which is where every later submit and
 		// the Present also run.
+		// Consecutive frames the render window's client rect must be unchanged before Remix is
+		// allowed to bind it.
+		//
+		// MEASURED AND DEFAULTED OFF. The theory below is plausible and was the best remaining
+		// lead, but a 10-launch-per-arm A/B on the worst-case state (SOCOM slot 2) came back
+		// 1/10 survived at delay 0 versus 2/10 at delay 60 -- indistinguishable from noise. The
+		// knob is kept because it is the only way to re-test the idea cheaply, but do NOT treat
+		// it as a fix and do not re-run a three-launch version of this experiment.
+		//
+		// We force the device Surfaceless and hand Remix the raw HWND. If Qt has not finished
+		// realising and sizing that window when Startup() runs, the swapchain dxvk-remix builds
+		// against it is poisoned from birth: two observed deaths printed
+		// "[D3D9WindowProc] Swapchain handle is invalid" before exiting, and *every* device-loss
+		// exit lands within a fraction of a second of "renderer is live", never later. Sessions
+		// that clear that window run for minutes.
+		u32 startup_stable_frames()
+		{
+			static const u32 value =
+				static_cast<u32>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_STARTUPDELAY", 0)));
+			return value;
+		}
+
+		RECT s_last_startup_rect{};
+		u32 s_stable_frames = 0;
+
+		// True once the window has held one size for startup_stable_frames() consecutive calls.
+		bool window_settled()
+		{
+			const u32 required = startup_stable_frames();
+			if (required == 0)
+				return true;
+
+			RECT rc{};
+			if (!s_hwnd || !GetClientRect(s_hwnd, &rc) || (rc.right - rc.left) <= 0 || (rc.bottom - rc.top) <= 0)
+			{
+				s_stable_frames = 0;
+				return false;
+			}
+
+			// A window Qt has not shown yet is not a window Remix should bind.
+			if (!IsWindowVisible(s_hwnd))
+			{
+				s_stable_frames = 0;
+				return false;
+			}
+
+			if (rc.left != s_last_startup_rect.left || rc.top != s_last_startup_rect.top ||
+				rc.right != s_last_startup_rect.right || rc.bottom != s_last_startup_rect.bottom)
+			{
+				s_last_startup_rect = rc;
+				s_stable_frames = 0;
+				return false;
+			}
+
+			return (++s_stable_frames) >= required;
+		}
+
 		void ensure_initialized()
 		{
 			if (s_init_attempted)
 				return;
 
-			s_init_attempted = true;
-
 			if (!s_hwnd)
 			{
+				s_init_attempted = true;
 				ERROR_LOG("Remix: no game window was stashed, rendering is disabled");
 				return;
 			}
+
+			// Deliberately before s_init_attempted is set: this is a "not yet", not a failure.
+			if (!window_settled())
+				return;
+
+			s_init_attempted = true;
+
+			INFO_LOG("Remix: window settled at {}x{} after {} stable frames",
+				s_last_startup_rect.right - s_last_startup_rect.left,
+				s_last_startup_rect.bottom - s_last_startup_rect.top, s_stable_frames);
 
 			// The close path clears s_init_attempted so a reopen rebuilds the scene, but
 			// runtime::initialize() short-circuits once started -- it would still be bound to the
@@ -1235,6 +1302,23 @@ namespace RemixSubmit
 		// surface was being blended against whatever the runtime found in place of a struct we
 		// never provided. 0 and 1 exist to A/B that; 2 is the destination, because PS2 blending
 		// genuinely matters for glass, decals and effects.
+		// See the use site: separates the texture-stage fields of InstanceInfoBlendEXT from its
+		// blend fields, so colour can be chased without giving up the alpha-state fix.
+		// Auto-classification of alpha-tested draws as cut-outs. 0 disables it.
+		int cutout_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_CUTOUT", 1), 0, 1));
+			return value;
+		}
+
+		int texture_stage_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_TEXSTAGE", 1), 0, 1));
+			return value;
+		}
+
 		int alpha_state_mode()
 		{
 			static const int value =
@@ -1455,7 +1539,7 @@ namespace RemixSubmit
 					 "skip: tri {} untex {} fst {} constq {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
-					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} | mesh/frame peak {}",
+					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | mesh/frame peak {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -1465,7 +1549,7 @@ namespace RemixSubmit
 				s_stats.skip_minw,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
-				s_stats.sky_tagged, s_stats.meshes_created_peak);
+				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.meshes_created_peak);
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -2035,22 +2119,53 @@ namespace RemixSubmit
 		blend.alphaBlendOp = 1;
 		// TFX: MODULATE 0, DECAL 1, HIGHLIGHT 2, HIGHLIGHT2 3. Only the first two are
 		// expressible as a fixed-function stage; the highlight modes degrade to modulate.
-		const bool decal = (r.m_cached_ctx.TEX0.TFX == 1);
-		blend.textureColorArg1Source = 2; // D3DTA_TEXTURE
-		blend.textureColorArg2Source = 0; // D3DTA_DIFFUSE
-		blend.textureColorOperation = decal ? 2u : 4u; // SELECTARG1 : MODULATE
-		blend.textureAlphaArg1Source = 2;
-		blend.textureAlphaArg2Source = 0;
-		blend.textureAlphaOperation = decal ? 2u : 4u;
+		//
+		// PCSX2_REMIX_TEXSTAGE gates this separately from the blend fields so colour can be
+		// chased without giving up the alpha-state fix. 0 leaves the fields zeroed for the
+		// runtime's own default, 1 derives them from TFX.
+		//
+		// MEASURED on Rainbow Six 3 (-state 9), identical scene, PrintWindow capture, pixels
+		// with max channel > 12 counted as lit:
+		//   TEXSTAGE=1 (derived): lit 2,468,536  mean sat 0.0918  coloured 12.79% of lit
+		//   TEXSTAGE=0 (zeroed):  lit 1,110,107  mean sat 0.0545  coloured  3.72% of lit
+		// Sending the derived stage gives 3.4x the coloured pixels and 2.2x the lit area, so
+		// these fields are NOT the "colour is missing" regression -- they are carrying the
+		// texture's contribution and zeroing them is what removes it. Default 1.
+		if (texture_stage_mode() != 0)
+		{
+			const bool decal = (r.m_cached_ctx.TEX0.TFX == 1);
+			blend.textureColorArg1Source = 2; // D3DTA_TEXTURE
+			blend.textureColorArg2Source = 0; // D3DTA_DIFFUSE
+			blend.textureColorOperation = decal ? 2u : 4u; // SELECTARG1 : MODULATE
+			blend.textureAlphaArg1Source = 2;
+			blend.textureAlphaArg2Source = 0;
+			blend.textureAlphaOperation = decal ? 2u : 4u;
+		}
 		blend.tFactor = 0xFFFFFFFFu;
 		blend.isTextureFactorBlend = 0;
 		blend.writeMask = 0xF; // D3DCOLORWRITEENABLE_ALL
 		blend.isVertexColorBakedLighting = 0;
 
+		// Alpha-tested draws are cut-outs -- foliage, decals, muzzle flashes -- and submitting
+		// them as ordinary blended geometry makes the whole quad participate in lighting rather
+		// than just the kept texels, so the billboard's triangle silhouette shows and the
+		// denoiser flickers on it. ALPHA_BLEND_TO_CUTOUT is the runtime's purpose-built path
+		// for exactly this (dxvk-remix rtx_instance_manager.cpp:597,
+		// forceAlphaTest = categories.test(InstanceCategories::AlphaBlendToCutout)).
+		//
+		// Keyed on ATE because that is the guest saying "this is a cut-out" itself. Rainbow Six
+		// 3's dump has ATE=0 on every draw, so this is inert there and carries no regression
+		// risk for it; it is aimed at SOCOM's foliage and is NOT yet verified against a SOCOM
+		// draw dump -- the counter is how that gets checked.
+		const bool is_cutout =
+			(cutout_mode() != 0) && r.m_cached_ctx.TEST.ATE && (r.m_cached_ctx.TEST.ATST != 1); // not ALWAYS
+
 		remixapi_InstanceInfo instance{};
 		instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
 		instance.pNext = (alpha_state_mode() == 2) ? &blend : nullptr;
-		instance.categoryFlags = tagged | (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u);
+		instance.categoryFlags = tagged |
+		                         (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u) |
+		                         (is_cutout ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT) : 0u);
 		instance.mesh = it->second.handle;
 		// Identity: the positions are already in the submitted camera's space. Per-draw world
 		// transforms are phase 2.
@@ -2067,6 +2182,9 @@ namespace RemixSubmit
 
 		if (is_sky)
 			++s_stats.sky_tagged;
+
+		if (is_cutout)
+			++s_stats.cutout_tagged;
 
 		if (s_drawdump_frames_left > 0)
 		{
@@ -2273,6 +2391,8 @@ namespace RemixSubmit
 		s_sun_placed = false;
 		s_drawdump_started = false;
 		s_drawdump_frames_left = 0;
+		s_stable_frames = 0;
+		s_last_startup_rect = RECT{};
 
 		if (!s_remix.ok())
 			return;

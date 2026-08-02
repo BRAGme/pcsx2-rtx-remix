@@ -251,6 +251,11 @@ namespace remix_ps2::materials
 			{"rtx.ignoreAlphaOnTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL},
 			{"rtx.ignoreTransparencyLayerTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER},
 			{"rtx.particleEmitterTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER},
+			// Not a dxvk-remix option name -- setupCategoriesForTexture has no entry for
+			// AlphaBlendToCutout, so the developer menu cannot write it and there is nothing to
+			// stay compatible with. Ours, so the user still has a by-hash lever for foliage and
+			// decals that the ATE auto-classifier misses.
+			{"rtx.pcsx2AlphaCutoutTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT},
 		};
 
 		std::unordered_map<u64, remixapi_InstanceCategoryFlags> s_categories;
