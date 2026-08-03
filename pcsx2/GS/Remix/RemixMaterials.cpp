@@ -7,6 +7,7 @@
 #include "GS/Renderers/Common/GSRenderer.h"
 
 #include "Config.h"
+#include "VMManager.h"
 
 #include "common/Console.h"
 #include "common/FileSystem.h"
@@ -330,6 +331,45 @@ namespace remix_ps2::materials
 			return value;
 		}
 
+		// The per-game Remix conf layers, most specific last.
+		//
+		// PCSX2 is one executable for hundreds of games, and Remix keys its user settings by exe
+		// identity -- so without this every PS2 title shares one pot, and SOCOM's texture tags,
+		// sky categorisation and light calibration land on top of Rainbow Six 3's.
+		//
+		// The naming mirrors PCSX2's own per-game settings (VMManager::GetGameSettingsPath,
+		// VMManager.cpp:812) rather than inventing a scheme: a user who knows where
+		// gamesettings\SCUS-97545_D7CFDCCF.ini lives can guess SCUS-97545_D7CFDCCF.conf. The
+		// serial-only name is accepted too and is the one to reach for by hand, since it
+		// survives a different disc revision of the same game.
+		//
+		// GetDiscSerial/GetDiscCRC take s_info_mutex (VMManager.cpp:333, :358), so calling them
+		// from the GS thread is safe.
+		std::vector<std::string> game_conf_paths()
+		{
+			std::vector<std::string> paths;
+
+			const std::string serial = VMManager::GetDiscSerial();
+			const u32 crc = VMManager::GetDiscCRC();
+			if (serial.empty() && crc == 0)
+				return paths;
+
+			const std::string dir(Path::GetDirectory(FileSystem::GetProgramPath()));
+			const std::string sanitized(Path::SanitizeFileName(serial));
+
+			if (!sanitized.empty())
+				paths.push_back(Path::Combine(dir, fmt::format("{}.conf", sanitized)));
+
+			if (crc != 0)
+			{
+				paths.push_back(Path::Combine(dir, sanitized.empty() ?
+					fmt::format("{:08X}.conf", crc) :
+					fmt::format("{}_{:08X}.conf", sanitized, crc)));
+			}
+
+			return paths;
+		}
+
 		std::vector<std::string> conf_paths()
 		{
 			std::vector<std::string> paths;
@@ -359,6 +399,12 @@ namespace remix_ps2::materials
 					start = end + 1;
 				}
 			}
+
+			// Per-game last, so a title's own tags outrank the shared layers. This is also what
+			// makes the digit-group-comma parser (see parse_hash_list) apply to per-game hash
+			// lists for free -- they go through exactly the same reader.
+			for (std::string& one : game_conf_paths())
+				paths.push_back(std::move(one));
 
 			return paths;
 		}
@@ -848,9 +894,214 @@ namespace remix_ps2::materials
 		}
 	} // namespace
 
+	// Set by invalidate_game_config() so the next refresh re-applies immediately instead of
+	// waiting out the poll interval. GS thread only, like everything else in this file.
+	bool s_game_config_dirty = true;
+
 	void begin_frame()
 	{
 		s_budget_left = texture_budget();
+	}
+
+	void invalidate_game_config()
+	{
+		s_game_config_dirty = true;
+	}
+
+	void refresh_game_config(const runtime& rt)
+	{
+		// Same cadence and the same identity-plus-mtime signature as refresh_categories, so a
+		// user can tune a per-game conf while the game runs, and so a game change re-applies.
+		static Common::Timer::Value last_check = 0;
+		static u64 last_signature = 0;
+		static bool first = true;
+		static std::string configured_game;
+
+		const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+
+		// A save-state load can switch to a different game, and the once-a-second poll would
+		// leave up to a second of frames running the previous title's settings. The hook makes
+		// it immediate.
+		if (s_game_config_dirty)
+		{
+			s_game_config_dirty = false;
+			first = true;
+		}
+
+		if (!first && Common::Timer::ConvertValueToMilliseconds(now - last_check) < 1000.0)
+			return;
+
+		last_check = now;
+
+		const std::vector<std::string> paths = game_conf_paths();
+
+		u64 signature = fnv_seed;
+		for (const std::string& path : paths)
+		{
+			// The identity itself is part of the signature: two games can both have no conf
+			// file, and switching between them must still be seen as a change.
+			for (const char c : path)
+				signature = fnv_mix(signature, static_cast<u64>(static_cast<unsigned char>(c)));
+
+			FILESYSTEM_STAT_DATA sd{};
+			if (FileSystem::StatFile(path.c_str(), &sd))
+			{
+				signature = fnv_mix(signature, static_cast<u64>(sd.ModificationTime));
+				signature = fnv_mix(signature, static_cast<u64>(sd.Size));
+			}
+			else
+			{
+				signature = fnv_mix(signature, 0);
+			}
+		}
+
+		if (!first && signature == last_signature)
+			return;
+
+		first = false;
+		last_signature = signature;
+
+		if (paths.empty())
+			return;
+
+		// Remix has no "unset" through the API, and the values we push land in its user layer,
+		// which outranks every file layer. So a second game configured in the same process
+		// inherits whatever the first one set and cannot clear it. PCSX2 tears the VM down on a
+		// game change but the Remix runtime is a process-lifetime singleton, so this is real.
+		const std::string game = paths.back();
+		if (!configured_game.empty() && configured_game != game)
+		{
+			WARNING_LOG("Remix: per-game config changing from '{}' to '{}' in one process -- keys "
+						"the previous game set cannot be unset through the API and will persist. "
+						"Restart the emulator for a clean per-game config.",
+				Path::GetFileName(configured_game), Path::GetFileName(game));
+		}
+		configured_game = game;
+
+		u32 found = 0;
+		u32 applied = 0;
+		u32 failed = 0;
+		u32 env_applied = 0;
+		u32 env_skipped = 0;
+
+		for (const std::string& path : paths)
+		{
+			std::FILE* file = FileSystem::OpenCFile(path.c_str(), "r");
+			if (!file)
+				continue;
+
+			++found;
+			INFO_LOG("Remix: per-game config '{}'", path);
+
+			char line[8192];
+			while (std::fgets(line, sizeof(line), file))
+			{
+				std::string text(line);
+
+				if (const size_t hash_pos = text.find('#'); hash_pos != std::string::npos)
+					text.erase(hash_pos);
+
+				const size_t eq = text.find('=');
+				if (eq == std::string::npos)
+					continue;
+
+				const auto trim = [](std::string s) {
+					const size_t f = s.find_first_not_of(" \t\r\n");
+					const size_t l = s.find_last_not_of(" \t\r\n");
+					return (f == std::string::npos) ? std::string() : s.substr(f, l - f + 1);
+				};
+
+				const std::string key = trim(text.substr(0, eq));
+				const std::string value = trim(text.substr(eq + 1));
+				if (key.empty())
+					continue;
+
+				// Our own knobs, spelled exactly as the environment variables they already are,
+				// because that is the spelling every note and toggle table in this project uses.
+				// This is where per-title light intensity, far plane and emissive settings
+				// belong -- it retires "constants calibrated for Rainbow Six 3 are meaningless
+				// on SOCOM" properly instead of by deriving them.
+				if (key.rfind("PCSX2_REMIX_", 0) == 0)
+				{
+					// A real environment variable always wins. Every A/B arm this project runs
+					// sets these from the harness, and a per-game conf silently overriding one
+					// mid-arm would invalidate the measurement without saying so.
+					//
+					// But "the environment" must mean the *user's* environment, not one we wrote
+					// ourselves a moment ago. These toggles are applied by setting the process
+					// environment, so without s_env_owned an earlier conf layer would set a key
+					// and the more specific layer would then skip it as "already set" -- which
+					// silently inverts the layer precedence. Measured, not reasoned about: with
+					// SCUS-97545.conf at MAXW=100 and SCUS-97545_D7CFDCCF.conf at 300, the
+					// counter block read "maxw gate 100".
+					static std::unordered_set<std::string> s_env_owned;
+
+					const std::wstring wkey(key.begin(), key.end());
+					if (!read_env(wkey.c_str()).empty() && s_env_owned.find(key) == s_env_owned.end())
+					{
+						++env_skipped;
+						INFO_LOG("Remix:   {} = {} SKIPPED (already set in the environment)", key, value);
+						continue;
+					}
+
+					s_env_owned.insert(key);
+
+					const std::wstring wvalue(value.begin(), value.end());
+					if (::SetEnvironmentVariableW(wkey.c_str(), wvalue.c_str()))
+					{
+						++env_applied;
+						INFO_LOG("Remix:   {} = {} (PCSX2 toggle)", key, value);
+					}
+					else
+					{
+						++failed;
+						WARNING_LOG("Remix:   {} = {} FAILED to set", key, value);
+					}
+
+					continue;
+				}
+
+				// Category and emissive hash lists are deliberately NOT pushed here: they are
+				// ours, not the runtime's, and conf_paths() already feeds these same files to
+				// load_categories(), which has the digit-group-comma parser. Pushing them would
+				// double-apply and, worse, hand the runtime a key it does not know.
+				if (key == "rtx.pcsx2EmissiveTextures" || key == "pcsx2.emissiveTextures")
+					continue;
+
+				const u32 code = guarded_set_config_variable(
+					rt.api().SetConfigVariable, key.c_str(), value.c_str());
+
+				if (code == REMIXAPI_ERROR_CODE_SUCCESS)
+				{
+					++applied;
+					INFO_LOG("Remix:   {} = {}", key, value);
+				}
+				else
+				{
+					++failed;
+					WARNING_LOG("Remix:   {} = {} FAILED ({})", key, value, error_name(code));
+				}
+			}
+
+			std::fclose(file);
+		}
+
+		if (found == 0)
+		{
+			// Named explicitly, because "no per-game config" and "per-game config with a typo in
+			// the filename" look identical otherwise, and that class of silence has cost this
+			// project two rounds already.
+			INFO_LOG("Remix: no per-game config found. Create one of these to add per-title "
+					 "settings, tags and toggles:");
+			for (const std::string& path : paths)
+				INFO_LOG("Remix:   {}", path);
+
+			return;
+		}
+
+		INFO_LOG("Remix: per-game config applied -- {} runtime keys, {} PCSX2 toggles, "
+				 "{} skipped (environment wins), {} failed",
+			applied, env_applied, env_skipped, failed);
 	}
 
 	void refresh_categories()

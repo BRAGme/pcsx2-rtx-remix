@@ -68,6 +68,28 @@ namespace remix_ps2
 		// most once a second); call once per frame.
 		void refresh_categories();
 
+		// Per-game Remix configuration. Call once per frame beside refresh_categories.
+		//
+		// PCSX2 is one executable for hundreds of games and Remix keys its user settings by exe
+		// identity, so every PS2 title otherwise shares one config. This reads
+		// "<exe dir>\<SERIAL>.conf" then "<SERIAL>_<CRC>.conf" -- mirroring PCSX2's own
+		// gamesettings\<SERIAL>_<CRC>.ini naming -- and pushes each entry through
+		// remixapi_SetConfigVariable, which writes Remix's *user* layer and therefore outranks
+		// rtx.conf and any Logic-graph layer. Keys spelled PCSX2_REMIX_* set our own toggles
+		// instead, and an existing environment variable always beats the file so an A/B harness
+		// cannot be silently overridden.
+		//
+		// Texture category and emissive hash lists in the same files are handled by
+		// refresh_categories, which already reads them (conf_paths appends the per-game layers)
+		// with the digit-group-comma parser they need.
+		void refresh_game_config(const runtime& rt);
+
+		// Forces the next refresh_game_config to re-apply instead of waiting out its poll
+		// interval. Call when the running game may have changed under us -- a save-state load
+		// can switch title, and up to a second of frames would otherwise run the previous
+		// game's settings.
+		void invalidate_game_config();
+
 		// Bumped every time the tag lists change on disk. The caller MUST fold this into its
 		// mesh hash: Remix binds the material into the mesh at CreateMesh time, so a mesh built
 		// before a tag changed would keep the pre-tag material for as long as it stays cached.

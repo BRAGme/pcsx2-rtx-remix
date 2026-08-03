@@ -3882,6 +3882,10 @@ namespace RemixSubmit
 		// Picks up tags the user saved from the developer menu without an emulator restart.
 		remix_ps2::materials::refresh_categories();
 
+		// Per-game settings. Ordered after refresh_categories only for log readability -- both
+		// poll independently, and this one also re-applies when the running game changes.
+		remix_ps2::materials::refresh_game_config(s_remix);
+
 		log_stats(false);
 	}
 
@@ -3893,6 +3897,10 @@ namespace RemixSubmit
 		// The VU1 candidates first, so nothing can latch a pre-load matrix in between.
 		RemixVU1Capture::DropPublished();
 		RemixVU1Capture::SetPinnedOffset(0xFFFFFFFFu);
+
+		// A state load can switch title, and the per-game config poll would otherwise leave up
+		// to a second of frames running the previous game's settings.
+		remix_ps2::materials::invalidate_game_config();
 
 		// Back to the fallback camera until the back-slice republishes. Holding the old one
 		// for even the three frames s_camera_hold_frames allows would submit the new scene
