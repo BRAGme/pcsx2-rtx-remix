@@ -1022,12 +1022,18 @@ namespace RemixSubmit
 				place_debug_light(origin_light, 2.f);
 			}
 
-			// Any light at all is enough to say the scene was built. Checking specifically for
-			// s_debug_light was correct only while the camera-attached sphere was the sole
-			// lighting model -- under the fill it is never created, so this failed the whole
-			// scene setup and degraded the renderer to a no-op with the lights sitting there
-			// working.
-			if (!s_debug_light && !s_dome_light && !s_sun_light && !no_debug_scene())
+			// A missing light is only a failure when a light was asked for. LIGHTMODE=0 asks for
+			// exactly none, and an unlit scene is a legitimate scene -- the path tracer still
+			// traces primary and indirect rays through it.
+			//
+			// This is the second time this check has been wrong in the same way. It first tested
+			// s_debug_light specifically, which broke when the fill replaced the sphere; widening
+			// it to "any light" left LIGHTMODE=0 failing, which degraded the whole renderer to a
+			// no-op. That mattered far more than it looks: a no-op renderer submits nothing, and
+			// an arm that submits nothing survives 20/20 for reasons that have nothing to do with
+			// what it was testing. See the "arms that survive by not rendering" note in notes.md.
+			const bool lights_requested = !no_debug_scene() && light_mode() != 0;
+			if (lights_requested && !s_debug_light && !s_dome_light && !s_sun_light)
 				return false;
 
 			// Debug triangle at z = 10, in front of the hardcoded camera at the origin. This is
