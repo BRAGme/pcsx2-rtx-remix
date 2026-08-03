@@ -2763,6 +2763,44 @@ namespace RemixSubmit
 			std::fflush(file);
 		}
 
+		// --- masked multi-pass dump ---------------------------------------------------------
+		//
+		// Separate from drawdump_write, which only ever sees draws that PASSED the gates. The
+		// masked passes are rejected, so nothing has ever been able to look at them, and they are
+		// where Rainbow Six 3's lightmap lives -- 23,592 of 100,469 draws in a measured frame set.
+		u64 fbmsk_dump_limit()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_FBMSKDUMP", 0)));
+			return value;
+		}
+
+		u64 s_fbmsk_dumped = 0;
+
+		void fbmsk_dump_write(const std::string& line)
+		{
+			static std::FILE* file = nullptr;
+			static bool tried = false;
+
+			if (!file && !tried)
+			{
+				tried = true;
+				const std::string path = Path::Combine(EmuFolders::Logs, "remix_fbmsk.txt");
+				file = FileSystem::OpenCFile(path.c_str(), "w");
+				if (!file)
+					return;
+
+				INFO_LOG("Remix: dumping masked multi-pass draws to {}", path);
+			}
+
+			if (!file)
+				return;
+
+			std::fputs(line.c_str(), file);
+			std::fputc('\n', file);
+			std::fflush(file);
+		}
+
 		// The GS register state a draw's instance-side properties are derived from, passed by value:
 		// GSRendererHW's members are private and RemixSubmit::OnDrawPrims is its only declared friend
 		// (GSRendererHW.h:37), so a namespace-scope helper cannot read them itself.
@@ -3374,6 +3412,48 @@ namespace RemixSubmit
 		if ((r.m_cached_ctx.FRAME.FBMSK & 0x00FFFFFFu) != 0)
 		{
 			++s_stats.skip_fbmsk;
+
+			// PCSX2_REMIX_FBMSKDUMP=N: dump the first N masked draws to logs\remix_fbmsk.txt.
+			//
+			// These never reach materials::bind(), so the lightmap they carry is never created as a
+			// Remix material and cannot even be tagged emissive in the developer menu. Identifying
+			// the texture is therefore the prerequisite for folding it in, and TEX0's page fields
+			// are enough for that -- the measured pattern is one texture page across all of them.
+			if (s_fbmsk_dumped < fbmsk_dump_limit())
+			{
+				++s_fbmsk_dumped;
+
+				const GIFRegTEX0& t0 = r.m_cached_ctx.TEX0;
+				const GIFRegALPHA& al = r.m_context->ALPHA;
+
+				// CLUT and ALPHA are the fields that decide the whole design. All three passes bind
+				// the SAME texture page, and three identical samples masked to different channels
+				// would only ever write greyscale -- so something must differ per pass. The PS2
+				// blend equation is (A-B)*C+D where C is an ALPHA source, so it cannot multiply by
+				// per-channel colour in one pass; the way to modulate RGB by a colour texture is to
+				// move one channel into alpha via the CLUT and mask the other two off, three times.
+				// If CBP/CSA vary across the triple, that is confirmed and the three passes
+				// reconstruct a full-colour lightmap.
+				fbmsk_dump_write(fmt::format(
+					"f={} mask=0x{:08x} verts={} tris={} | tex tbp0=0x{:x} tbw={} psm=0x{:02x} "
+					"tw={} th={} tcc={} tfx={} | clut cbp=0x{:x} cpsm=0x{:02x} csm={} csa={} cld={} | "
+					"alpha A={} B={} C={} D={} FIX={} | ate={} abe={} depth(r={} w={}) | "
+					"px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{}",
+					s_frame_counter, static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK),
+					r.m_vertex->next, r.m_index->tail / 3,
+					static_cast<u32>(t0.TBP0), static_cast<u32>(t0.TBW), static_cast<u32>(t0.PSM),
+					static_cast<u32>(t0.TW), static_cast<u32>(t0.TH), static_cast<u32>(t0.TCC),
+					static_cast<u32>(t0.TFX),
+					static_cast<u32>(t0.CBP), static_cast<u32>(t0.CPSM), static_cast<u32>(t0.CSM),
+					static_cast<u32>(t0.CSA), static_cast<u32>(t0.CLD),
+					static_cast<u32>(al.A), static_cast<u32>(al.B), static_cast<u32>(al.C),
+					static_cast<u32>(al.D), static_cast<u32>(al.FIX),
+					static_cast<u32>(r.m_cached_ctx.TEST.ATE), static_cast<u32>(r.PRIM->ABE),
+					r.m_cached_ctx.DepthRead() ? 1 : 0, r.m_cached_ctx.DepthWrite() ? 1 : 0,
+					r.m_vt.m_min.p.x, r.m_vt.m_max.p.x, r.m_vt.m_min.p.y, r.m_vt.m_max.p.y,
+					rt_unscaled_width, rt_unscaled_height));
+			}
+
 			return;
 		}
 
