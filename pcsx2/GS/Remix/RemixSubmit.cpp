@@ -88,6 +88,8 @@ namespace RemixSubmit
 			u64 skip_not_triangle = 0; // sprite / line / point class -- never 3D world geometry
 			u64 skip_untextured = 0; // !m_process_texture: nothing pins Q to anything
 			u64 skip_fst = 0; // PRIM->FST: UVs, so Q is not the perspective divisor
+			u64 fst_recovered = 0; // FST=1 draws submitted with depth recovered from Z
+			u64 fst_flat = 0; // FST=1 draws rejected for constant Z (no depth to recover)
 			u64 skip_const_q = 0; // m_vt.m_eq.q: one Q for the whole draw => 2D/HUD
 			u64 warn_inaccurate_stq = 0; // m_vt.m_accurate_stq: Q precision already suspect
 			u64 skip_no_target = 0; // no colour target, so no viewport to un-project against
@@ -544,6 +546,183 @@ namespace RemixSubmit
 		float s_extent_ratio_peak = 0.f;
 		double s_extent_ratio_total = 0.0;
 		u64 s_extent_ratio_frames = 0;
+
+		// --- Z -> w calibration, for FST=1 recovery -----------------------------------------
+		//
+		// PRIM->FST=1 means the guest supplied direct UV texels instead of ST/Q, so Q is not the
+		// perspective divisor and w = 1/Q does not exist. Those draws are gated off, and on
+		// SOCOM that is 37-42% of everything (Rainbow Six 3: ~2%, which is why it never mattered
+		// until a second title arrived).
+		//
+		// Every vertex still carries Z. The question is whether Z maps to depth by a rule we can
+		// *learn* rather than assume -- and the draws where TME=1 && FST=0 give it away for
+		// free, because they carry Z and the true w on the same vertices. That is a calibration
+		// set costing nothing.
+		//
+		// Two models are fitted, because Rainbow Six 3 is the documented cautionary case: its
+		// VU1 emits z = w + const (col2 == col3, m[3][2] = 2715.9), so Z is linear in w, whereas
+		// a textbook perspective depth buffer is linear in 1/w. Assuming either one globally is
+		// exactly the mistake that produced a 1.1e7-deep frustum in phase 2.
+		//
+		//   model A:  Q = a*zn + b   ->  w = 1 / (a*zn + b)     (perspective depth)
+		//   model B:  w = a*zn + b   ->  w = a*zn + b           (R6 3's fused w + const)
+		//
+		// zn is Z normalised by the ZBUF format's maximum, which differs for 32/24/16-bit Z
+		// (GSRendererHW.cpp:2181). R^2 for both is reported so a title whose Z is unusable says
+		// so in the counters instead of rendering garbage.
+		struct z_fit
+		{
+			double n = 0.0, sx = 0.0, sxx = 0.0;
+			double sy_a = 0.0, sxy_a = 0.0, syy_a = 0.0; // y = Q = 1/w
+			double sy_b = 0.0, sxy_b = 0.0, syy_b = 0.0; // y = w
+
+			void add(double zn, double w)
+			{
+				if (!(w > 0.0) || !std::isfinite(w) || !std::isfinite(zn))
+					return;
+
+				const double q = 1.0 / w;
+
+				n += 1.0;
+				sx += zn;
+				sxx += zn * zn;
+				sy_a += q;
+				sxy_a += zn * q;
+				syy_a += q * q;
+				sy_b += w;
+				sxy_b += zn * w;
+				syy_b += w * w;
+			}
+
+			void merge(const z_fit& o)
+			{
+				n += o.n; sx += o.sx; sxx += o.sxx;
+				sy_a += o.sy_a; sxy_a += o.sxy_a; syy_a += o.syy_a;
+				sy_b += o.sy_b; sxy_b += o.sxy_b; syy_b += o.syy_b;
+			}
+
+			// Ages the accumulator once per frame.
+			//
+			// The Z -> w mapping is a property of the *current projection*, and the projection
+			// changes -- between scenes, and when SOCOM's world camera engages part way through
+			// a session. A session-wide accumulator therefore fits a mixture and drifts: the
+			// same state measured R^2 = 1.00000 over 1.5 M vertices from one scene and 0.99856
+			// over 10.6 M spanning several. Decaying makes the fit describe the last few dozen
+			// frames, which is the only window in which "the projection" is a single thing.
+			void decay(double factor)
+			{
+				n *= factor; sx *= factor; sxx *= factor;
+				sy_a *= factor; sxy_a *= factor; syy_a *= factor;
+				sy_b *= factor; sxy_b *= factor; syy_b *= factor;
+			}
+
+			// Ordinary least squares of y on zn, plus the coefficient of determination.
+			bool solve(bool model_a, double& a, double& b, double& r2) const
+			{
+				if (n < 32.0)
+					return false;
+
+				const double sy = model_a ? sy_a : sy_b;
+				const double sxy = model_a ? sxy_a : sxy_b;
+				const double syy = model_a ? syy_a : syy_b;
+
+				const double sxx_c = sxx - (sx * sx / n);
+				const double syy_c = syy - (sy * sy / n);
+				const double sxy_c = sxy - (sx * sy / n);
+
+				if (!(sxx_c > 0.0) || !(syy_c > 0.0))
+					return false;
+
+				a = sxy_c / sxx_c;
+				b = (sy / n) - (a * (sx / n));
+				r2 = (sxy_c * sxy_c) / (sxx_c * syy_c);
+
+				return std::isfinite(a) && std::isfinite(b) && std::isfinite(r2);
+			}
+		};
+
+		z_fit s_zfit;
+
+		// FST=1 recovery, and the two knobs that decide whether it is safe to use.
+		//
+		// FSTZ: 1 (default) = recover FST=1 draws from Z once the calibration is good enough.
+		// FSTZR2: the R^2 model A must reach. Deliberately severe -- the measured split between
+		// the two titles is not marginal, so there is no reason to sit near a boundary:
+		//   SOCOM (SCUS-97545), 1,548,714 vertices : R^2 = 1.00000
+		//   Rainbow Six 3 (SLUS-20883), 6,228,855 : R^2 = 0.13231
+		// A title whose Z is unusable therefore degrades to today's behaviour rather than
+		// rendering garbage, which is the whole point of gating on fit rather than on a list.
+		int fst_z_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_FSTZ", 1), 0, 1));
+
+			return value;
+		}
+
+		// Per-frame retention of the Z->w accumulator. 0.9 gives an effective window of roughly
+		// ten frames, which at thousands of calibration vertices per frame is still an enormous
+		// sample. 1.0 restores the session-wide behaviour for comparison.
+		double fst_z_decay()
+		{
+			static const double value = []() -> double {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_FSTZDECAY");
+				if (env.empty())
+					return 0.9;
+
+				const double parsed = ::_wtof(env.c_str());
+				return (std::isfinite(parsed) && parsed > 0.0 && parsed <= 1.0) ? parsed : 0.9;
+			}();
+
+			return value;
+		}
+
+		// Whether to submit FST draws whose Z is constant across the draw.
+		//
+		// Measured on SOCOM: *every* FST draw is flat in Z -- 1,935 of 1,935 in one session, and
+		// the same in the indoor state. With one depth for the whole draw the un-projection can
+		// place it correctly but cannot give it shape, so what comes out is a camera-facing quad
+		// at the right distance. That is the right answer for a sprite, billboard or particle
+		// and the wrong answer for anything else, and nobody has looked yet.
+		//
+		// Defaulted OFF because "FST draws that render in the wrong place would be worse than
+		// not rendering them", and because a flat quad at the wrong depth is exactly the kind of
+		// full-screen occluder that made the developer menu unusable in phase 3d.
+		int fst_flat_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_FSTFLAT", 0), 0, 1));
+
+			return value;
+		}
+
+		double fst_z_min_r2()
+		{
+			static const double value = []() -> double {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_FSTZR2");
+				if (env.empty())
+					return 0.999;
+
+				const double parsed = ::_wtof(env.c_str());
+				return (std::isfinite(parsed) && parsed > 0.0 && parsed <= 1.0) ? parsed : 0.999;
+			}();
+
+			return value;
+		}
+
+		// The live calibration, or false while it is not yet good enough. Re-solved per draw;
+		// it is a handful of flops against an accumulator that only grows.
+		bool fst_z_solution(double& a, double& b)
+		{
+			if (fst_z_mode() == 0)
+				return false;
+
+			double r2 = 0.0;
+			if (!s_zfit.solve(true, a, b, r2))
+				return false;
+
+			return r2 >= fst_z_min_r2();
+		}
 
 		// Explicit absolute overrides. When unset (the default) radius and radiance are derived
 		// from the frame's measured extent instead, which is scale-free -- see place_debug_light.
@@ -2690,6 +2869,29 @@ namespace RemixSubmit
 					(s_extent_ratio_total / static_cast<double>(s_extent_ratio_frames)) : 0.0,
 				s_extent_ratio_peak);
 
+			// The Z -> w calibration. This is the whole feasibility test for FST=1 recovery: if
+			// neither model fits the draws that carry both Z and a real w, then Z cannot be
+			// turned into depth for the draws that carry only Z, and the approach is dead
+			// without writing any of it.
+			{
+				double a = 0.0, b = 0.0, r2 = 0.0;
+				const bool ok_a = s_zfit.solve(true, a, b, r2);
+				double a2 = 0.0, b2 = 0.0, r2b = 0.0;
+				const bool ok_b = s_zfit.solve(false, a2, b2, r2b);
+
+				double ua = 0.0, ub = 0.0;
+				const bool live = fst_z_solution(ua, ub);
+
+				INFO_LOG("Remix: Z->w fit over {:.0f} vertices | A (Q = a*zn+b): {} | B (w = a*zn+b): {} "
+						 "| FST recovery {} (gate R2 >= {:g}), fst recovered {} skipped {}",
+					s_zfit.n,
+					ok_a ? fmt::format("a={:.6g} b={:.6g} R2={:.5f}", a, b, r2) : std::string("insufficient"),
+					ok_b ? fmt::format("a={:.6g} b={:.6g} R2={:.5f}", a2, b2, r2b) : std::string("insufficient"),
+					(fst_z_mode() == 0) ? "OFF" : (live ? "ACTIVE" : "waiting/rejected"),
+					fst_z_min_r2(), s_stats.fst_recovered,
+					fmt::format("{} (flat-Z {})", s_stats.skip_fst, s_stats.fst_flat));
+			}
+
 			// Third line: the material bridge. Kept separate so the counter block stays
 			// readable, and because the two numbers the user has to act on -- unique content
 			// hashes and the per-draw hash cost -- both live here.
@@ -2814,16 +3016,36 @@ namespace RemixSubmit
 			return;
 		}
 
-		if (r.PRIM->FST)
+		// FST=1: the guest fed direct UV texels, so Q is not the perspective divisor. Recoverable
+		// only if this title's Z has been shown to be a usable depth (see fst_z_solution), which
+		// is measured continuously from the FST=0 draws rather than assumed.
+		double fst_z_a = 0.0;
+		double fst_z_b = 0.0;
+		const bool fst_draw = (r.PRIM->FST != 0);
+
+		if (fst_draw && !fst_z_solution(fst_z_a, fst_z_b))
 		{
 			++s_stats.skip_fst;
 			return;
 		}
 
 		// One Q across the whole draw means no perspective, i.e. 2D even when textured.
-		if (r.m_vt.m_eq.q)
+		//
+		// For an FST draw Q is meaningless and almost always constant, so this test would reject
+		// every one of them. The analogue that still discriminates is Z: a HUD element is
+		// screen-aligned and has constant Z, whereas world geometry under a perspective
+		// projection does not. It is the same trade this gate already makes -- flat geometry
+		// viewed exactly head-on is lost -- applied to the only varying quantity FST draws have.
+		if (fst_draw ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q)
 		{
-			++s_stats.skip_const_q;
+			// Counted separately: "how many FST draws have no depth variation at all" is the
+			// number that decides whether depth-from-Z can recover geometry for this title or
+			// only ever produces camera-facing flats.
+			if (fst_draw)
+				++s_stats.fst_flat;
+			else
+				++s_stats.skip_const_q;
+
 			return;
 		}
 
@@ -2942,6 +3164,18 @@ namespace RemixSubmit
 		float min_v = std::numeric_limits<float>::max();
 		float max_v = -std::numeric_limits<float>::max();
 
+		// Z -> w calibration samples for this draw, merged only if the draw is accepted. Only
+		// FST=0 draws contribute: they are the ones carrying both Z and a trustworthy w, and
+		// feeding recovered values back into the fit would make it self-confirming.
+		z_fit draw_zfit{};
+		const double zfit_scale = 1.0 / static_cast<double>(
+			0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_cached_ctx.ZBUF.PSM].fmt * 8));
+
+		// FST draws carry UV in 12.4 fixed-point texels (GSVertex.h:22), so the normalised
+		// texture coordinate is (U/16)/width. TEX0.TW/TH are log2 sizes.
+		const float fst_inv_w = 1.0f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TW) / 16.0f;
+		const float fst_inv_h = 1.0f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TH) / 16.0f;
+
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
 			const GSVertex& v = verts[i];
@@ -2949,10 +3183,17 @@ namespace RemixSubmit
 			const float ndc_x = ((static_cast<float>(v.XYZ.X) - 0.05f) * sx) - offset_x;
 			const float ndc_y = -(((static_cast<float>(v.XYZ.Y) - 0.05f) * sy) - offset_y);
 
-			// w is the eye-space depth the guest divided by. Trusted only because of the
-			// TME=1 && FST=0 gate above; the two Q guards (GSState.cpp:1399/:1403) can still
-			// leave FLT_MIN or GSVector4::m_max here, which the finite check below rejects.
-			const float q = v.RGBAQ.Q;
+			// w is the eye-space depth the guest divided by. For an FST=0 draw it is 1/Q
+			// directly; the two Q guards (GSState.cpp:1399/:1403) can still leave FLT_MIN or
+			// GSVector4::m_max here, which the finite check below rejects.
+			//
+			// For an FST draw Q is not a divisor at all, so w comes from the calibrated
+			// Q = a*zn + b fitted on this title's FST=0 draws. Non-positive or non-finite
+			// results fall out at the same finite check -- Z below the far plane inverts to a
+			// negative w, and rejecting it is correct.
+			const float q = fst_draw ?
+				static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
+				v.RGBAQ.Q;
 			const float w = 1.0f / q;
 
 			remixapi_HardcodedVertex& out = s_scratch_vertices[i];
@@ -2978,8 +3219,8 @@ namespace RemixSubmit
 			out.normal[0] = 0.f;
 			out.normal[1] = 0.f;
 			out.normal[2] = -1.f;
-			out.texcoord[0] = v.ST.S * w;
-			out.texcoord[1] = v.ST.T * w;
+			out.texcoord[0] = fst_draw ? (static_cast<float>(v.U) * fst_inv_w) : (v.ST.S * w);
+			out.texcoord[1] = fst_draw ? (static_cast<float>(v.V) * fst_inv_h) : (v.ST.T * w);
 			// PS2 alpha is 0..128 (0x80 == 1.0); scale into 0..255 for a D3DCOLOR-style ARGB.
 			const u32 alpha = std::min<u32>(255u, static_cast<u32>(v.RGBAQ.A) * 2u);
 			out.color = (alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
@@ -3014,6 +3255,9 @@ namespace RemixSubmit
 			max_v = std::max(max_v, out.texcoord[1]);
 			min_z = std::min(min_z, static_cast<u32>(v.XYZ.Z));
 			max_z = std::max(max_z, static_cast<u32>(v.XYZ.Z));
+
+			if (!fst_draw)
+				draw_zfit.add(static_cast<double>(v.XYZ.Z) * zfit_scale, static_cast<double>(w));
 		}
 
 		// The eye-plane gate. w = 1/Q is the depth the guest divided by; the per-vertex check
@@ -3056,6 +3300,11 @@ namespace RemixSubmit
 				s_frame_max_extent = std::max(s_frame_max_extent, extent);
 				s_frame_min_extent = std::min(s_frame_min_extent, extent);
 			}
+
+			s_zfit.merge(draw_zfit);
+
+			if (fst_draw)
+				++s_stats.fst_recovered;
 		}
 
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
@@ -3797,6 +4046,9 @@ namespace RemixSubmit
 		}
 		s_frame_max_extent = 0.f;
 		s_frame_min_extent = std::numeric_limits<float>::max();
+
+		// Ages the Z->w calibration so it tracks the current projection rather than the session.
+		s_zfit.decay(fst_z_decay());
 
 		s_frame_bounds = scene_bounds{};
 		s_frame_bounds_world = false;
