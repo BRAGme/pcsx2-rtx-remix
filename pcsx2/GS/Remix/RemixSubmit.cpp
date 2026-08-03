@@ -108,6 +108,19 @@ namespace RemixSubmit
 			u64 skip_mesh_budget = 0; // over the per-frame CreateMesh budget
 			u64 skip_fbmsk = 0; // partial colour write mask: a multi-pass modulation term
 			u64 skip_coincident = 0; // identical geometry already submitted this frame
+			// Draws whose GEOMETRY matches one already submitted this frame but whose MATERIAL
+			// differs -- the PS2 multitexture pattern. The GS has one texture unit, so a title
+			// lays a base pass and then re-draws the same triangles with the lightmap bound.
+			//
+			// These are NOT in skip_coincident: material.content_hash is folded into the identity
+			// hash on both the stable and legacy paths (deliberately -- Remix binds the material at
+			// CreateMesh time), so a different texture means a different hash and the pass is
+			// submitted. It therefore reaches the path tracer as a second surface sitting exactly on
+			// the first, which is z-fighting rather than lighting.
+			//
+			// Counted, never rejected: this number sizes the opportunity to fold those passes into
+			// one surface with a combined material, which is where the level's baked lighting is.
+			u64 multipass_overlay = 0;
 			u64 skip_minw = 0; // draw sits at or inside the eye
 			u64 skip_maxw = 0; // draw sits entirely beyond the far-field cap (PCSX2_REMIX_MAXW)
 			// Hyperextended draws: the ones whose AABB diagonal exceeds explode_ratio_limit()
@@ -283,6 +296,11 @@ namespace RemixSubmit
 
 		// Mesh hashes already submitted this frame, cleared at each VSync. See the dedupe gate.
 		std::unordered_set<u64> s_frame_submitted_hashes;
+
+		// The same, with the material contribution removed: "these triangles in this place",
+		// whatever texture is bound. A second hit here that was NOT a dedupe hit is a multitexture
+		// pass. Diagnostic only; see stat_counters::multipass_overlay.
+		std::unordered_set<u64> s_frame_geometry_hashes;
 
 		// Distinct mesh *keys* instanced this frame. Under stable identity the dedupe set above
 		// also carries a quantized centroid, so two instances of one object appear twice in it
@@ -764,6 +782,32 @@ namespace RemixSubmit
 				const float parsed = static_cast<float>(::_wtof(env.c_str()));
 				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 0.001f;
 			}();
+
+			return value;
+		}
+
+		// Tell Remix that per-vertex colour IS baked lighting, via
+		// remixapi_InstanceInfoBlendEXT::isVertexColorBakedLighting.
+		//
+		// This is the semantically correct answer for a title that bakes, and it took a dead end to
+		// find. The plan was to recover the multitexture lightmap passes -- the PS2 has one texture
+		// unit, so titles lay a base pass then re-draw with the lightmap bound. MEASURED on SOCOM
+		// in-mission: multipass_overlay = 0 out of 1,038,746 draws seen, and fbmsk 2,686 (0.26%).
+		// SOCOM does not do it at all; that pattern is Rainbow Six 3's (90 of 231 dumped draws split
+		// 30/30/30 across FBMSK masks). So there is no lightmap in SOCOM's draw stream to fold in.
+		//
+		// Its baked lighting is entirely in the vertex colours: 43,825,580 vertices at mean luminance
+		// 45.7/255, 0.0% at PS2 unity (128), 75% of draws carrying a gradient. Using that as albedo
+		// double-darkens (albedo x baked shadow, then path-traced and lit again), which is why
+		// VCOLOR=0 discards it -- but discarding it throws the level's only lighting away.
+		//
+		// This field is the third option: submit the colour AND tell the runtime what it means, so it
+		// is treated as irradiance rather than as surface albedo. Pair with VCOLOR=1.
+		// Requires alpha_state_mode()==2, since that is what chains the blend struct at all.
+		int vcolor_baked_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_VCBAKED", 0), 0, 1));
 
 			return value;
 		}
@@ -2816,7 +2860,9 @@ namespace RemixSubmit
 			blend.tFactor = 0xFFFFFFFFu;
 			blend.isTextureFactorBlend = 0;
 			blend.writeMask = 0xF; // D3DCOLORWRITEENABLE_ALL
-			blend.isVertexColorBakedLighting = 0;
+			// See vcolor_baked_mode(): SOCOM's only baked lighting is its vertex colour, and this is
+			// what tells the runtime to treat it as irradiance instead of as albedo.
+			blend.isVertexColorBakedLighting = (vcolor_baked_mode() != 0) ? 1 : 0;
 
 			// Alpha-tested draws are cut-outs -- foliage, decals, muzzle flashes -- and submitting
 			// them as ordinary blended geometry makes the whole quad participate in lighting rather
@@ -3057,7 +3103,7 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
+					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
@@ -3068,7 +3114,7 @@ namespace RemixSubmit
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
 				s_stats.skip_const_q, s_stats.skip_w_flat, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
-				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident,
+				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
 				s_stats.skip_minw,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
@@ -3925,6 +3971,16 @@ namespace RemixSubmit
 			return;
 		}
 
+		// Same geometry, different material: a multitexture pass, not a duplicate. Keyed on the
+		// dedupe key with the material contribution removed, so it is exactly "this draw's
+		// triangles in this place, whatever is bound to them". Diagnostic only -- the draw is
+		// submitted either way. See multipass_overlay for what this is for.
+		{
+			const u64 geometry_key = fnv_mix(dedupe_key ^ material.content_hash, 0x9E3779B97F4A7C15ull);
+			if (!s_frame_geometry_hashes.insert(geometry_key).second)
+				++s_stats.multipass_overlay;
+		}
+
 		const remixapi_Interface& api = s_remix.api();
 
 		// The instance-side state, needed here rather than further down because it is what
@@ -4440,6 +4496,7 @@ namespace RemixSubmit
 		++s_frame_counter;
 		s_submitted_this_frame = 0;
 		s_frame_submitted_hashes.clear();
+		s_frame_geometry_hashes.clear();
 		s_frame_instanced_keys.clear();
 		// Counted whether or not batching is enabled: this is the number that decides whether
 		// batching can reach the operating point the dose-response calls safe, and it has to be
@@ -4551,6 +4608,7 @@ namespace RemixSubmit
 		s_meshes.clear();
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
+		s_frame_geometry_hashes.clear();
 		s_frame_instanced_keys.clear();
 		s_frame_group_keys.clear();
 		batch_discard();
@@ -4608,6 +4666,7 @@ namespace RemixSubmit
 		s_meshes.clear();
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
+		s_frame_geometry_hashes.clear();
 		s_frame_instanced_keys.clear();
 		s_frame_group_keys.clear();
 		batch_discard();
