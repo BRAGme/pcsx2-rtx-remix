@@ -99,6 +99,7 @@ namespace RemixSubmit
 			u64 skip_fbmsk = 0; // partial colour write mask: a multi-pass modulation term
 			u64 skip_coincident = 0; // identical geometry already submitted this frame
 			u64 skip_minw = 0; // draw sits at or inside the eye
+			u64 skip_maxw = 0; // draw sits entirely beyond the far-field cap (PCSX2_REMIX_MAXW)
 			// Histogram of each submitted draw's smallest w, by decade, so the min-w gate can be
 			// set from the measured distribution instead of a guess. Buckets are
 			// w < 1e-3, < 1e-2, < 1e-1, < 1, < 10, < 100, >= 100.
@@ -482,6 +483,21 @@ namespace RemixSubmit
 				const float diag = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
 				return std::isfinite(diag) ? std::max(0.5f * diag, 1e-3f) : 1.f;
 			}
+
+			// The raw diagonal, unclamped. radius() floors at 1e-3 because it feeds light and
+			// gate scaling where a zero would divide; the extent ratio below has to see genuinely
+			// tiny primitives as tiny, so it cannot use that.
+			float diagonal() const
+			{
+				if (!valid)
+					return 0.f;
+
+				const float dx = max[0] - min[0];
+				const float dy = max[1] - min[1];
+				const float dz = max[2] - min[2];
+				const float diag = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+				return std::isfinite(diag) ? diag : 0.f;
+			}
 		};
 
 		scene_bounds s_frame_bounds{};
@@ -511,6 +527,23 @@ namespace RemixSubmit
 		// solve is right and its x/y rows are not, which no self-consistency test can see.
 		float s_frame_max_w = 0.f;
 		std::unordered_set<u64> s_refuted_matrices;
+
+		// Largest and smallest per-draw world-space AABB diagonal submitted this frame.
+		//
+		// This is the quantity the device-loss hypothesis is actually about, and nothing has ever
+		// measured it. maxpos measures absolute magnitude; this measures the *ratio* between the
+		// biggest and smallest thing in one frame, which is what decides whether a BVH can
+		// separate them. A TLAS of single-triangle instances whose bounds span three orders of
+		// magnitude cannot be partitioned, so most rays descend most of the tree -- which is the
+		// only remaining explanation for a few thousand rays hanging a 4070 Ti (phase 5).
+		//
+		// Per draw rather than per triangle: a draw is one instance and one BLAS, so the draw's
+		// AABB is exactly what the TLAS sees.
+		float s_frame_max_extent = 0.f;
+		float s_frame_min_extent = std::numeric_limits<float>::max();
+		float s_extent_ratio_peak = 0.f;
+		double s_extent_ratio_total = 0.0;
+		u64 s_extent_ratio_frames = 0;
 
 		// Explicit absolute overrides. When unset (the default) radius and radiance are derived
 		// from the frame's measured extent instead, which is scale-free -- see place_debug_light.
@@ -1875,6 +1908,34 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// The far-field twin of min_submitted_w(): reject a draw whose *nearest* vertex is beyond
+		// this w, so nothing in the frame sits further out than the cap. 0 (the default) disables
+		// it and nothing changes.
+		//
+		// This exists to move the one variable no arm has ever moved. SOCOM slot 2 submits 838
+		// draws in a frame with a median of ONE triangle each and w spanning 16.7 to 3,440 -- a
+		// TLAS of single-triangle instances whose bounds overlap across a 200x depth range,
+		// including single triangles hundreds of screen pixels wide at w ~ 2,000 sitting beside
+		// geometry at w ~ 17. Capping w collapses that spread while leaving vertex data,
+		// packaging, identity, instancing and materials untouched, which is what makes it a clean
+		// arm rather than another confound.
+		//
+		// Deliberately gated on min_w, not max_w: a draw that straddles the cap is kept, so the
+		// gate removes only geometry lying entirely in the far field.
+		float max_submitted_w()
+		{
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_MAXW");
+				if (env.empty())
+					return 0.f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 0.f;
+			}();
+
+			return value;
+		}
+
 		// Quantum, in world units, that positions are snapped to before they are hashed into a
 		// mesh identity. 0 disables quantization and restores exact-bit hashing, which is the
 		// A/B handle for the measurement. The default is deliberately coarse relative to the
@@ -2614,10 +2675,14 @@ namespace RemixSubmit
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
 			INFO_LOG("Remix: submitted w (max per draw): <1e-3 {} <1e-2 {} <0.1 {} <1 {} <10 {} "
-					 "<100 {} >=100 {} | minw gate {:g}",
+					 "<100 {} >=100 {} | minw gate {:g} | maxw gate {:g} skipped {} | "
+					 "draw extent ratio avg {:.0f} peak {:.0f}",
 				s_stats.w_histogram[0], s_stats.w_histogram[1], s_stats.w_histogram[2],
 				s_stats.w_histogram[3], s_stats.w_histogram[4], s_stats.w_histogram[5],
-				s_stats.w_histogram[6], min_submitted_w());
+				s_stats.w_histogram[6], min_submitted_w(), max_submitted_w(), s_stats.skip_maxw,
+				(s_extent_ratio_frames > 0) ?
+					(s_extent_ratio_total / static_cast<double>(s_extent_ratio_frames)) : 0.0,
+				s_extent_ratio_peak);
 
 			// Third line: the material bridge. Kept separate so the counter block stays
 			// readable, and because the two numbers the user has to act on -- unique content
@@ -2962,11 +3027,29 @@ namespace RemixSubmit
 				return;
 			}
 
+			// The far-field gate. See max_submitted_w() for why this is the arm that matters.
+			const float max_w_limit = max_submitted_w();
+			if (max_w_limit > 0.f && min_w > max_w_limit)
+			{
+				++s_stats.skip_maxw;
+				return;
+			}
+
 			const u32 bucket = (max_w < 1e-3f) ? 0 : (max_w < 1e-2f) ? 1 :
 			                   (max_w < 1e-1f) ? 2 : (max_w < 1.f)   ? 3 :
 			                   (max_w < 10.f)  ? 4 : (max_w < 100.f) ? 5 : 6;
 			++s_stats.w_histogram[bucket];
 			s_frame_max_w = std::max(s_frame_max_w, max_w);
+
+			// Per-draw AABB diagonal, i.e. the size of the box this draw will occupy in the TLAS.
+			// Accumulated only for draws that clear every gate above, so the ratio describes what
+			// the path tracer is actually given rather than what the tee saw.
+			const float extent = draw_bounds.diagonal();
+			if (extent > 0.f)
+			{
+				s_frame_max_extent = std::max(s_frame_max_extent, extent);
+				s_frame_min_extent = std::min(s_frame_min_extent, extent);
+			}
 		}
 
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
@@ -3692,6 +3775,23 @@ namespace RemixSubmit
 			s_last_bounds_world = s_frame_bounds_world;
 		}
 
+		// Fold this frame's largest/smallest submitted extent into the session ratio before the
+		// per-frame values are cleared. Frames that submitted fewer than two draws have no ratio
+		// to speak of and are not counted, so an empty menu frame cannot dilute the average.
+		if (s_frame_max_extent > 0.f && s_frame_min_extent < std::numeric_limits<float>::max() &&
+			s_frame_min_extent > 0.f)
+		{
+			const float ratio = s_frame_max_extent / s_frame_min_extent;
+			if (std::isfinite(ratio))
+			{
+				s_extent_ratio_peak = std::max(s_extent_ratio_peak, ratio);
+				s_extent_ratio_total += static_cast<double>(ratio);
+				++s_extent_ratio_frames;
+			}
+		}
+		s_frame_max_extent = 0.f;
+		s_frame_min_extent = std::numeric_limits<float>::max();
+
 		s_frame_bounds = scene_bounds{};
 		s_frame_bounds_world = false;
 		s_frame_max_w = 0.f;
@@ -3802,6 +3902,8 @@ namespace RemixSubmit
 		s_frame_bounds_world = false;
 		s_last_bounds_world = false;
 		s_frame_max_w = 0.f;
+		s_frame_max_extent = 0.f;
+		s_frame_min_extent = std::numeric_limits<float>::max();
 		s_refuted_matrices.clear();
 
 		// The beacon must not fire just because the first frames after a load submit nothing.
@@ -3861,6 +3963,8 @@ namespace RemixSubmit
 		s_frame_bounds_world = false;
 		s_last_bounds_world = false;
 		s_frame_max_w = 0.f;
+		s_frame_max_extent = 0.f;
+		s_frame_min_extent = std::numeric_limits<float>::max();
 		s_refuted_matrices.clear();
 		s_camera_last_accept_frame = 0;
 		s_logged_world_camera = false;
