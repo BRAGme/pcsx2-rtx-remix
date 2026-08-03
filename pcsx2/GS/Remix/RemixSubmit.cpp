@@ -738,6 +738,31 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// Whether per-vertex RGB reaches Remix as vertex colour.
+		//
+		// 1 (default) = submit it. 0 = force white and let the path tracer do all the lighting.
+		//
+		// The distinction is whether the title bakes its lighting into vertex colour, and that is
+		// measured, not guessed. SOCOM Combined Assault, over 43,825,580 vertices in-mission:
+		//   mean luminance 45.7 of 255, neutral(128,128,128) 0.0%, 83% of vertices in the two
+		//   darkest buckets, and 1,200,752 draws with *varying* colour against 397,110 constant.
+		// PS2 unity is 128, so essentially nothing is at full brightness and three quarters of
+		// draws carry a gradient across the surface. That is baked lighting, not a material tint.
+		//
+		// Submitting it means albedo gets multiplied by the game's pre-baked shadows and then path
+		// traced and lit again -- doubly darkened, which is what left the mission at mean luminance
+		// 31 once the volumetric wash was removed. A remaster wants the albedo and its own lighting.
+		//
+		// Defaults to 1 so nothing changes for titles that do not bake; set per-game where the
+		// vertex-colour measurement above says otherwise.
+		int vcolor_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_VCOLOR", 1), 0, 1));
+
+			return value;
+		}
+
 		// UNTEXZ: 1 (default) = recover *untextured* draws from Z as well, on the same calibration
 		// and the same R^2 gate as FSTZ above.
 		//
@@ -3421,9 +3446,12 @@ namespace RemixSubmit
 			out.texcoord[0] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.U) * fst_inv_w) : (v.ST.S * w));
 			out.texcoord[1] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.V) * fst_inv_h) : (v.ST.T * w));
 			// PS2 alpha is 0..128 (0x80 == 1.0); scale into 0..255 for a D3DCOLOR-style ARGB.
+			// Alpha is kept either way -- it is real transparency, not baked lighting.
 			const u32 alpha = std::min<u32>(255u, static_cast<u32>(v.RGBAQ.A) * 2u);
-			out.color = (alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
-			            (static_cast<u32>(v.RGBAQ.G) << 8) | static_cast<u32>(v.RGBAQ.B);
+			out.color = (vcolor_mode() != 0) ?
+				((alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
+					(static_cast<u32>(v.RGBAQ.G) << 8) | static_cast<u32>(v.RGBAQ.B)) :
+				((alpha << 24) | 0x00FFFFFFu);
 
 			draw_vcolor.add(v.RGBAQ.R, v.RGBAQ.G, v.RGBAQ.B);
 			if (i == 0)
@@ -3653,7 +3681,12 @@ namespace RemixSubmit
 		// there (GSTextureCache.h:306) and it is null on most draws and always null for a
 		// render-target source, so the key has to be rebuilt from TEX0/TEXA/CLUT/region.
 		const GSTextureCache::Source* const source = static_cast<const GSTextureCache::Source*>(tex_source);
-		const remix_ps2::materials::binding material = remix_ps2::materials::bind(s_remix, source, s_frame_counter);
+		// An untextured draw has no source to key a material on, so bind() would hand back null and
+		// the surface would shade colourless -- and since UNTEXZ these are the majority of a SOCOM
+		// frame. Give them the shared white material instead, so their per-vertex colour lands.
+		const remix_ps2::materials::binding material = untex_draw ?
+			remix_ps2::materials::bind_untextured(s_remix) :
+			remix_ps2::materials::bind(s_remix, source, s_frame_counter);
 
 		// --- mesh identity ------------------------------------------------------------------
 		u64 hash = fnv_seed;

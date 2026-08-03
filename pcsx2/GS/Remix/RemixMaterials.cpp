@@ -1172,6 +1172,95 @@ namespace remix_ps2::materials
 		return it->second;
 	}
 
+	binding bind_untextured(const runtime& rt)
+	{
+		// A fixed, arbitrary hash. It is not a content hash -- there is no content -- but it must
+		// be stable and distinct, because the caller folds it into the mesh identity and Remix
+		// binds the material at CreateMesh time. "UNTEXTRD" in ASCII, so it is recognisable in a
+		// log and cannot collide with a real GS texture hash.
+		static constexpr u64 untextured_hash = 0x554E544558545244ull;
+
+		static remixapi_MaterialHandle s_untextured = nullptr;
+		static bool s_tried = false;
+
+		binding out{};
+
+		// No fork_features() gate and no texture budget: this material names no texture, so none
+		// of the pseudo-path machinery those guard is involved.
+		if (!rt.ok())
+			return out;
+
+		if (!s_untextured && !s_tried)
+		{
+			s_tried = true;
+
+			remixapi_MaterialInfoOpaqueEXT opaque{};
+			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+			opaque.pNext = nullptr;
+			opaque.roughnessTexture = nullptr;
+			opaque.metallicTexture = nullptr;
+			opaque.anisotropy = 0.f;
+			// White, so the per-vertex RGBAQ colour is what decides the surface colour.
+			opaque.albedoConstant = {1.f, 1.f, 1.f};
+			opaque.opacityConstant = 1.f;
+			opaque.roughnessConstant = 0.7f;
+			opaque.metallicConstant = 0.f;
+			opaque.thinFilmThickness_hasvalue = 0;
+			opaque.thinFilmThickness_value = 0.f;
+			opaque.alphaIsThinFilmThickness = 0;
+			opaque.heightTexture = nullptr;
+			opaque.displaceIn = 0.f;
+			// Must agree with what RemixSubmit chains on the instance, exactly as in the textured
+			// path -- claiming draw-call alpha state and not supplying it is what once suppressed
+			// every blended surface.
+			opaque.useDrawCallAlphaState = (alpha_state_mode() != 0) ? 1 : 0;
+			opaque.blendType_hasvalue = 0;
+			opaque.blendType_value = 0;
+			opaque.invertedBlend = 0;
+			opaque.alphaTestType = 7; // always
+			opaque.alphaReferenceValue = 0;
+			opaque.displaceOut = 0.f;
+
+			remixapi_MaterialInfo material{};
+			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+			material.pNext = &opaque;
+			material.hash = untextured_hash;
+			material.albedoTexture = nullptr; // the whole point: constant albedo, no texture
+			material.normalTexture = nullptr;
+			material.tangentTexture = nullptr;
+			material.emissiveTexture = nullptr;
+			material.emissiveIntensity = 0.f;
+			material.emissiveColorConstant = remixapi_Float3D{0.f, 0.f, 0.f};
+			material.spriteSheetRow = 1;
+			material.spriteSheetCol = 1;
+			material.spriteSheetFps = 0;
+			material.filterMode = 1; // linear
+			material.wrapModeU = 1;
+			material.wrapModeV = 1;
+
+			const remixapi_Interface& api = rt.api();
+			const u32 status = guarded_create_material(api.CreateMaterial, &material, &s_untextured);
+
+			if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_untextured)
+			{
+				ERROR_LOG("Remix: CreateMaterial failed for the shared untextured material ({})",
+					error_name(status));
+				s_untextured = nullptr;
+				++s_stats.failures;
+				return out;
+			}
+
+			INFO_LOG("Remix: created the shared untextured material (white albedo, vertex-colour lit)");
+		}
+
+		if (!s_untextured)
+			return out;
+
+		out.material = s_untextured;
+		out.content_hash = untextured_hash;
+		return out;
+	}
+
 	binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame)
 	{
 		binding out{};

@@ -46,6 +46,21 @@ namespace remix_ps2
 		// draw. Never throws and never asserts: any failure degrades to a null material.
 		binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame);
 
+		// One shared white material for untextured draws.
+		//
+		// Since untextured draws started being submitted rather than dropped (PCSX2_REMIX_UNTEXZ),
+		// they are the *majority* of a SOCOM mission frame -- 811,006 of 1,008,379 submitted -- and
+		// bind() hands them the null binding because there is no source. Measured result: the frame
+		// renders geometrically complete and completely colourless, mean saturation 0.038 with
+		// coloured_px 0.00%.
+		//
+		// PS2 untextured geometry is shaded by per-vertex colour, and that colour is already being
+		// written into every remixapi_HardcodedVertex. It just has no material to modulate. This
+		// supplies one: no albedo texture, albedoConstant white, so the vertex colour comes through.
+		// Created once and cached for the session; it holds no texture, so it is outside the
+		// CreateTexture budget and the LRU entirely.
+		binding bind_untextured(const runtime& rt);
+
 		// LRU release. Must run *after* the mesh reap: a live mesh holds its material handle,
 		// so meshes have to be released before the materials they reference.
 		void reap(const runtime& rt, u64 frame);
