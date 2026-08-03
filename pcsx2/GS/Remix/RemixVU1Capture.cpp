@@ -592,8 +592,14 @@ namespace RemixVU1Capture
 			float m[16];
 			std::memcpy(m, mem + pinned, sizeof(m));
 
+			// Source 3, not the default 0. This candidate is the address a back-slice already
+			// resolved, re-read each frame -- calling it a window-scan hit made 'accept (sliced
+			// N)' under-report by 20x on SOCOM (317 of 6,439 accepts looked unattributed when in
+			// fact all of them were the same sliced matrix), and cost it the non-scan ranking
+			// bonus that says an address a camera was actually recovered from outranks a shape
+			// score.
 			if (finite_window(m))
-				insert_candidate(m, 1000.f, pinned, start_pc, ucode);
+				insert_candidate(m, 1000.f, pinned, start_pc, ucode, 3);
 		}
 
 		trace("scanned", s_frame.windows_survived, s_frame.count);

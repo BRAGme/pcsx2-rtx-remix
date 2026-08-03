@@ -164,6 +164,8 @@ namespace RemixSubmit
 			u64 cam_reject_score = 0; // split worked, score_perspective refused
 			u64 cam_accept = 0;
 			u64 cam_reject_degenerate = 0; // split and scored, but refuted by the geometry
+			u64 cam_reject_scale = 0; // the un-projection's unit disagrees with the guest's w
+			u64 cam_reject_extent = 0; // world space changed the scene's size, so it is not rigid
 			u32 cam_last_candidates = 0;
 		};
 
@@ -211,6 +213,10 @@ namespace RemixSubmit
 			float far_plane = 1000.f;
 			u64 matrix_hash = 0;
 			float score = 0.f;
+			// Measured by the depth-scale gate and reported, so the number the gate turns on is
+			// visible rather than implied.
+			float depth_scale = 0.f;
+			float depth_anisotropy = 0.f;
 		};
 
 		remix_ps2::runtime s_remix;
@@ -412,6 +418,31 @@ namespace RemixSubmit
 
 		scene_bounds s_frame_bounds{};
 		scene_bounds s_last_bounds{};
+
+		// Whether s_last_bounds was captured while world-anchored. Without this the drift guard
+		// cannot tell world-space bounds from view-space ones, and comparing a world-space eye
+		// against view-space bounds is a units error -- the bug that locked Rainbow Six 3 out of
+		// world mode and, once "fixed" by restricting when the guard runs, let SOCOM's bad camera
+		// through unchallenged.
+		bool s_frame_bounds_world = false;
+		bool s_last_bounds_world = false;
+
+		// The largest eye-space depth submitted this frame, and the hashes of world matrices
+		// refuted by the extent check below.
+		//
+		// This is the gate that catches a camera which is internally perfectly consistent and
+		// still wrong. w = 1/Q is the guest's own eye-space depth, so every vertex it submits
+		// lies within w of the camera -- the whole visible scene fits in a sphere of a few times
+		// the frame's largest w. A recovered camera whose un-projection scatters that same
+		// geometry across a thousand times that distance is not the camera, whatever its internal
+		// numbers say.
+		//
+		// Measured: SOCOM's accepted camera has depth scale 0.9999 and anisotropy 2.6x -- both
+		// exactly right -- and still submits scene radius 5,807 from geometry whose largest w is
+		// about 6. Rainbow Six 3 submits radius 9 against w in the same range. The w row of the
+		// solve is right and its x/y rows are not, which no self-consistency test can see.
+		float s_frame_max_w = 0.f;
+		std::unordered_set<u64> s_refuted_matrices;
 
 		// Explicit absolute overrides. When unset (the default) radius and radiance are derived
 		// from the frame's measured extent instead, which is scale-free -- see place_debug_light.
@@ -678,6 +709,9 @@ namespace RemixSubmit
 		float world_near_plane();
 		float world_far_plane(float near_plane);
 		float camera_distance_limit();
+		float camera_scale_limit();
+		float camera_anisotropy_limit();
+		float camera_extent_limit();
 
 		void place_debug_light(const float (&position)[3], float scene_radius)
 		{
@@ -1250,7 +1284,7 @@ namespace RemixSubmit
 					dump_write(fmt::format(
 						"f={} src={} off=0x{:04x} pc=0x{:04x} ucode=0x{:016x} shape={:.2f} res=[{} ] best={} "
 						"score={:.2f} fovY={:.2f} aspect={:.3f} near={:.5g} M={}",
-						s_frame_counter, (candidate.source == 0) ? "scan" : ((candidate.source == 1) ? "slice" : "slice-tops"),
+						s_frame_counter, (candidate.source == 0) ? "scan" : ((candidate.source == 1) ? "slice" : ((candidate.source == 2) ? "slice-tops" : "pinned")),
 						candidate.mem_offset, candidate.start_pc, candidate.ucode_hash,
 						candidate.score, detail, candidate_name, candidate_best,
 						candidate_params.fov_y_degrees, candidate_params.aspect, candidate_params.near_plane,
@@ -1341,15 +1375,98 @@ namespace RemixSubmit
 				}
 			}
 
-			// ONLY when the previous frame was itself world-anchored. s_last_bounds holds the
-			// extent of whatever space the previous frame submitted in, so on the first
-			// acceptance it is view-space geometry centred near the origin while the candidate
-			// eye is in world coordinates -- comparing them is a units error, and it rejected
-			// every camera Rainbow Six 3 had been resolving happily (cam world 0 / fallback 900,
-			// where it used to be 3958/2). The origin check above is unconditional and catches
-			// the SOCOM collapse this gate was written for; this one only guards against drift
-			// once world mode is already established.
-			if (s_last_bounds.valid && s_active_camera.valid)
+			// --- depth-scale consistency ---------------------------------------------------
+			//
+			// The gate that matters, and the one the geometry cross-check below structurally
+			// could not be.
+			//
+			// w = 1/Q is the eye-space depth the guest itself divided by, so it is ground truth
+			// in the guest's own units. Every engine we have looked at uses a rigid view
+			// transform, which means |col3| of the fused matrix is 1 and the recovered world
+			// space shares those units. So un-projecting the NDC centre at w = 1 must land
+			// exactly one unit from the eye, and the frame's corners must land at
+			// 1/cos(half-diagonal fov) -- 1.11 at Rainbow Six 3's 36 degrees, ~2.9 even at 113.
+			//
+			// This needs no geometry, so unlike the cross-check below it can run on the FIRST
+			// acceptance, which is the only one that matters: once a wrong camera is accepted,
+			// the geometry it un-projects becomes the bounds the cross-check compares against,
+			// and a wrong camera is perfectly self-consistent with its own output.
+			//
+			// That single flaw produced two opposite symptoms. Comparing a world-space eye
+			// against view-space bounds is a units error, so before 0fa6d10fc it rejected every
+			// camera Rainbow Six 3 resolved. Restricting it to "world mode already established"
+			// fixed that and simultaneously made it unable to ever catch a bad first
+			// acceptance -- SOCOM went from falling back to view space to running world-anchored
+			// on a camera whose recovered unit is ~1000x the guest's, which is the vertex
+			// explosion the user photographed (scene radius 5,959 against a real extent of ~4).
+			{
+				static constexpr float ndc_samples[5][2] = {
+					{0.f, 0.f}, {-1.f, -1.f}, {1.f, -1.f}, {-1.f, 1.f}, {1.f, 1.f}};
+
+				float centre_scale = 0.f;
+				float min_scale = std::numeric_limits<float>::max();
+				float max_scale = 0.f;
+				bool finite = true;
+
+				for (u32 i = 0; i < std::size(ndc_samples); ++i)
+				{
+					float probe[3];
+					// clip = (ndc_x * w, ndc_y * w, w) with w = 1.
+					remix_ps2::solve_world_position(camera.solver, ndc_samples[i][0], ndc_samples[i][1], 1.f, probe);
+
+					const float dx = probe[0] - camera.position[0];
+					const float dy = probe[1] - camera.position[1];
+					const float dz = probe[2] - camera.position[2];
+					const float distance = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+					if (!std::isfinite(distance) || !(distance > 0.f))
+					{
+						finite = false;
+						break;
+					}
+
+					if (i == 0)
+						centre_scale = distance;
+
+					min_scale = std::min(min_scale, distance);
+					max_scale = std::max(max_scale, distance);
+				}
+
+				const float scale_limit = camera_scale_limit();
+				const bool scale_ok = finite && (centre_scale >= (1.f / scale_limit)) &&
+				                      (centre_scale <= scale_limit);
+				const bool aniso_ok = finite && (max_scale <= (camera_anisotropy_limit() * min_scale));
+
+				if (!scale_ok || !aniso_ok)
+				{
+					++s_stats.cam_reject_scale;
+
+					if (s_stats.cam_reject_scale == 1)
+					{
+						WARNING_LOG("Remix: refusing a world camera whose un-projection does not match the "
+									"guest's own depth -- a point at w=1 lands {:.4g} units from the eye "
+									"(expected ~1, limit {:g}x) and varies {:.3g}x across the frame "
+									"(limit {:g}x). Staying in view-space; raise PCSX2_REMIX_CAMSCALE / "
+									"PCSX2_REMIX_CAMANISO if this title really does scale its view transform.",
+							centre_scale, scale_limit, (min_scale > 0.f) ? (max_scale / min_scale) : 0.f,
+							camera_anisotropy_limit());
+					}
+
+					drop_stale_camera();
+					return;
+				}
+
+				camera.depth_scale = centre_scale;
+				camera.depth_anisotropy = (min_scale > 0.f) ? (max_scale / min_scale) : 0.f;
+			}
+
+			// Drift guard, secondary to the check above. It compares the candidate eye against
+			// the previous frame's submitted geometry, so it is only meaningful when that frame
+			// was itself world-anchored -- otherwise the bounds are view-space and the eye is
+			// world-space, which is a units error. Keyed on what space the bounds were actually
+			// captured in rather than on the current camera's validity, so it no longer skips
+			// exactly the acceptance that needs guarding.
+			if (s_last_bounds.valid && s_last_bounds_world)
 			{
 				const float cx = 0.5f * (s_last_bounds.min[0] + s_last_bounds.max[0]);
 				const float cy = 0.5f * (s_last_bounds.min[1] + s_last_bounds.max[1]);
@@ -1381,6 +1498,16 @@ namespace RemixSubmit
 				}
 			}
 
+			if (s_refuted_matrices.count(camera.matrix_hash) != 0)
+			{
+				// Refuted by the extent check on a previous frame. Without this the camera is
+				// re-accepted every frame, submits one bad frame, is refuted again, and the
+				// scene strobes between the two spaces.
+				++s_stats.cam_reject_extent;
+				drop_stale_camera();
+				return;
+			}
+
 			s_active_camera = camera;
 			s_camera_last_accept_frame = s_frame_counter;
 			++s_stats.cam_accept;
@@ -1396,12 +1523,16 @@ namespace RemixSubmit
 			{
 				s_logged_world_camera = true;
 				INFO_LOG("Remix: world camera resolved -- source {}, hypothesis {}/{}, score {:.2f}, "
-						 "fovY {:.1f} deg, near {:.5g}, far {:.5g}, eye ({:.3f}, {:.3f}, {:.3f}) "
+						 "fovY {:.1f} deg, near {:.5g}, far {:.5g}, eye ({:.3f}, {:.3f}, {:.3f}), "
+						 "depth scale {:.4g} (anisotropy {:.3g}x) "
 						 "[matrix-implied near {:.5g}, not used]",
-					(best_source == 0) ? "window scan" : ((best_source == 1) ? "ucode back-slice" : "ucode back-slice (TOPS)"),
+					(best_source == 0) ? "window scan" :
+						((best_source == 1) ? "ucode back-slice" :
+							((best_source == 2) ? "ucode back-slice (TOPS)" : "pinned back-slice address")),
 					best_name, best_transposed ? "column-major" : "row-major", best_score,
 					params.fov_y_degrees, camera.near_plane, camera.far_plane,
 					camera.position[0], camera.position[1], camera.position[2],
+					camera.depth_scale, camera.depth_anisotropy,
 					described ? params.near_plane : 0.f);
 			}
 		}
@@ -1697,6 +1828,35 @@ namespace RemixSubmit
 		float camera_distance_limit()
 		{
 			static const float value = env_float(L"PCSX2_REMIX_CAMDIST", 50.f);
+			return value;
+		}
+
+		// How far the recovered world space's unit may be from the guest's own, before the
+		// camera is refused. See check_depth_scale: for a rigid view transform the two are the
+		// same, so this is a wide tolerance around 1 rather than a fitted number.
+		float camera_scale_limit()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_CAMSCALE", 8.f);
+			return value;
+		}
+
+		// How much that unit may vary between the centre of the frame and its corners. A well
+		// conditioned perspective un-projection varies by 1/cos(half-diagonal-fov) -- 1.11 at
+		// Rainbow Six 3's 36 degrees, about 2.9 even at 113 degrees. Anything beyond this is a
+		// near-singular solve, which is what smears geometry into bands.
+		float camera_anisotropy_limit()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_CAMANISO", 8.f);
+			return value;
+		}
+
+		// How many times the frame's largest eye-space depth the submitted scene's radius may
+		// reach before the world camera is refused. Geometry at depth w sits at most w/cos(fov/2)
+		// from the eye, so a correct camera keeps this near 1-3 even at a wide field of view;
+		// Rainbow Six 3 measures well under it and SOCOM's bad matrix measures ~970.
+		float camera_extent_limit()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_CAMEXTENT", 10.f);
 			return value;
 		}
 
@@ -2309,12 +2469,12 @@ namespace RemixSubmit
 			// windows through the shape prefilter, no candidates, no split, or no score.
 			INFO_LOG("Remix: vu kicks {} scanned {} reentrant {} windows {} shape-ok {} | "
 					 "slice matrices {} published {} | cand {} (now {}) | "
-					 "split-reject {} score-reject {} degenerate-reject {} accept {} (sliced {}) | camera {}{}",
+					 "split-reject {} score-reject {} degenerate-reject {} scale-reject {} extent-reject {} accept {} (sliced {}) | camera {}{}",
 				s_stats.vu_kicks, s_stats.vu_kicks_scanned, s_stats.vu_reentrant, s_stats.vu_windows,
 				s_stats.vu_survivors, s_stats.vu_sliced, s_stats.vu_sliced_published,
 				s_stats.cam_candidates, s_stats.cam_last_candidates, s_stats.cam_reject_split,
-				s_stats.cam_reject_score, s_stats.cam_reject_degenerate, s_stats.cam_accept,
-				s_stats.cam_accept_sliced,
+				s_stats.cam_reject_score, s_stats.cam_reject_degenerate, s_stats.cam_reject_scale,
+				s_stats.cam_reject_extent, s_stats.cam_accept, s_stats.cam_accept_sliced,
 				s_active_camera.valid ? "world score " : "view-space",
 				s_active_camera.valid ? fmt::format("{:.2f} near {:.5g}", s_active_camera.score, s_active_camera.near_plane) : "");
 		}
@@ -2646,6 +2806,7 @@ namespace RemixSubmit
 			                   (max_w < 1e-1f) ? 2 : (max_w < 1.f)   ? 3 :
 			                   (max_w < 10.f)  ? 4 : (max_w < 100.f) ? 5 : 6;
 			++s_stats.w_histogram[bucket];
+			s_frame_max_w = std::max(s_frame_max_w, max_w);
 		}
 
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
@@ -2978,6 +3139,7 @@ namespace RemixSubmit
 			{
 				s_frame_bounds.add(draw_bounds.min);
 				s_frame_bounds.add(draw_bounds.max);
+				s_frame_bounds_world = world_mode;
 			}
 
 			if (ds.is_sky)
@@ -3266,6 +3428,7 @@ namespace RemixSubmit
 		{
 			s_frame_bounds.add(draw_bounds.min);
 			s_frame_bounds.add(draw_bounds.max);
+			s_frame_bounds_world = world_mode;
 		}
 
 		++s_stats.draws_submitted;
@@ -3327,9 +3490,48 @@ namespace RemixSubmit
 		// Same one-frame latch for the measured extent: the light placed at the top of the next
 		// frame is scaled from the frame that just presented.
 		if (s_frame_bounds.valid)
+		{
+			// The rigid-transform check. A frame submitted in world space must describe the same
+			// scene, at the same size, as the view-space frames before it -- the map between the
+			// two is rigid. When it does not, the recovered matrix is some other perspective-ish
+			// matrix out of VU1 memory rather than the camera, and it will be self-consistent
+			// while placing every vertex somewhere wrong. That is the failure the internal
+			// consistency checks cannot see: SOCOM's accepted camera measures depth scale 0.9999
+			// and anisotropy 2.6x, both perfect, and still explodes the scene 1,450x.
+			if (s_frame_bounds_world && s_active_camera.valid && s_frame_max_w > 0.f)
+			{
+				const float world_radius = s_frame_bounds.radius();
+				const float ratio = world_radius / s_frame_max_w;
+
+				if (!(ratio <= camera_extent_limit()))
+				{
+					++s_stats.cam_reject_extent;
+					s_refuted_matrices.insert(s_active_camera.matrix_hash);
+
+					if (s_stats.cam_reject_extent == 1)
+					{
+						WARNING_LOG("Remix: refusing a world camera that scatters the scene -- the frame's "
+									"deepest vertex sits at w={:.4g}, so the visible geometry cannot span more "
+									"than a few times that, and this camera un-projects it to radius {:.4g} "
+									"({:.0f}x, limit {:g}x). Its depth scale and anisotropy are both fine, so "
+									"this is the wrong matrix rather than a mis-scaled one. Staying in "
+									"view-space; raise PCSX2_REMIX_CAMEXTENT to override.",
+							s_frame_max_w, world_radius, ratio, camera_extent_limit());
+					}
+
+					s_active_camera = world_camera{};
+					s_camera_last_accept_frame = 0;
+					s_logged_world_camera = false;
+				}
+			}
+
 			s_last_bounds = s_frame_bounds;
+			s_last_bounds_world = s_frame_bounds_world;
+		}
 
 		s_frame_bounds = scene_bounds{};
+		s_frame_bounds_world = false;
+		s_frame_max_w = 0.f;
 
 		resolve_world_camera();
 
@@ -3434,6 +3636,10 @@ namespace RemixSubmit
 		s_last_viewport = viewport_constants{};
 		s_frame_bounds = scene_bounds{};
 		s_last_bounds = scene_bounds{};
+		s_frame_bounds_world = false;
+		s_last_bounds_world = false;
+		s_frame_max_w = 0.f;
+		s_refuted_matrices.clear();
 
 		// The beacon must not fire just because the first frames after a load submit nothing.
 		s_empty_frame_streak = 0;
@@ -3489,6 +3695,10 @@ namespace RemixSubmit
 		s_last_viewport = viewport_constants{};
 		s_frame_bounds = scene_bounds{};
 		s_last_bounds = scene_bounds{};
+		s_frame_bounds_world = false;
+		s_last_bounds_world = false;
+		s_frame_max_w = 0.f;
+		s_refuted_matrices.clear();
 		s_camera_last_accept_frame = 0;
 		s_logged_world_camera = false;
 		s_light_placed = false;
