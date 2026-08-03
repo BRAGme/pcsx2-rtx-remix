@@ -17,8 +17,17 @@ param(
     [int]$Stable = 0,
     [int]$DebugView = 0,
     [int]$Warmup = 18,        # long enough that startup is definitively survived
-    [int]$Presses = 8,
-    [int]$PressGapMs = 2500,
+    # MEASURED on D3D11, where the screen is actually visible: slot 3 is the KINGFISHER mission
+    # BRIEFING (objectives list, gold three-pointed emblem at the bottom -- the thing that renders
+    # as a giant blown-out triangle in Remix mode). Exactly ONE Cross press loads the mission.
+    #
+    # The old default of 8-10 presses at a 2.2 s gap is why entry was unreliable: the mission takes
+    # longer than one gap to load, so presses kept landing during the load and then in-game --
+    # pausing, firing, opening menus. Press once, then WAIT for entry rather than pressing again.
+    [int]$Presses = 3,
+    [int]$PressGapMs = 8000,
+    # Seconds to wait for the mission to load after a press before giving up and pressing again.
+    [int]$EntryWaitSec = 100,
     [int]$SettleSec = 25,     # after entry, let the mission run and accumulate
     [hashtable]$Extra = @{}
 )
@@ -133,13 +142,41 @@ Write-Output ("menu survived {0}s, focused={1}, frame={2}, maxpos={3}" -f $Warmu
 
 # Blind Cross presses. The menu cannot be seen, so watch scene extent for mission entry.
 $entered = $false
-for ($i = 1; $i -le $Presses; $i++) {
-    if (-not (Alive $p)) { Write-Output "DIED DURING NAV after $i presses"; break }
-    Tap 0x0D    # Return -> Cross
-    Start-Sleep -Milliseconds $PressGapMs
+# The variable is ELAPSED TIME, not press count, and it took three arms to establish that:
+#
+#   presses every 2.2 s, 8-10 of them (~25 s total)   entered ~1 in 4
+#   one press then a 24 s poll, repeated (~75 s)      entered 3 of 5   <-- press 3 always took
+#   4 presses front-loaded 2.5 s apart (~32 s)        entered 0 of 6
+#
+# Front-loading fails and long-spacing works, so the briefing simply does not accept input until
+# roughly 70 s of wall time. On D3D11 one press at 20 s sufficed, because it runs at 59.93 fps
+# against 28-40 here -- the briefing's own timeline advances in game frames, so Remix's lower
+# framerate stretches it in wall-clock.
+#
+# So: keep pressing across a long window, checking between presses. Total exposure is ~2 minutes,
+# which slot 3 tolerates -- it is the light scene, and it is the mission states that die in ~5 s.
+$deadline = $EntryWaitSec
+$elapsed = 0
+$press = 0
+while ($elapsed -lt $deadline) {
+    if (-not (Alive $p)) { Write-Output ("  died during nav at t+{0}s" -f $elapsed); break }
+
     $ext = SceneExtent
-    Write-Output ("  press {0}: frame={1} maxpos={2}" -f $i, (LastFrame), $ext)
-    if ($ext -gt 1000) { Write-Output "  -> MISSION ENTERED (scene extent $ext)"; $entered = $true; break }
+    if ($ext -gt 1000) {
+        Write-Output ("  -> MISSION ENTERED at t+{0}s after {1} press(es) (extent {2}, frame {3})" `
+            -f $elapsed, $press, $ext, (LastFrame))
+        $entered = $true
+        break
+    }
+
+    Tap 0x0D    # Return -> Cross
+    $press++
+    Start-Sleep -Milliseconds $PressGapMs
+    $elapsed += [int]($PressGapMs / 1000)
+}
+
+if (-not $entered -and (Alive $p)) {
+    Write-Output ("  no entry within {0}s after {1} presses (maxpos {2})" -f $deadline, $press, (SceneExtent))
 }
 
 if ($entered -and (Alive $p)) {

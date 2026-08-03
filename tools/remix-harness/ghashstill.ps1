@@ -21,7 +21,10 @@ param(
     [int]$Warmup = 20,
     [int]$Shots = 4,
     [int]$GapMs = 2000,
-    [string]$TitleMatch = "Rainbow Six 3"
+    [string]$TitleMatch = "Rainbow Six 3",
+    # Arbitrary PCSX2_REMIX_* overrides, applied after the stale-env clear so they win.
+    # Same idiom as arm.ps1 -Env and deploy.ps1 -Extra.
+    [hashtable]$Extra = @{}
 )
 
 $scratch = "C:\Users\Tristan\AppData\Local\Temp\claude\C--Users-Tristan-Documents-GitHub\867daea0-c913-4e87-8427-856883dcdb0c\scratchpad"
@@ -69,6 +72,8 @@ foreach ($n in @('REUSEHANDLE','REUSEPOOL','INSTBUDGET','NODRAWINSTANCE','SUBMIT
 $env:PCSX2_REMIX_STABLEID = "$Stable"
 $env:PCSX2_REMIX_STATSFRAMES = "120"
 $env:PCSX2_REMIX_TEXDUMP = "0"
+# Applied last so an explicit -Extra beats both the clear list and the defaults above.
+foreach ($k in $Extra.Keys) { Set-Item -Path "Env:PCSX2_REMIX_$k" -Value ([string]$Extra[$k]) }
 if ($DebugView -gt 0) { $env:DXVK_RTX_DEBUG_VIEW_INDEX = "$DebugView" }
 else { Remove-Item Env:DXVK_RTX_DEBUG_VIEW_INDEX -EA SilentlyContinue }
 

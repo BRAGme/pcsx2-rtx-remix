@@ -30,7 +30,36 @@ and 2 load the full mission straight into the fragile window and die in ~5 s. Be
 there was no way to measure or capture SOCOM in-mission at all — every arm died first.
 
 The menu is invisible in Remix mode (D3D11 is surfaceless, sprites are never submitted), so it
-navigates blind and detects mission entry from `maxpos` crossing ~1000. Budget ~8 attempts.
+navigates blind and detects mission entry from `maxpos` crossing ~1000. Budget ~5 attempts for a
+*settled* mission (`seen > 150000`).
+
+### To see a menu at all: boot it on D3D11
+
+Set `Renderer = 3` in `bin\inis\PCSX2.ini` and the screen renders normally. This is how the
+navigation was worked out, and it is the way to answer any "what is on screen" question that the
+Remix path cannot. It also gives a **reference image of what the game is supposed to look like**,
+which is worth having next to a Remix capture.
+
+Established that way: **slot 3 is the KINGFISHER mission briefing** — objectives list, and a gold
+three-pointed emblem at the bottom which is what renders as a giant blown-out triangle in Remix
+mode. On D3D11 at 59.93 fps, **one Cross press ~20 s in loads the mission**.
+
+### Entry is limited by the GPU hang, not by navigation
+
+Four strategies, and the honest summary is that only the bad one is distinguishable:
+
+| approach | entered |
+|---|---|
+| 8–10 presses @2.2 s (~25 s total) | ~1 / 4 |
+| one press then a 24 s poll, repeated (~75 s) | 3 / 5 |
+| 4 presses front-loaded @2.5 s (~32 s) | **0 / 6** |
+| periodic presses @5 s across 110 s | 1 / 5 |
+
+Front-loading clearly fails, so a press has to land late; but entry has also been observed at
+t+20 s, so there is no fixed threshold to hit. The failures are overwhelmingly `died during nav` —
+pressing Cross starts loading heavy mission geometry, and *that* is what triggers the hang. **Do not
+spend more time tuning the key sequence; the ceiling is the upstream crash.** Current defaults
+(8 s gap across a 100 s window) are a reasonable middle, not an optimum.
 
 ## Traps these encode — all of them cost time
 
