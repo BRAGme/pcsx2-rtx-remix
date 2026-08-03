@@ -46,6 +46,16 @@ namespace remix_ps2
 		// draw. Never throws and never asserts: any failure degrades to a null material.
 		binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame);
 
+		// The content hash for a source, computed and nothing else -- no texture upload, no
+		// material, no budget consumed, no cache entry.
+		//
+		// For draws that are REJECTED before bind() but whose texture still matters. Rainbow Six 3's
+		// lightmap is the case: it arrives on masked multi-pass draws that the FBMSK gate drops, so
+		// the texture never becomes a Remix material and its hash -- the value a modder types into
+		// rtx.conf, and the key the emissive and category lists match on -- was never computed at
+		// all. Returns 0 when there is no hashable source.
+		u64 hash_only(const GSTextureCache::Source* source);
+
 		// One shared white material for untextured draws.
 		//
 		// Since untextured draws started being submitted rather than dropped (PCSX2_REMIX_UNTEXZ),

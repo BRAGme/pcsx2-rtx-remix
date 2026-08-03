@@ -1172,6 +1172,33 @@ namespace remix_ps2::materials
 		return it->second;
 	}
 
+	u64 hash_only(const GSTextureCache::Source* source)
+	{
+		if (!source || source->m_target || source->m_from_target)
+			return 0;
+
+		const GIFRegTEX0& TEX0 = source->m_TEX0;
+		const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
+
+		// Identical to the computation in bind(), deliberately -- a hash that did not match would be
+		// useless for tagging, since the emissive and category lists key on bind()'s value.
+		const u32* clut = (psm.pal > 0) ? static_cast<const u32*>(g_gs_renderer->m_mem.m_clut) : nullptr;
+		const GSVector2i* lod =
+			(GSConfig.HWMipmap || GSConfig.TriFilter == TriFiltering::Forced) ? &source->m_lod : nullptr;
+
+		const GSTextureCache::HashCacheKey key =
+			GSTextureCache::HashCacheKey::Create(TEX0, source->m_TEXA, clut, lod, source->m_region);
+
+		u64 content_hash = fnv_seed;
+		{
+			const u64* words = reinterpret_cast<const u64*>(&key);
+			for (u32 i = 0; i < (sizeof(GSTextureCache::HashCacheKey) / sizeof(u64)); ++i)
+				content_hash = fnv_mix(content_hash, words[i]);
+		}
+
+		return (content_hash == 0) ? 1 : content_hash;
+	}
+
 	binding bind_untextured(const runtime& rt)
 	{
 		// A fixed, arbitrary hash. It is not a content hash -- there is no content -- but it must

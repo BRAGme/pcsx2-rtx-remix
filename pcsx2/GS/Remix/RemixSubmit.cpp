@@ -2777,6 +2777,97 @@ namespace RemixSubmit
 
 		u64 s_fbmsk_dumped = 0;
 
+		// --- lightmap discovery -------------------------------------------------------------
+		//
+		// PCSX2_REMIX_LIGHTMAPS (default 1) records the content hash of every texture that arrives
+		// on a masked multi-pass draw, and writes the set to logs\remix_lightmaps.txt at shutdown
+		// and whenever it grows.
+		//
+		// These hashes are the values a modder types into rtx.conf, and the keys the emissive and
+		// category lists match on -- and until now they were never computed for these textures at
+		// all, because the FBMSK gate rejects the draw before materials::bind() runs. On Rainbow
+		// Six 3 that is the entire level lighting: the title has no runtime lights.
+		//
+		// Deliberately writes a REPORT and does not touch the per-game conf. The conf is a file the
+		// user edits by hand, and an emulator silently rewriting it while the game runs is how edits
+		// get lost. The report is meant to be reviewed and merged.
+		int lightmap_discovery_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_LIGHTMAPS", 1), 0, 1));
+			return value;
+		}
+
+		struct lightmap_entry
+		{
+			u64 hash = 0;
+			u32 tbp0 = 0;
+			u32 cbp = 0;
+			u32 psm = 0;
+			u32 width = 0;
+			u32 height = 0;
+			u32 mask = 0;
+			u64 draws = 0;
+		};
+
+		std::unordered_map<u64, lightmap_entry> s_lightmaps;
+		bool s_lightmaps_dirty = false;
+
+		void write_lightmap_report()
+		{
+			if (s_lightmaps.empty())
+				return;
+
+			const std::string path = Path::Combine(EmuFolders::Logs, "remix_lightmaps.txt");
+			std::FILE* file = FileSystem::OpenCFile(path.c_str(), "w");
+			if (!file)
+				return;
+
+			// Sorted, so the file is stable across runs and diffable -- an unordered_map's order is
+			// not, and a report that reshuffles every session cannot be compared to the last one.
+			std::vector<const lightmap_entry*> sorted;
+			sorted.reserve(s_lightmaps.size());
+			for (const auto& [key, entry] : s_lightmaps)
+				sorted.push_back(&entry);
+			std::sort(sorted.begin(), sorted.end(),
+				[](const lightmap_entry* a, const lightmap_entry* b) { return a->hash < b->hash; });
+
+			std::fprintf(file,
+				"# Lightmap textures discovered on masked multi-pass draws.\n"
+				"#\n"
+				"# These arrive on draws the FBMSK gate rejects, so they never become Remix materials\n"
+				"# and cannot be tagged in the developer menu. Rainbow Six 3 encodes a full-colour\n"
+				"# lightmap as ONE index texture plus THREE CLUTs, one per colour channel, because the\n"
+				"# PS2 blend equation (A-B)*C+D takes C from an alpha source and so cannot multiply by\n"
+				"# per-channel colour. Each distinct cbp below is one channel of the same lightmap.\n"
+				"#\n"
+				"# %zu distinct textures this session.\n"
+				"#\n"
+				"# hash               tbp0    cbp     psm   size      mask        draws\n",
+				s_lightmaps.size());
+
+			for (const lightmap_entry* e : sorted)
+			{
+				std::fprintf(file, "0x%016llX   0x%04x  0x%04x  0x%02x  %4ux%-4u  0x%08x  %llu\n",
+					static_cast<unsigned long long>(e->hash), e->tbp0, e->cbp, e->psm,
+					e->width, e->height, e->mask, static_cast<unsigned long long>(e->draws));
+			}
+
+			// Ready to paste into the per-game conf. Not written there automatically on purpose.
+			std::fprintf(file, "\n# Paste into <SERIAL>.conf to tag them, e.g.:\n# rtx.emissiveTextures = ");
+			bool first = true;
+			for (const lightmap_entry* e : sorted)
+			{
+				std::fprintf(file, "%s0x%016llX", first ? "" : ", ",
+					static_cast<unsigned long long>(e->hash));
+				first = false;
+			}
+			std::fprintf(file, "\n");
+
+			std::fclose(file);
+			INFO_LOG("Remix: wrote {} discovered lightmap textures to {}", s_lightmaps.size(), path);
+		}
+
 		void fbmsk_dump_write(const std::string& line)
 		{
 			static std::FILE* file = nullptr;
@@ -3139,6 +3230,15 @@ namespace RemixSubmit
 			if (!force && (s_frame_counter == 0 || (s_frame_counter % stats_interval_frames()) != 0))
 				return;
 
+			// Flushed here rather than only at shutdown: device loss calls exit() and the clean
+			// shutdown path never runs, which is how every other end-of-session report on this
+			// project has been lost.
+			if (s_lightmaps_dirty)
+			{
+				write_lightmap_report();
+				s_lightmaps_dirty = false;
+			}
+
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} | "
@@ -3413,6 +3513,35 @@ namespace RemixSubmit
 		{
 			++s_stats.skip_fbmsk;
 
+			// Record the lightmap this pass carries. The source is available here -- it is bind()
+			// that is skipped, not the source -- so the hash can be computed without uploading
+			// anything. See lightmap_discovery_mode().
+			if (lightmap_discovery_mode() != 0)
+			{
+				const GSTextureCache::Source* const masked_source =
+					static_cast<const GSTextureCache::Source*>(tex_source);
+				const u64 lm_hash = remix_ps2::materials::hash_only(masked_source);
+
+				if (lm_hash != 0)
+				{
+					auto [it, inserted] = s_lightmaps.try_emplace(lm_hash);
+					lightmap_entry& e = it->second;
+					if (inserted)
+					{
+						const GIFRegTEX0& lt = r.m_cached_ctx.TEX0;
+						e.hash = lm_hash;
+						e.tbp0 = static_cast<u32>(lt.TBP0);
+						e.cbp = static_cast<u32>(lt.CBP);
+						e.psm = static_cast<u32>(lt.PSM);
+						e.width = 1u << static_cast<u32>(lt.TW);
+						e.height = 1u << static_cast<u32>(lt.TH);
+						e.mask = static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK);
+						s_lightmaps_dirty = true;
+					}
+					++e.draws;
+				}
+			}
+
 			// PCSX2_REMIX_FBMSKDUMP=N: dump the first N masked draws to logs\remix_fbmsk.txt.
 			//
 			// These never reach materials::bind(), so the lightmap they carry is never created as a
@@ -3426,6 +3555,15 @@ namespace RemixSubmit
 				const GIFRegTEX0& t0 = r.m_cached_ctx.TEX0;
 				const GIFRegALPHA& al = r.m_context->ALPHA;
 
+				// Why hash_only() refused, if it did. A masked pass whose texture is a render TARGET
+				// has no stable content identity and can never be tagged -- that would mean the
+				// lightmap is generated into the framebuffer rather than being an asset.
+				const GSTextureCache::Source* const dbg_src =
+					static_cast<const GSTextureCache::Source*>(tex_source);
+				const char* src_state = !dbg_src ? "null" :
+					(dbg_src->m_target ? "target" : (dbg_src->m_from_target ? "from_target" : "ok"));
+				const u64 dbg_hash = remix_ps2::materials::hash_only(dbg_src);
+
 				// CLUT and ALPHA are the fields that decide the whole design. All three passes bind
 				// the SAME texture page, and three identical samples masked to different channels
 				// would only ever write greyscale -- so something must differ per pass. The PS2
@@ -3438,7 +3576,7 @@ namespace RemixSubmit
 					"f={} mask=0x{:08x} verts={} tris={} | tex tbp0=0x{:x} tbw={} psm=0x{:02x} "
 					"tw={} th={} tcc={} tfx={} | clut cbp=0x{:x} cpsm=0x{:02x} csm={} csa={} cld={} | "
 					"alpha A={} B={} C={} D={} FIX={} | ate={} abe={} depth(r={} w={}) | "
-					"px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{}",
+					"px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | src={} hash=0x{:016x}",
 					s_frame_counter, static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK),
 					r.m_vertex->next, r.m_index->tail / 3,
 					static_cast<u32>(t0.TBP0), static_cast<u32>(t0.TBW), static_cast<u32>(t0.PSM),
@@ -3451,7 +3589,7 @@ namespace RemixSubmit
 					static_cast<u32>(r.m_cached_ctx.TEST.ATE), static_cast<u32>(r.PRIM->ABE),
 					r.m_cached_ctx.DepthRead() ? 1 : 0, r.m_cached_ctx.DepthWrite() ? 1 : 0,
 					r.m_vt.m_min.p.x, r.m_vt.m_max.p.x, r.m_vt.m_min.p.y, r.m_vt.m_max.p.y,
-					rt_unscaled_width, rt_unscaled_height));
+					rt_unscaled_width, rt_unscaled_height, src_state, dbg_hash));
 			}
 
 			return;
