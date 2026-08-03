@@ -1,0 +1,69 @@
+# RTX Remix backend test harness
+
+Measurement scripts for the `remix-backend` branch. Committed because they previously lived only in
+a `%TEMP%` scratchpad, where a cleanup would have destroyed them — several encode measurements and
+traps that cost real time to find.
+
+Every script assumes the repo build at `..\..\bin`. Paths inside them point at a session scratchpad
+that will not exist on a fresh checkout; repoint `$scratch` at the top of the ones that use it.
+
+## The scripts
+
+| script | what it does |
+|---|---|
+| `build.cmd` | `vcvars64.bat` + `msbuild PCSX2_qt.sln /m /p:Configuration=Release /p:Platform=x64`. `clang-cl` is absent on this machine so the `CMakePresets.json` presets are unusable. |
+| `deploy.ps1` | **The important one.** Boots SOCOM's deploy menu (slot 3), survives the startup window there, then presses Cross to load into the mission from an already-stable session. |
+| `ghashstill.ps1` | N stills with **zero input**, so a frame-to-frame diff measures churn rather than a changed view. |
+| `rotwalk.ps1` | Motion arm: stills, a 360° turn in three steps, then walk forward/back, capturing at each stage. Installs temporary keyboard pad bindings and restores them. |
+| `arm.ps1` | Survival accounting over N launches. For crash arms only. |
+| `capture.ps1` | DPI-aware `PrintWindow(PW_RENDERFULLCONTENT)` of the render window. |
+| `send.ps1` | Keyboard input via `keybd_event`. Keyboard only — no mouse-look. |
+| `colmetric.py` | Single-image metric: `lit_px`, `mean_sat`, `mean_lum`, `coloured_px`. |
+| `imgdiff.py` | Two-image mean-\|diff\|. Handles the capture size mismatch. |
+| `diffmask.py` | Saves a mask of *where* two captures differ, plus a row/column profile. |
+
+## Why `deploy.ps1` exists
+
+The `0x60D0DEAD` GPU hang lands within a fraction of a second of `renderer is live`, and **surviving
+that window buys minutes**. Slot 3 is a light scene (~3 draws/frame) that boots reliably; slots 1
+and 2 load the full mission straight into the fragile window and die in ~5 s. Before this route
+there was no way to measure or capture SOCOM in-mission at all — every arm died first.
+
+The menu is invisible in Remix mode (D3D11 is surfaceless, sprites are never submitted), so it
+navigates blind and detects mission entry from `maxpos` crossing ~1000. Budget ~8 attempts.
+
+## Traps these encode — all of them cost time
+
+- **`capture.ps1 -TitleMatch "."` captures PCSX2 *dialogs*, not the game.** Any title matches, and it
+  saves whichever window has the most non-black pixels, so a Settings dialog full of white text beats
+  a dim path-traced scene. Seven "motion" captures were the Settings dialog. Always pass a real
+  title; a `WRONG_WINDOW` guard now exits 3 rather than returning a plausible wrong image.
+- **`PrintWindow` intermittently returns black** on the Remix surface, roughly alternating
+  (`lit_px` 2,343,600 / 11,100 / 0). **Gate every image comparison on `lit_px`** or it measures
+  "unrendered vs rendered" and reports a meaningless ~125/255.
+- **Capture size is not constant within a run** — 2100x1240 vs 2100x1332, the extra rows a title bar
+  at the top. `imgdiff.py` crops to the common size and tries both anchors.
+- **Never trust bare `Get-Process` for liveness.** Windows leaves zombies with 0 threads and 0 CPU
+  that make `[bool](Get-Process ...)` return `True`; this produced two false "it survived" reports.
+  Assert `Threads.Count -gt 0` *and* an advancing `Remix: frame` in `emulog.txt`.
+- **Exit codes are signed.** `0xFEFEFEFE` arrives as `-16843010` and throws on `[uint32]`, which
+  suppresses the `DIED` line and makes a crashed run look like a survival.
+- **`bin\sstates` and the deployed `sstates` are not in sync.** A missing state gives
+  `ReportErrorAsync: Startup Error` — an audible Windows error beep and a **clean exit 0 in ~1.5 s**.
+  That is a missing save state, not the GPU hang; `0x60D0DEAD` at ~5 s is the hang.
+- **A build can silently fail to link** with `LNK1104: cannot open file pcsx2-qtx64.exe` when a
+  running PCSX2 holds the exe, and the next arm then measures the *old* binary. **Check the exe
+  timestamp moved before trusting a result.**
+- **Run-to-run variance on identical code measured `mean_lum` 59.9 -> 98.0.** Larger than most
+  changes produce. Use a binary instrument (the albedo debug view reads 0 or ~580,000) or many runs
+  — never a single normal-view capture.
+- **Measuring from a menu is worthless**, and the slot labels lied about which state was which:
+  **slot 2 and slot 1 are in-mission, slot 3 is the deploy menu.**
+
+## Useful debug views
+
+`DXVK_RTX_DEBUG_VIEW_INDEX=<n>`, verified working for API-submitted geometry:
+
+- `23` — albedo. Validated against Rainbow Six 3 (`lit_px` 2,421,139, `mean_lum` 111) before being
+  trusted on a null reading.
+- `277` — geometry hash. Flat colour per object; colours reshuffling between frames means churn.
