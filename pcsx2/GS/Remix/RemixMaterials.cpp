@@ -109,6 +109,23 @@ namespace remix_ps2::materials
 			return value;
 		}
 
+		// PCSX2_REMIX_ALBEDOPROBE=1 sets every material's albedoConstant to magenta while leaving its
+		// albedoTexture alone.
+		//
+		// The discriminator for "why are there no textures". If surfaces render with texture detail,
+		// the pseudo-path albedo resolves and the flatness is elsewhere. If they render MAGENTA, the
+		// texture is not resolving and Remix is falling back to the constant.
+		//
+		// This exists because the earlier conclusion that the pseudo-path resolves was CONFOUNDED: the
+		// untextured material was given a white 4x4 texture AND a white albedoConstant, so albedo
+		// going from 0 (nullptr) to ~580,000 is equally consistent with the texture resolving or with
+		// the constant being used once a path is merely named. Same colour either way, no information.
+		bool albedo_probe()
+		{
+			static const bool value = read_env_int(L"PCSX2_REMIX_ALBEDOPROBE", 0) != 0;
+			return value;
+		}
+
 		bool textures_linear()
 		{
 			static const bool value = read_env_int(L"PCSX2_REMIX_TEXLINEAR", 0) != 0;
@@ -745,7 +762,7 @@ namespace remix_ps2::materials
 			opaque.roughnessTexture = nullptr;
 			opaque.metallicTexture = nullptr;
 			opaque.anisotropy = 0.f;
-			opaque.albedoConstant = {1.f, 1.f, 1.f};
+			opaque.albedoConstant = albedo_probe() ? remixapi_Float3D{1.f, 0.f, 1.f} : remixapi_Float3D{1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
 			opaque.roughnessConstant = 0.7f;
 			opaque.metallicConstant = 0.f;
@@ -833,7 +850,7 @@ namespace remix_ps2::materials
 
 			remixapi_MaterialInfoOpaqueEXT opaque{};
 			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
-			opaque.albedoConstant = {1.f, 1.f, 1.f};
+			opaque.albedoConstant = albedo_probe() ? remixapi_Float3D{1.f, 0.f, 1.f} : remixapi_Float3D{1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
 			opaque.roughnessConstant = 0.7f;
 			opaque.metallicConstant = 0.f;
@@ -1269,7 +1286,7 @@ namespace remix_ps2::materials
 			opaque.metallicTexture = nullptr;
 			opaque.anisotropy = 0.f;
 			// White, so the per-vertex RGBAQ colour is what decides the surface colour.
-			opaque.albedoConstant = {1.f, 1.f, 1.f};
+			opaque.albedoConstant = albedo_probe() ? remixapi_Float3D{1.f, 0.f, 1.f} : remixapi_Float3D{1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
 			opaque.roughnessConstant = 0.7f;
 			opaque.metallicConstant = 0.f;
