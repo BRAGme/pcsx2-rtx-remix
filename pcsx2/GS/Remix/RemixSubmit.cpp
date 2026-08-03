@@ -89,6 +89,11 @@ namespace RemixSubmit
 			u64 skip_untextured = 0; // !m_process_texture: nothing pins Q to anything
 			u64 skip_fst = 0; // PRIM->FST: UVs, so Q is not the perspective divisor
 			u64 fst_recovered = 0; // FST=1 draws submitted with depth recovered from Z
+			// Untextured draws submitted with depth recovered from Z. Measured on SOCOM Combined
+			// Assault in-mission: untex was 4,395,585 of 8,417,784 draws seen -- 52% of the scene
+			// and 96% of every skip -- so this counter is the one that says whether half the world
+			// is reaching Remix or not.
+			u64 untex_recovered = 0;
 			u64 fst_flat = 0; // FST=1 draws rejected for constant Z (no depth to recover)
 			u64 skip_const_q = 0; // m_vt.m_eq.q: one Q for the whole draw => 2D/HUD
 			u64 warn_inaccurate_stq = 0; // m_vt.m_accurate_stq: Q precision already suspect
@@ -733,6 +738,30 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// UNTEXZ: 1 (default) = recover *untextured* draws from Z as well, on the same calibration
+		// and the same R^2 gate as FSTZ above.
+		//
+		// This is the largest single visual lever measured on this backend. An untextured draw has
+		// no Q at all -- TME=0 means nothing ever wrote one -- so before this it was dropped
+		// outright, and on SOCOM Combined Assault in-mission that was 4,395,585 of 8,417,784 draws
+		// seen: 52% of the scene, and 96% of every skip. Half the world was missing, which is what
+		// the user was seeing as geometry "shredded" into disconnected shards -- the surviving
+		// textured fragments floating in the gaps left by the dropped half. The submitted geometry
+		// itself was never displaced: the hyperextension counter read peak 2.6x against a 32x line
+		// through all of it.
+		//
+		// Safe to default on for the same reason FSTZ is: the gate is the *fit*, not a title list.
+		// SOCOM's Z predicts Q with R^2 = 1.00000 over 1.5M vertices, so recovery is essentially
+		// exact there, while Rainbow Six 3 sits at 0.13231 and therefore keeps today's behaviour
+		// without anything having to know which title it is.
+		int untex_z_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_UNTEXZ", 1), 0, 1));
+
+			return value;
+		}
+
 		// Per-frame retention of the Z->w accumulator. 0.9 gives an effective window of roughly
 		// ten frames, which at thousands of calibration vertices per frame is still an enormous
 		// sample. 1.0 restores the session-wide behaviour for comparison.
@@ -783,11 +812,34 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// Minimum accumulated vertices before the calibration may be *used*. z_fit::solve only
+		// requires 32, which is one small draw's worth -- and a single near-planar draw fits a
+		// line at R^2 ~ 1 trivially, so that floor lets a burst through before any real evidence
+		// exists. Measured: Rainbow Six 3, whose Z is genuinely unusable (R^2 0.48 over 30,210
+		// vertices), still recovered 12 untextured draws through exactly that hole.
+		//
+		// 4096 is well above one draw but reached within a frame or two of real geometry, and the
+		// accumulator decays at 0.9/frame so steady state is ~10x the per-frame sample count. For
+		// scale: SOCOM fits over 1,548,714 vertices, Rainbow Six 3 over 6,228,855.
+		double fst_z_min_samples()
+		{
+			static const double value = []() -> double {
+				const double parsed = static_cast<double>(
+					remix_ps2::read_env_int(L"PCSX2_REMIX_FSTZMINN", 4096));
+				return (parsed >= 32.0) ? parsed : 4096.0;
+			}();
+
+			return value;
+		}
+
 		// The live calibration, or false while it is not yet good enough. Re-solved per draw;
 		// it is a handful of flops against an accumulator that only grows.
 		bool fst_z_solution(double& a, double& b)
 		{
 			if (fst_z_mode() == 0)
+				return false;
+
+			if (s_zfit.n < fst_z_min_samples())
 				return false;
 
 			double r2 = 0.0;
@@ -2991,13 +3043,16 @@ namespace RemixSubmit
 				const bool live = fst_z_solution(ua, ub);
 
 				INFO_LOG("Remix: Z->w fit over {:.0f} vertices | A (Q = a*zn+b): {} | B (w = a*zn+b): {} "
-						 "| FST recovery {} (gate R2 >= {:g}), fst recovered {} skipped {}",
+						 "| FST recovery {} (gate R2 >= {:g}), fst recovered {} skipped {} "
+						 "| UNTEX recovery {}, untex recovered {} still-skipped {}",
 					s_zfit.n,
 					ok_a ? fmt::format("a={:.6g} b={:.6g} R2={:.5f}", a, b, r2) : std::string("insufficient"),
 					ok_b ? fmt::format("a={:.6g} b={:.6g} R2={:.5f}", a2, b2, r2b) : std::string("insufficient"),
 					(fst_z_mode() == 0) ? "OFF" : (live ? "ACTIVE" : "waiting/rejected"),
 					fst_z_min_r2(), s_stats.fst_recovered,
-					fmt::format("{} (flat-Z {})", s_stats.skip_fst, s_stats.fst_flat));
+					fmt::format("{} (flat-Z {})", s_stats.skip_fst, s_stats.fst_flat),
+					(untex_z_mode() == 0) ? "OFF" : (live ? "ACTIVE" : "waiting/rejected"),
+					s_stats.untex_recovered, s_stats.skip_untextured);
 			}
 
 			// Vertex colour. The whole vertex-colour-baking question is decided by whether these
@@ -3130,7 +3185,20 @@ namespace RemixSubmit
 
 		// Q only means "the perspective divisor" when the draw is textured with ST/Q. With
 		// TME=0 nothing ever wrote a meaningful Q, and with FST=1 the guest fed UVs instead.
-		if (!r.m_process_texture)
+		//
+		// Neither is fatal any more: both classes can take their depth from Z instead, on the
+		// calibration fitted continuously from the textured FST=0 draws. What they cannot do is
+		// take it from Q, so they share one flag from here on.
+		double fst_z_a = 0.0;
+		double fst_z_b = 0.0;
+		const bool untex_draw = !r.m_process_texture;
+		const bool fst_draw = !untex_draw && (r.PRIM->FST != 0);
+		const bool z_depth = untex_draw || fst_draw;
+
+		// Untextured: no texture means no Q was ever written, and also no material -- these come
+		// back from materials::bind() with the null binding and shade like Rainbow Six 3's white
+		// geometry. Untextured-and-placed beats absent, which is what dropping them amounted to.
+		if (untex_draw && (untex_z_mode() == 0 || !fst_z_solution(fst_z_a, fst_z_b)))
 		{
 			++s_stats.skip_untextured;
 			return;
@@ -3139,10 +3207,6 @@ namespace RemixSubmit
 		// FST=1: the guest fed direct UV texels, so Q is not the perspective divisor. Recoverable
 		// only if this title's Z has been shown to be a usable depth (see fst_z_solution), which
 		// is measured continuously from the FST=0 draws rather than assumed.
-		double fst_z_a = 0.0;
-		double fst_z_b = 0.0;
-		const bool fst_draw = (r.PRIM->FST != 0);
-
 		if (fst_draw && !fst_z_solution(fst_z_a, fst_z_b))
 		{
 			++s_stats.skip_fst;
@@ -3156,11 +3220,14 @@ namespace RemixSubmit
 		// screen-aligned and has constant Z, whereas world geometry under a perspective
 		// projection does not. It is the same trade this gate already makes -- flat geometry
 		// viewed exactly head-on is lost -- applied to the only varying quantity FST draws have.
-		if (fst_draw ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q)
+		// Applies to every Z-depth draw, textured or not: for an untextured draw Q is not merely
+		// the wrong divisor, it was never written, so testing it would pass everything through.
+		if (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q)
 		{
 			// Counted separately: "how many FST draws have no depth variation at all" is the
 			// number that decides whether depth-from-Z can recover geometry for this title or
-			// only ever produces camera-facing flats.
+			// only ever produces camera-facing flats. Untextured flats go to the const-depth
+			// bucket, which is the same finding this gate always reported.
 			if (fst_draw)
 				++s_stats.fst_flat;
 			else
@@ -3321,7 +3388,7 @@ namespace RemixSubmit
 			// Q = a*zn + b fitted on this title's FST=0 draws. Non-positive or non-finite
 			// results fall out at the same finite check -- Z below the far plane inverts to a
 			// negative w, and rejecting it is correct.
-			const float q = fst_draw ?
+			const float q = z_depth ?
 				static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
 				v.RGBAQ.Q;
 			const float w = 1.0f / q;
@@ -3349,8 +3416,10 @@ namespace RemixSubmit
 			out.normal[0] = 0.f;
 			out.normal[1] = 0.f;
 			out.normal[2] = -1.f;
-			out.texcoord[0] = fst_draw ? (static_cast<float>(v.U) * fst_inv_w) : (v.ST.S * w);
-			out.texcoord[1] = fst_draw ? (static_cast<float>(v.V) * fst_inv_h) : (v.ST.T * w);
+			// An untextured draw has no texture to coordinate against, and TEX0.TW/TH are stale,
+			// so fst_inv_w/h would be meaningless here. Zero, and let the null material shade it.
+			out.texcoord[0] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.U) * fst_inv_w) : (v.ST.S * w));
+			out.texcoord[1] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.V) * fst_inv_h) : (v.ST.T * w));
 			// PS2 alpha is 0..128 (0x80 == 1.0); scale into 0..255 for a D3DCOLOR-style ARGB.
 			const u32 alpha = std::min<u32>(255u, static_cast<u32>(v.RGBAQ.A) * 2u);
 			out.color = (alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
@@ -3392,7 +3461,10 @@ namespace RemixSubmit
 			min_z = std::min(min_z, static_cast<u32>(v.XYZ.Z));
 			max_z = std::max(max_z, static_cast<u32>(v.XYZ.Z));
 
-			if (!fst_draw)
+			// Only draws whose w came from Q may feed the Q-from-Z fit. Feeding a Z-derived w back
+			// in would be circular -- the fit would be regressing its own output and would report a
+			// perfect R^2 no matter how wrong it was. z_depth, not !fst_draw, for that reason.
+			if (!z_depth)
 				draw_zfit.add(static_cast<double>(v.XYZ.Z) * zfit_scale, static_cast<double>(w));
 		}
 
@@ -3473,6 +3545,8 @@ namespace RemixSubmit
 
 			if (fst_draw)
 				++s_stats.fst_recovered;
+			else if (untex_draw)
+				++s_stats.untex_recovered;
 		}
 
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
