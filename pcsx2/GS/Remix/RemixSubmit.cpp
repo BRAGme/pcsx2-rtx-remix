@@ -373,6 +373,74 @@ namespace RemixSubmit
 		float s_sun_direction[3] = {0.f, 0.f, 1.f};
 		bool s_sun_placed = false;
 
+		// --- scene lighting -------------------------------------------------------------------
+		//
+		// Neither of these titles ships a light the backend can see, so the scene is lit entirely
+		// by whatever we add. The original placeholder was a sphere light attached to the camera,
+		// and its 1/d^2 falloff is not a tuning problem, it is the wrong shape: the first-person
+		// weapon sits at d ~ 0.5 and a wall at d ~ 6, so the weapon receives about 100x the
+		// irradiance and blows to flat white while the room stays legible but dim. That is
+		// exactly the "flat white weapon against grainy walls" the user reported, and it is also
+		// why both verification tasks -- the rotate/walk protocol and any look at SOCOM -- came
+		// back as captures too dark to judge.
+		//
+		// A dome light and a distant light have no distance falloff at all, so one setting works
+		// whether the frame's scene radius is 4 (SOCOM slot 3) or 11,785 (the user's outdoor
+		// save). They are also position-independent, so unlike the sphere they never need
+		// re-placing and never chase the camera.
+		remixapi_LightHandle s_dome_light = nullptr;
+
+		// Defined below with the other env helpers.
+		float env_float(const wchar_t* name, float fallback);
+
+		//   0 = no lights at all
+		//   1 = distance-independent fill: dome ambient + distant key. The default.
+		//   2 = the legacy camera-attached sphere light, kept for comparison
+		int light_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_LIGHTMODE", 1), 0, 2));
+			return value;
+		}
+
+		// Uniform ambient from every direction.
+		//
+		// DEFAULTED OFF, and by measurement rather than preference: a dome light with no
+		// colorTexture contributes nothing through this API in this runtime. Rainbow Six 3
+		// -state 9 renders pure black with the dome alone at radiance 20 and fully lit with the
+		// distant key alone. The creation path is kept because a dome is the right shape for
+		// ambient and a future runtime (or a colour texture) may honour it -- but it must not be
+		// the default, because a silent no-op that looks like a tuning problem is exactly what
+		// cost this project two rounds of "captures too dark to judge".
+		float ambient_radiance()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_AMBIENT", 0.f);
+			return value;
+		}
+
+		// Directional key, and the light that actually carries the scene. Fixed in world space
+		// rather than attached to the camera, so shading stays put as the player turns -- which is
+		// precisely what the rotate/walk protocol has to be able to see -- and with no distance
+		// falloff at all, so nothing near the camera blows out and nothing far from it is crushed.
+		//
+		// The default is set from the geometry, not by taste. A distant light of angular diameter
+		// t delivers irradiance E = radiance * pi * (t/2)^2; at 8 degrees that solid angle is
+		// 0.0153 sr, so E = 1 -- the exposure the old sphere light was calibrated to deliver at
+		// the scene radius -- needs radiance ~65. 200 was measured as legible but washed out, so
+		// 100 sits just above correct exposure, which is the right side to err on for a title
+		// with no lights of its own.
+		float key_radiance()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_KEY", 100.f);
+			return value;
+		}
+
+		float key_angle_degrees()
+		{
+			static const float value = env_float(L"PCSX2_REMIX_KEYANGLE", 8.f);
+			return value;
+		}
+
 		// The world-space (or view-space, whichever is being submitted) bounding box of the
 		// geometry submitted this frame, and the finished frame's copy. This is the measurement
 		// the debug light is scaled from: the previous fixed radius/radiance were tuned for a
@@ -834,16 +902,99 @@ namespace RemixSubmit
 			}
 		}
 
+		// The distance-independent fill. Created once, never moved, never rescaled: a dome and a
+		// distant light have no position and no falloff, so there is nothing about them that
+		// depends on the scene's size or on where the camera is.
+		void place_fill_lights()
+		{
+			if (no_debug_scene() || light_mode() != 1)
+				return;
+
+			const remixapi_Interface& api = s_remix.api();
+
+			if (!s_dome_light && ambient_radiance() > 0.f)
+			{
+				remixapi_LightInfoDomeEXT dome{};
+				dome.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DOME_EXT;
+				dome.pNext = nullptr;
+				dome.transform = s_identity_transform;
+				dome.colorTexture = nullptr; // flat radiance rather than an environment map
+
+				const float radiance = ambient_radiance();
+				remixapi_LightInfo light_info{};
+				light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+				light_info.pNext = &dome;
+				light_info.hash = 0x5;
+				light_info.radiance = {radiance, radiance, radiance};
+
+				const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_dome_light);
+				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_dome_light)
+				{
+					ERROR_LOG("Remix: CreateLight failed for the dome light ({})", remix_ps2::error_name(status));
+					s_dome_light = nullptr;
+				}
+			}
+
+			if (!s_sun_light && key_radiance() > 0.f)
+			{
+				// Fixed direction, deliberately off-axis on all three so no wall, floor or
+				// ceiling is lit flat-on and surface orientation stays readable.
+				const float direction[3] = {0.35f, -0.86f, 0.37f};
+
+				remixapi_LightInfoDistantEXT distant{};
+				distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
+				distant.pNext = nullptr;
+				distant.direction = {direction[0], direction[1], direction[2]};
+				distant.angularDiameterDegrees = key_angle_degrees();
+				distant.volumetricRadianceScale = 1.f;
+
+				const float radiance = key_radiance();
+				remixapi_LightInfo light_info{};
+				light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+				light_info.pNext = &distant;
+				light_info.hash = 0x6;
+				light_info.radiance = {radiance, radiance, radiance};
+
+				const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_sun_light);
+				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_sun_light)
+				{
+					ERROR_LOG("Remix: CreateLight failed for the key light ({})", remix_ps2::error_name(status));
+					s_sun_light = nullptr;
+				}
+				else
+				{
+					s_sun_placed = true; // stop place_sun_light from replacing it
+				}
+			}
+
+			INFO_LOG("Remix: scene lighting -- distance-independent fill (key {:g} at {:g} deg, dome {:g}). "
+					 "No 1/d^2 falloff, so it is scale-free: the same numbers work at scene radius 4 and "
+					 "11,785. PCSX2_REMIX_KEY / KEYANGLE / AMBIENT tune it, LIGHTMODE=2 restores the "
+					 "camera-attached sphere.",
+				key_radiance(), key_angle_degrees(), ambient_radiance());
+		}
+
 		bool create_debug_scene()
 		{
 			const remixapi_Interface& api = s_remix.api();
 
-			// Sphere light, straight from the official remixapi_example_c.c. The scene radius
+			// Scene lighting. The default is the fill above; mode 2 is the old camera-attached
+			// sphere light, straight from the official remixapi_example_c.c, whose scene radius
 			// is a placeholder until the first frame measures one.
-			const float origin_light[3] = {0.f, -1.f, 0.f};
-			place_debug_light(origin_light, 2.f);
+			place_fill_lights();
 
-			if (!s_debug_light)
+			if (light_mode() == 2)
+			{
+				const float origin_light[3] = {0.f, -1.f, 0.f};
+				place_debug_light(origin_light, 2.f);
+			}
+
+			// Any light at all is enough to say the scene was built. Checking specifically for
+			// s_debug_light was correct only while the camera-attached sphere was the sole
+			// lighting model -- under the fill it is never created, so this failed the whole
+			// scene setup and degraded the renderer to a no-op with the lights sitting there
+			// working.
+			if (!s_debug_light && !s_dome_light && !s_sun_light && !no_debug_scene())
 				return false;
 
 			// Debug triangle at z = 10, in front of the hardcoded camera at the origin. This is
@@ -1035,13 +1186,18 @@ namespace RemixSubmit
 				submit_fallback_camera();
 				++s_stats.cam_fallback;
 
-				// The fallback camera sits at the origin looking down +Z, so the light rides
-				// with it and the distant light points the same way.
-				const float origin_light[3] = {0.f, 0.f, 0.f};
-				place_debug_light(origin_light, scene_radius);
+				// Legacy mode only: the fallback camera sits at the origin looking down +Z, so
+				// the sphere light rides with it. The fill lights need none of this -- they have
+				// no position, which is the entire point of them.
+				if (light_mode() == 2)
+				{
+					const float origin_light[3] = {0.f, 0.f, 0.f};
+					place_debug_light(origin_light, scene_radius);
 
-				const float forward[3] = {0.f, 0.f, 1.f};
-				place_sun_light(forward);
+					const float forward[3] = {0.f, 0.f, 1.f};
+					place_sun_light(forward);
+				}
+
 				return;
 			}
 
@@ -1058,15 +1214,19 @@ namespace RemixSubmit
 			remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &camera_info);
 			++s_stats.cam_world;
 
-			// The debug light rides the camera, as in RPCS3: a world-space scene lit from
-			// wherever the origin happens to be is usually a black scene.
-			place_debug_light(s_active_camera.position, scene_radius);
+			if (light_mode() == 2)
+			{
+				// The sphere light rides the camera, as in RPCS3: a world-space scene lit from
+				// wherever the origin happens to be is usually a black scene. This is also what
+				// blows out the first-person weapon, which is why it is no longer the default.
+				place_debug_light(s_active_camera.position, scene_radius);
 
-			// Camera forward in world space. p_view = p_world * V (row-vector), so the gradient
-			// of view z with respect to world position is V's third column.
-			const float forward[3] = {
-				s_active_camera.view.m[0][2], s_active_camera.view.m[1][2], s_active_camera.view.m[2][2]};
-			place_sun_light(forward);
+				// Camera forward in world space. p_view = p_world * V (row-vector), so the
+				// gradient of view z with respect to world position is V's third column.
+				const float forward[3] = {
+					s_active_camera.view.m[0][2], s_active_camera.view.m[1][2], s_active_camera.view.m[2][2]};
+				place_sun_light(forward);
+			}
 		}
 
 		void drop_stale_camera()
@@ -3476,6 +3636,9 @@ namespace RemixSubmit
 		if (s_sun_light)
 			remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_sun_light);
 
+		if (s_dome_light)
+			remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_dome_light);
+
 		const u32 status = remix_ps2::guarded_present(s_remix.api().Present, nullptr);
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
 			ERROR_LOG("Remix: Present failed ({})", remix_ps2::error_name(status));
@@ -3745,6 +3908,12 @@ namespace RemixSubmit
 		{
 			remix_ps2::guarded_destroy_light(api.DestroyLight, s_sun_light);
 			s_sun_light = nullptr;
+		}
+
+		if (s_dome_light)
+		{
+			remix_ps2::guarded_destroy_light(api.DestroyLight, s_dome_light);
+			s_dome_light = nullptr;
 		}
 
 		// One last counter block, so a short session still reports what it saw. Emitted before
