@@ -102,6 +102,16 @@ namespace RemixSubmit
 			u64 skip_coincident = 0; // identical geometry already submitted this frame
 			u64 skip_minw = 0; // draw sits at or inside the eye
 			u64 skip_maxw = 0; // draw sits entirely beyond the far-field cap (PCSX2_REMIX_MAXW)
+			// Hyperextended draws: the ones whose AABB diagonal exceeds explode_ratio_limit()
+			// times their own furthest w, i.e. "vertex explosion" turned into a number. Counted,
+			// never rejected -- this is the diagnostic that decides whether the reported explosions
+			// are geometry this backend submits or an artefact of Remix's Geometry Hash debug view,
+			// and a gate that removed the evidence would answer the wrong question. 'peak' is the
+			// session's largest ratio whatever the limit, so it retunes the limit from measurement:
+			// legitimate off-screen geometry reaches ~17x, the one wrong-matrix scatter ever
+			// measured on this project reached 1,450x.
+			u64 hyperextended = 0;
+			float hyperextended_peak = 0.f;
 			// Histogram of each submitted draw's smallest w, by decade, so the min-w gate can be
 			// set from the measured distribution instead of a guess. Buckets are
 			// w < 1e-3, < 1e-2, < 1e-1, < 1, < 10, < 100, >= 100.
@@ -2184,6 +2194,32 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// How many eye-depths across a draw may be before it is called hyperextended: the ratio of
+		// its AABB diagonal to its own furthest w. Nothing is rejected on this -- it only counts and
+		// dumps -- because it exists to answer whether the "vertex explosions" the user reports are
+		// geometry we submit at all, and a gate would delete the evidence it was set to gather.
+		//
+		// 32 is the default, and it sits between two measurements rather than being picked. Ordinary
+		// geometry legitimately reaches ~17x: GS XY is 12.4 fixed point spanning +-4096 px against a
+		// 640-wide render target, so a wall whose vertices lie several screens off to the side is
+		// genuinely many times wider than the depth it sits at. The only real explosion this project
+		// has ever measured -- a wrong VU1 matrix accepted as the world camera -- scattered the scene
+		// 1,450x. Anything between those two is ambiguous, and the session peak printed on the stats
+		// line is what moves the line without a rebuild. 0 disables the counter.
+		float explode_ratio_limit()
+		{
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_EXPLODEK");
+				if (env.empty())
+					return 32.f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 32.f;
+			}();
+
+			return value;
+		}
+
 		// Quantum, in world units, that positions are snapped to before they are hashed into a
 		// mesh identity. 0 disables quantization and restores exact-bit hashing, which is the
 		// A/B handle for the measurement. The default is deliberately coarse relative to the
@@ -2541,6 +2577,10 @@ namespace RemixSubmit
 
 		u64 s_drawdump_frames_left = 0;
 		bool s_drawdump_started = false;
+		// EXPLODE offender lines written so far. Session-lifetime like drawdump_write's own line
+		// count, not per-frame: the offenders worth reading are the first ones, and after a hundred
+		// of them the stats-line counter is the number that matters.
+		u32 s_explode_dumped = 0;
 
 		void drawdump_write(const std::string& line)
 		{
@@ -2922,15 +2962,20 @@ namespace RemixSubmit
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
+			// 'explode' is the A-vs-B verdict for the reported vertex explosions, and it is on this
+			// line rather than its own because it is only meaningful next to the w distribution the
+			// ratio is measured against. A count of 0 with a peak well under the limit says no draw
+			// this backend submitted was misplaced, whatever the screen looked like.
 			INFO_LOG("Remix: submitted w (max per draw): <1e-3 {} <1e-2 {} <0.1 {} <1 {} <10 {} "
 					 "<100 {} >=100 {} | minw gate {:g} | maxw gate {:g} skipped {} | "
-					 "draw extent ratio avg {:.0f} peak {:.0f}",
+					 "draw extent ratio avg {:.0f} peak {:.0f} | explode >{:g}x {} peak {:.1f}x",
 				s_stats.w_histogram[0], s_stats.w_histogram[1], s_stats.w_histogram[2],
 				s_stats.w_histogram[3], s_stats.w_histogram[4], s_stats.w_histogram[5],
 				s_stats.w_histogram[6], min_submitted_w(), max_submitted_w(), s_stats.skip_maxw,
 				(s_extent_ratio_frames > 0) ?
 					(s_extent_ratio_total / static_cast<double>(s_extent_ratio_frames)) : 0.0,
-				s_extent_ratio_peak);
+				s_extent_ratio_peak,
+				explode_ratio_limit(), s_stats.hyperextended, s_stats.hyperextended_peak);
 
 			// The Z -> w calibration. This is the whole feasibility test for FST=1 recovery: if
 			// neither model fits the draws that carry both Z and a real w, then Z cannot be
@@ -3239,6 +3284,12 @@ namespace RemixSubmit
 		float min_v = std::numeric_limits<float>::max();
 		float max_v = -std::numeric_limits<float>::max();
 
+		// Non-zero once the hyperextension check below has flagged this draw, carried all the way
+		// down to the dump site rather than dumped where it is computed: the offender line is only
+		// worth reading with the draw's texture source, material hash and sky classification on it,
+		// and none of those three exist yet at the point the ratio is known.
+		float explode_ratio = 0.f;
+
 		// Z -> w calibration samples for this draw, merged only if the draw is accepted. Only
 		// FST=0 draws contribute: they are the ones carrying both Z and a trustworthy w, and
 		// feeding recovered values back into the fit would make it self-confirming.
@@ -3384,6 +3435,31 @@ namespace RemixSubmit
 			{
 				s_frame_max_extent = std::max(s_frame_max_extent, extent);
 				s_frame_min_extent = std::min(s_frame_min_extent, extent);
+
+				// The hyperextension check. extent is this draw's size in world units and max_w is
+				// the depth its furthest vertex sits at, so extent/max_w is how many eye-depths
+				// across the draw is. Being a ratio it is scale-free, which is what makes it
+				// comparable between titles whose world units differ by 2x (maxpos ~2,500 on
+				// Rainbow Six 3, ~5,300 on SOCOM) and between world and view space, where the
+				// positions are computed by two different code paths.
+				//
+				// max_w > 0 is guaranteed by the per-vertex !(w > 0) rejection above; the guard is
+				// kept so a future change there cannot turn this into a division by zero silently.
+				if (max_w > 0.f)
+				{
+					const float ratio = extent / max_w;
+					if (std::isfinite(ratio))
+					{
+						s_stats.hyperextended_peak = std::max(s_stats.hyperextended_peak, ratio);
+
+						const float explode_limit = explode_ratio_limit();
+						if (explode_limit > 0.f && ratio > explode_limit)
+						{
+							++s_stats.hyperextended;
+							explode_ratio = ratio;
+						}
+					}
+				}
 			}
 
 			s_zfit.merge(draw_zfit);
@@ -3984,15 +4060,20 @@ namespace RemixSubmit
 		if (ds.is_cutout)
 			++s_stats.cutout_tagged;
 
-		if (s_drawdump_frames_left > 0)
+		// Built once and used twice. PCSX2_REMIX_DRAWDUMP's per-frame dump wants it, and so do the
+		// hyperextension offenders: bucketing an explosion by class needs the same fields the sky
+		// rule was derived from -- FST, world or view space, whether the texture is a render target,
+		// and the w range -- so duplicating a shortened field set for them would be strictly worse.
+		if (s_drawdump_frames_left > 0 || explode_ratio > 0.f)
 		{
-			drawdump_write(fmt::format(
-				"f={} d={} verts={} tris={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
+			const std::string draw_state_line = fmt::format(
+				"f={} d={} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
 				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
 				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
 				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
 				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
 				s_frame_counter, s_submitted_this_frame, vertex_count, s_scratch_indices.size() / 3,
+				fst_draw ? 1 : 0, world_mode ? 1 : 0,
 				ds.is_sky ? 1 : 0,
 				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),
 				static_cast<u32>(r.m_cached_ctx.ZBUF.ZMSK), static_cast<u32>(r.m_cached_ctx.ZBUF.PSM),
@@ -4008,7 +4089,23 @@ namespace RemixSubmit
 				(source && (source->m_target || source->m_from_target)) ? 1 : 0,
 				min_w, max_w, min_z, max_z, min_px, max_px, min_py, max_py,
 				rt_unscaled_width, rt_unscaled_height, min_u, max_u, min_v, max_v,
-				material.content_hash));
+				material.content_hash);
+
+			if (s_drawdump_frames_left > 0)
+				drawdump_write(draw_state_line);
+
+			// Offender detail behind the 'explode' counter on the stats line. Capped, because a
+			// title that misplaces every draw would otherwise fill the 40k-line dump with the same
+			// finding: a hundred lines is plenty to name the class, and the counter stays exact
+			// regardless of the cap. Deliberately NOT gated on PCSX2_REMIX_DRAWDUMP -- the counter is
+			// meant to be readable from a default run, and drawdump_write only creates the file on
+			// its first call, so a session with no offenders still writes nothing at all.
+			if (explode_ratio > 0.f && s_explode_dumped < 100)
+			{
+				++s_explode_dumped;
+				drawdump_write(fmt::format("EXPLODE ratio={:.1f}x limit={:g}x extent={:.2f} | {}",
+					explode_ratio, explode_ratio_limit(), draw_bounds.diagonal(), draw_state_line));
+			}
 		}
 
 		// Only now that the draw is committed does its extent count towards the frame's, and
