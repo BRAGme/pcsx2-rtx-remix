@@ -96,6 +96,9 @@ namespace RemixSubmit
 			u64 untex_recovered = 0;
 			u64 fst_flat = 0; // FST=1 draws rejected for constant Z (no depth to recover)
 			u64 skip_const_q = 0; // m_vt.m_eq.q: one Q for the whole draw => 2D/HUD
+			// Draws whose relative w spread is below w_flat_limit(): 2D the exact const-Q test
+			// missed because their Q varies in the last few bits. See w_flat_limit().
+			u64 skip_w_flat = 0;
 			u64 warn_inaccurate_stq = 0; // m_vt.m_accurate_stq: Q precision already suspect
 			u64 skip_no_target = 0; // no colour target, so no viewport to un-project against
 			u64 skip_empty = 0;
@@ -734,6 +737,33 @@ namespace RemixSubmit
 		{
 			static const int value =
 				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_FSTZ", 1), 0, 1));
+
+			return value;
+		}
+
+		// Relative spread of w across a draw, below which the draw has no perspective and is 2D.
+		//
+		// The existing const-Q gate is r.m_vt.m_eq.q, an EXACT equality test, and 2D quads leak
+		// straight through it because their Q varies in the last few bits. MEASURED on SOCOM's
+		// deploy menu, every submitted draw: w=[6.0,6.0], z=[38275,38275], px rects 20x20 within a
+		// 640x448 target, depth(r=1 w=0) -- so classify_sky cannot catch them either, because depth
+		// testing is on. They were being submitted as world geometry, which is why the 2D main menu
+		// renders in-world as glowing boxes now that untextured draws get albedo.
+		//
+		// (max_w - min_w) / max_w is scale-free, so one threshold serves a scene radius of 4 and one
+		// of 11,785. 0.001 is deliberately far below anything with real depth: the menu measures 0.
+		// It makes the same trade the const-Q gate always made -- geometry viewed exactly head-on is
+		// lost -- but on a robust test rather than an exact one. 0 disables.
+		float w_flat_limit()
+		{
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_WFLAT");
+				if (env.empty())
+					return 0.001f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 0.001f;
+			}();
 
 			return value;
 		}
@@ -3026,7 +3056,7 @@ namespace RemixSubmit
 				return;
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
-					 "skip: tri {} untex {} fst {} constq {} notarget {} empty {} large {} "
+					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} minw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
@@ -3036,7 +3066,7 @@ namespace RemixSubmit
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
-				s_stats.skip_const_q, s_stats.skip_no_target, s_stats.skip_empty,
+				s_stats.skip_const_q, s_stats.skip_w_flat, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident,
 				s_stats.skip_minw,
@@ -3524,6 +3554,15 @@ namespace RemixSubmit
 		// accident is the obvious failure mode here -- and the histogram in the stats line is
 		// what it was set from. 0 disables the gate.
 		{
+			// 2D that the exact const-Q test missed. Placed here because min_w/max_w only exist
+			// once the vertex loop has run; see w_flat_limit() for the menu measurement behind it.
+			const float flat_limit = w_flat_limit();
+			if (flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
+			{
+				++s_stats.skip_w_flat;
+				return;
+			}
+
 			const float min_w_limit = min_submitted_w();
 			if (min_w_limit > 0.f && max_w < min_w_limit)
 			{
