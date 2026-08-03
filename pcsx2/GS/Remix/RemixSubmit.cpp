@@ -2798,6 +2798,50 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// PCSX2_REMIX_LIGHTMAPINJECT: submit the masked multi-pass draws instead of rejecting them,
+		// as static decals so their texture can light the scene.
+		//
+		//   0 = reject (default, and what shipped)
+		//   1 = submit as DECAL_STATIC
+		//
+		// Rainbow Six 3 has no runtime lights at all, so these passes are the entire level lighting
+		// and rejecting them means substituting one injected fill light for the whole thing. That is
+		// why the weapon blows out white while walls stay flat, and it is very likely why albedo
+		// reads near-greyscale: a lightmapped title keeps its base textures desaturated because the
+		// lightmap carries the colour.
+		//
+		// DECAL_STATIC is the load-bearing part. Submitting these as ordinary geometry is what
+		// originally put four coincident surfaces on every wall and z-fought in the path tracer --
+		// the reason the gate exists. A decal is exactly the thing a renderer offsets to sit on a
+		// surface without fighting it, and these are static by construction.
+		//
+		// Increment 1 (this) reuses the existing emissive-tag path: tag the discovered lightmap
+		// hashes in the per-game conf and bind() already builds them with emissiveTexture set, so no
+		// new material code is needed and the z-fighting risk gets tested cheaply. Each of the three
+		// channel passes then emits white x its own greyscale channel, so the LIGHT is right and the
+		// COLOUR is not -- three white emitters sum to grey. Increment 2 sets emissiveColorConstant
+		// per channel from the FBMSK to recover colour.
+		int lightmap_inject_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_LIGHTMAPINJECT", 0), 0, 1));
+			return value;
+		}
+
+		// Which colour channel a masked pass writes. FBMSK bits SET are protected, so the byte that
+		// is zero is the one written. Returns a unit RGB for that channel, or all-zero if the mask
+		// is not a single-channel one (which would mean the 30/30/30 structure does not hold here).
+		void fbmsk_channel(u32 mask, float out_rgb[3])
+		{
+			const bool writes_r = ((mask >> 0) & 0xFFu) == 0;
+			const bool writes_g = ((mask >> 8) & 0xFFu) == 0;
+			const bool writes_b = ((mask >> 16) & 0xFFu) == 0;
+
+			out_rgb[0] = writes_r ? 1.f : 0.f;
+			out_rgb[1] = writes_g ? 1.f : 0.f;
+			out_rgb[2] = writes_b ? 1.f : 0.f;
+		}
+
 		struct lightmap_entry
 		{
 			u64 hash = 0;
@@ -3509,6 +3553,12 @@ namespace RemixSubmit
 		// The texture bound in one of these passes is the title's lightmap. Folding it into the
 		// base material is the next phase; the per-draw mask test is what will identify it
 		// there too, so nothing here needs a per-title texture-page list.
+		// Set by the masked-pass gate below when injection is on, and consumed at instance build to
+		// mark the draw a static decal. Declared here so the gate can fall through instead of
+		// returning.
+		bool lightmap_pass = false;
+		float lightmap_channel[3] = {0.f, 0.f, 0.f};
+
 		if ((r.m_cached_ctx.FRAME.FBMSK & 0x00FFFFFFu) != 0)
 		{
 			++s_stats.skip_fbmsk;
@@ -3540,6 +3590,13 @@ namespace RemixSubmit
 					}
 					++e.draws;
 				}
+			}
+
+			// Submit it instead of rejecting, as a static decal. See lightmap_inject_mode().
+			if (lightmap_inject_mode() != 0)
+			{
+				lightmap_pass = true;
+				fbmsk_channel(static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK), lightmap_channel);
 			}
 
 			// PCSX2_REMIX_FBMSKDUMP=N: dump the first N masked draws to logs\remix_fbmsk.txt.
@@ -3592,7 +3649,9 @@ namespace RemixSubmit
 					rt_unscaled_width, rt_unscaled_height, src_state, dbg_hash));
 			}
 
-			return;
+			// Fall through only when injecting; otherwise this draw is done.
+			if (!lightmap_pass)
+				return;
 		}
 
 		if (r.m_vt.m_accurate_stq)
@@ -4215,6 +4274,16 @@ namespace RemixSubmit
 		regs.alpha = r.m_context->ALPHA;
 
 		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame, untex_draw);
+
+		// A lightmap pass sits exactly on the surface it modulates, so it has to be a decal or it
+		// z-fights -- that is what made the FBMSK gate necessary in the first place. Static, because
+		// baked lighting does not move. IGNORE_BAKED_LIGHTING keeps the runtime from also treating
+		// the pass's vertex colour as baked light on top of it.
+		if (lightmap_pass)
+		{
+			ds.categories |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
+			ds.categories |= REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING;
+		}
 
 		// The batch key: everything that lives on the instance. Two draws may share a mesh only
 		// if they agree on all of it. Materials are per surface and deliberately absent.
