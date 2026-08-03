@@ -643,6 +643,69 @@ namespace RemixSubmit
 
 		z_fit s_zfit;
 
+		// --- vertex-colour distribution ------------------------------------------------------
+		//
+		// The question this answers: does this title bake its lighting into per-vertex colour?
+		//
+		// The PS2 GS has one texture unit, so a lightmap costs a second blended pass. Titles that
+		// do not pay for that pass usually bake into vertex colours instead. We have both idioms
+		// in evidence: Rainbow Six 3 multi-passes (the 30/30/30 per-channel FBMSK we identify and
+		// skip), SOCOM does not multi-pass at all.
+		//
+		// The discriminator is NOT "are the colours non-zero" -- it is whether they *vary*. On the
+		// PS2 a vertex colour of 128 is unity for modulation, so an unlit title emits a constant
+		// 0x80808080 and a title with baked lighting emits a spread. Both look like "there is
+		// colour data" to a naive check, which is why `neutral` and `draws const/vary` are counted
+		// separately from the means.
+		struct vcolor_stats
+		{
+			u64 vertices = 0;
+			u64 neutral = 0; // exactly (128,128,128): PS2 unity, i.e. "no bake"
+			u64 draws_constant = 0; // every vertex in the draw shares one colour
+			u64 draws_varying = 0;
+			double sum_lum = 0.0;
+			double sum_lum2 = 0.0;
+			u64 hist[8] = {}; // luminance, 32-wide buckets over 0..255
+
+			void add(u32 r, u32 g, u32 b)
+			{
+				++vertices;
+				if (r == 128 && g == 128 && b == 128)
+					++neutral;
+
+				const double lum = (0.2126 * r) + (0.7152 * g) + (0.0722 * b);
+				sum_lum += lum;
+				sum_lum2 += lum * lum;
+				++hist[std::min<u32>(7, static_cast<u32>(lum) >> 5)];
+			}
+
+			void merge(const vcolor_stats& o)
+			{
+				vertices += o.vertices;
+				neutral += o.neutral;
+				draws_constant += o.draws_constant;
+				draws_varying += o.draws_varying;
+				sum_lum += o.sum_lum;
+				sum_lum2 += o.sum_lum2;
+				for (u32 i = 0; i < 8; ++i)
+					hist[i] += o.hist[i];
+			}
+
+			double mean() const { return (vertices > 0) ? (sum_lum / static_cast<double>(vertices)) : 0.0; }
+
+			double stddev() const
+			{
+				if (vertices < 2)
+					return 0.0;
+
+				const double m = mean();
+				const double var = (sum_lum2 / static_cast<double>(vertices)) - (m * m);
+				return (var > 0.0) ? std::sqrt(var) : 0.0;
+			}
+		};
+
+		vcolor_stats s_vcolor;
+
 		// FST=1 recovery, and the two knobs that decide whether it is safe to use.
 		//
 		// FSTZ: 1 (default) = recover FST=1 draws from Z once the calibration is good enough.
@@ -2892,6 +2955,18 @@ namespace RemixSubmit
 					fmt::format("{} (flat-Z {})", s_stats.skip_fst, s_stats.fst_flat));
 			}
 
+			// Vertex colour. The whole vertex-colour-baking question is decided by whether these
+			// vary: 128 is PS2 unity, so a title with no bake reports neutral ~100% and
+			// draws const >> vary, whatever its means look like.
+			INFO_LOG("Remix: vertex colour over {} verts | mean lum {:.1f} sd {:.1f} | neutral(128,128,128) {:.1f}% | "
+					 "draws const {} vary {} | lum buckets {} {} {} {} {} {} {} {}",
+				s_vcolor.vertices, s_vcolor.mean(), s_vcolor.stddev(),
+				(s_vcolor.vertices > 0) ?
+					(100.0 * static_cast<double>(s_vcolor.neutral) / static_cast<double>(s_vcolor.vertices)) : 0.0,
+				s_vcolor.draws_constant, s_vcolor.draws_varying,
+				s_vcolor.hist[0], s_vcolor.hist[1], s_vcolor.hist[2], s_vcolor.hist[3],
+				s_vcolor.hist[4], s_vcolor.hist[5], s_vcolor.hist[6], s_vcolor.hist[7]);
+
 			// Third line: the material bridge. Kept separate so the counter block stays
 			// readable, and because the two numbers the user has to act on -- unique content
 			// hashes and the per-draw hash cost -- both live here.
@@ -3171,6 +3246,10 @@ namespace RemixSubmit
 		const double zfit_scale = 1.0 / static_cast<double>(
 			0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_cached_ctx.ZBUF.PSM].fmt * 8));
 
+		vcolor_stats draw_vcolor{};
+		u32 first_vcolor = 0;
+		bool vcolor_varies = false;
+
 		// FST draws carry UV in 12.4 fixed-point texels (GSVertex.h:22), so the normalised
 		// texture coordinate is (U/16)/width. TEX0.TW/TH are log2 sizes.
 		const float fst_inv_w = 1.0f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TW) / 16.0f;
@@ -3225,6 +3304,12 @@ namespace RemixSubmit
 			const u32 alpha = std::min<u32>(255u, static_cast<u32>(v.RGBAQ.A) * 2u);
 			out.color = (alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
 			            (static_cast<u32>(v.RGBAQ.G) << 8) | static_cast<u32>(v.RGBAQ.B);
+
+			draw_vcolor.add(v.RGBAQ.R, v.RGBAQ.G, v.RGBAQ.B);
+			if (i == 0)
+				first_vcolor = out.color & 0x00FFFFFFu;
+			else if ((out.color & 0x00FFFFFFu) != first_vcolor)
+				vcolor_varies = true;
 
 			if (!std::isfinite(out.position[0]) || !std::isfinite(out.position[1]) || !std::isfinite(out.position[2]) ||
 				std::abs(out.position[0]) > position_limit ||
@@ -3302,6 +3387,13 @@ namespace RemixSubmit
 			}
 
 			s_zfit.merge(draw_zfit);
+
+			if (vcolor_varies)
+				++draw_vcolor.draws_varying;
+			else
+				++draw_vcolor.draws_constant;
+
+			s_vcolor.merge(draw_vcolor);
 
 			if (fst_draw)
 				++s_stats.fst_recovered;
