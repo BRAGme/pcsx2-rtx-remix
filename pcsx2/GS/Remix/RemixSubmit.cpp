@@ -2716,7 +2716,8 @@ namespace RemixSubmit
 			bool is_cutout = false;
 		};
 
-		draw_state build_draw_state(const draw_regs& regs, u64 material_hash, u64 draw_ordinal)
+		draw_state build_draw_state(const draw_regs& regs, u64 material_hash, u64 draw_ordinal,
+			bool untextured)
 		{
 			const bool depth_read = regs.depth_read;
 			const bool depth_write = regs.depth_write;
@@ -2764,6 +2765,23 @@ namespace RemixSubmit
 				blend.textureAlphaArg1Source = 2;
 				blend.textureAlphaArg2Source = 0;
 				blend.textureAlphaOperation = decal ? 2u : 4u;
+
+				// An untextured draw has no D3DTA_TEXTURE to read. MODULATE then multiplies diffuse
+				// by a texture that is not there and SELECTARG1 selects it outright -- either way
+				// the surface comes out BLACK. That is the pure-black albedo debug view: since
+				// UNTEXZ started submitting these they are the majority of a SOCOM frame
+				// (715,916 of 948,303), so most of the world was being told to take its colour
+				// from nothing, and rendered black with only specular highlights on it. Which is
+				// exactly the "black/white" look the user reported, and no amount of injected
+				// light could have fixed it -- more light only brightens the highlights.
+				//
+				// SELECTARG2 takes D3DTA_DIFFUSE, the vertex colour, which is the only colour an
+				// untextured draw has. Alpha likewise.
+				if (untextured)
+				{
+					blend.textureColorOperation = 3u; // D3DTOP_SELECTARG2 -> diffuse
+					blend.textureAlphaOperation = 3u;
+				}
 			}
 			blend.tFactor = 0xFFFFFFFFu;
 			blend.isTextureFactorBlend = 0;
@@ -3883,7 +3901,7 @@ namespace RemixSubmit
 		regs.tfx = r.m_cached_ctx.TEX0.TFX;
 		regs.alpha = r.m_context->ALPHA;
 
-		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame);
+		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame, untex_draw);
 
 		// The batch key: everything that lives on the instance. Two draws may share a mesh only
 		// if they agree on all of it. Materials are per surface and deliberately absent.

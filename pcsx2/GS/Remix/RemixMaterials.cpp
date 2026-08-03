@@ -1181,18 +1181,59 @@ namespace remix_ps2::materials
 		static constexpr u64 untextured_hash = 0x554E544558545244ull;
 
 		static remixapi_MaterialHandle s_untextured = nullptr;
+		static remixapi_TextureHandle s_untextured_tex = nullptr;
 		static bool s_tried = false;
 
 		binding out{};
 
-		// No fork_features() gate and no texture budget: this material names no texture, so none
-		// of the pseudo-path machinery those guard is involved.
-		if (!rt.ok())
+		// fork_features() IS required: the albedo below is bound through the fork's pseudo-path
+		// resolution, exactly as the textured path does. No texture *budget* gate though -- this is
+		// one 4x4 upload for the whole session, not per-draw churn.
+		if (!rt.ok() || !rt.fork_features())
 			return out;
 
 		if (!s_untextured && !s_tried)
 		{
 			s_tried = true;
+
+			const remixapi_Interface& api = rt.api();
+
+			// A material with albedoTexture = nullptr renders BLACK -- albedoConstant alone is not
+			// enough. MEASURED: with no albedo texture named, the albedo debug view
+			// (DXVK_RTX_DEBUG_VIEW_INDEX=23) reads lit_px 0 across an entire SOCOM mission, while
+			// Rainbow Six 3 in the same view on the same build reads lit_px 2,421,139 at mean
+			// luminance 111 -- so the view works and the surfaces genuinely had zero albedo. Since
+			// UNTEXZ these are ~76% of a SOCOM frame, so most of the world was black with only
+			// specular highlights on it. That is the "black/white" look, and no injected light
+			// could have fixed it.
+			//
+			// This is what material_stage() == 3 exists to bisect: "CreateMaterial, but with no
+			// albedo texture named". So name one: 4x4 opaque white, uploaded once per session, and
+			// let the vertex diffuse and the path tracer supply the actual colour and lighting.
+			u8 white[4 * 4 * 4];
+			std::memset(white, 0xFF, sizeof(white));
+
+			remixapi_TextureInfo tex{};
+			tex.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+			tex.pNext = nullptr;
+			tex.hash = untextured_hash;
+			tex.width = 4;
+			tex.height = 4;
+			tex.depth = 1;
+			tex.mipLevels = 1;
+			tex.format = textures_linear() ? REMIXAPI_FORMAT_B8G8R8A8_UNORM : REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+			tex.data = white;
+			tex.dataSize = sizeof(white);
+
+			const u32 tex_status = guarded_create_texture(api.CreateTexture, &tex, &s_untextured_tex);
+			if (tex_status != REMIXAPI_ERROR_CODE_SUCCESS || !s_untextured_tex)
+			{
+				ERROR_LOG("Remix: CreateTexture failed for the untextured white albedo ({})",
+					error_name(tex_status));
+				s_untextured_tex = nullptr;
+				++s_stats.failures;
+				return out;
+			}
 
 			remixapi_MaterialInfoOpaqueEXT opaque{};
 			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
@@ -1221,11 +1262,16 @@ namespace remix_ps2::materials
 			opaque.alphaReferenceValue = 0;
 			opaque.displaceOut = 0.f;
 
+			// The pseudo-path trick, same as the textured path: the fork resolves this string
+			// against the texture manager's hash table that CreateTexture just populated.
+			wchar_t albedo_path[32]{};
+			::swprintf_s(albedo_path, L"0x%016llX", static_cast<unsigned long long>(untextured_hash));
+
 			remixapi_MaterialInfo material{};
 			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
 			material.pNext = &opaque;
 			material.hash = untextured_hash;
-			material.albedoTexture = nullptr; // the whole point: constant albedo, no texture
+			material.albedoTexture = albedo_path; // 4x4 white; albedoConstant alone renders black
 			material.normalTexture = nullptr;
 			material.tangentTexture = nullptr;
 			material.emissiveTexture = nullptr;
@@ -1238,19 +1284,21 @@ namespace remix_ps2::materials
 			material.wrapModeU = 1;
 			material.wrapModeV = 1;
 
-			const remixapi_Interface& api = rt.api();
 			const u32 status = guarded_create_material(api.CreateMaterial, &material, &s_untextured);
 
 			if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_untextured)
 			{
 				ERROR_LOG("Remix: CreateMaterial failed for the shared untextured material ({})",
 					error_name(status));
+				guarded_destroy_texture(api.DestroyTexture, s_untextured_tex);
+				s_untextured_tex = nullptr;
 				s_untextured = nullptr;
 				++s_stats.failures;
 				return out;
 			}
 
-			INFO_LOG("Remix: created the shared untextured material (white albedo, vertex-colour lit)");
+			INFO_LOG("Remix: created the shared untextured material (4x4 white albedo at {}, "
+					 "vertex diffuse carries the colour)", "0x554E544558545244");
 		}
 
 		if (!s_untextured)
