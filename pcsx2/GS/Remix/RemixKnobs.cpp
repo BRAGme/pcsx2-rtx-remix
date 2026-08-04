@@ -75,9 +75,17 @@ namespace remix_ps2
 				false},
 
 			// ------------------------------------------------------- Textures and Materials
-			{"TEXSTAGE", "Textures and Materials", "Texture stage", knob_type::Integer, 1, 0, 8, 1,
-				nullptr, "Which PS2 texture stage supplies the albedo.", false},
-			{"MATSTAGE", "Textures and Materials", "Material stage", knob_type::Integer, 4, 0, 8, 1,
+			// Ranges here MUST match the clamp at the read site. These two offered 0-8 while the
+			// backend clamped to 0-1 and 1-4, so seven of the nine choices silently collapsed onto
+			// another and the page reported a setting the backend was not using.
+			{"TEXSTAGE", "Textures and Materials", "Texture stage state", knob_type::Choice, 1, 0, 1, 1,
+				"Send nothing (let Remix decide)|Derive from the PS2 TFX mode",
+				"Whether to send Remix explicit fixed-function texture-stage state -- which argument "
+				"the stage samples and how it combines with the vertex colour. Deriving it from TFX "
+				"is the faithful translation; sending nothing falls back to Remix's own default, "
+				"which is what to try if surfaces render flat and ignore their texture.",
+				false},
+			{"MATSTAGE", "Textures and Materials", "Material stage", knob_type::Integer, 4, 1, 4, 1,
 				nullptr, "Texture stage the material is built from.", false},
 			{"REPLACEALBEDO", "Textures and Materials", "Use replacement textures", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr,
