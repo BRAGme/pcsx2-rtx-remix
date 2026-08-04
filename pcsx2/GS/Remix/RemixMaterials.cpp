@@ -138,7 +138,19 @@ namespace remix_ps2::materials
 
 		bool replacement_albedo()
 		{
-			static const bool value = read_env_int(L"PCSX2_REMIX_REPLACEALBEDO", 1) != 0;
+			// DEFAULT 0. Pointing albedoTexture at a .dds on disk is the one thing this path does
+			// that the last build with working textures (036a3529b) does not do at all -- there,
+			// albedoTexture is always the API pseudo-path. With a replacement pack installed the
+			// file branch wins for most textures (measured: 27 of 34 unique on Rainbow Six 3), so
+			// almost nothing goes through the pseudo-path and the API-uploaded textures are never
+			// referenced by any material. The user's Remix developer menu then lists NO textures
+			// at all, which is what put the fault here rather than in shading: it is a supply
+			// problem, not an albedo problem.
+			//
+			// On by default this was never a measured improvement, only an untested hypothesis
+			// about the pseudo-path being broken. Off restores the known-good behaviour; turn it
+			// back on only with a before/after that shows replacement textures actually resolving.
+			static const bool value = read_env_int(L"PCSX2_REMIX_REPLACEALBEDO", 0) != 0;
 			return value;
 		}
 

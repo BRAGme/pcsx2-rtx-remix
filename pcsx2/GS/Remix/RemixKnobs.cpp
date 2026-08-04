@@ -74,7 +74,7 @@ namespace remix_ps2
 				nullptr, "Which PS2 texture stage supplies the albedo.", false},
 			{"MATSTAGE", "Textures and Materials", "Material stage", knob_type::Integer, 4, 0, 8, 1,
 				nullptr, "Texture stage the material is built from.", false},
-			{"REPLACEALBEDO", "Textures and Materials", "Use replacement textures", knob_type::Boolean, 1, 0, 1, 1,
+			{"REPLACEALBEDO", "Textures and Materials", "Use replacement textures", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr,
 				"Binds albedo to a matching .dds from PCSX2's own texture replacement pack when one "
 				"exists for that texture hash.",
