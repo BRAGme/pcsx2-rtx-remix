@@ -1,0 +1,260 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>RemixSettingsWidget</class>
+ <widget class="QWidget" name="RemixSettingsWidget">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>700</width>
+    <height>700</height>
+   </rect>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QGroupBox" name="runtimeGroup">
+     <property name="title">
+      <string>Runtime</string>
+     </property>
+     <layout class="QGridLayout" name="runtimeLayout">
+      <item row="0" column="0" colspan="3">
+       <widget class="QLabel" name="rendererHint">
+        <property name="text">
+         <string>These settings apply when the renderer is set to RTX Remix in Graphics.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" colspan="3">
+       <widget class="QLabel" name="runtimeLabel">
+        <property name="text">
+         <string>Runtime DLL:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLineEdit" name="runtimePath">
+        <property name="placeholderText">
+         <string>Default: remix\d3d9.dll next to PCSX2</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QPushButton" name="runtimeBrowse">
+        <property name="text">
+         <string>Browse...</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="2">
+       <widget class="QPushButton" name="runtimeReset">
+        <property name="text">
+         <string>Reset</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="perGameGroup">
+     <property name="title">
+      <string>Per-Game Files</string>
+     </property>
+     <layout class="QGridLayout" name="perGameLayout">
+      <item row="0" column="0" colspan="4">
+       <widget class="QCheckBox" name="perGameFiles">
+        <property name="text">
+         <string>Separate Remix files per game</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" colspan="4">
+       <widget class="QLabel" name="remixFolderLabel">
+        <property name="text">
+         <string>Remix folder:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLineEdit" name="remixFolder"/>
+      </item>
+      <item row="2" column="1">
+       <widget class="QPushButton" name="remixFolderBrowse">
+        <property name="text">
+         <string>Browse...</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="2">
+       <widget class="QPushButton" name="remixFolderOpen">
+        <property name="text">
+         <string>Open...</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="3">
+       <widget class="QPushButton" name="remixFolderReset">
+        <property name="text">
+         <string>Reset</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0" colspan="4">
+       <widget class="QLabel" name="currentGameLabel">
+        <property name="text">
+         <string>No game running.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0" colspan="4">
+       <widget class="QPushButton" name="openGameFolder">
+        <property name="text">
+         <string>Open Current Game's Remix Folder</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="sceneGroup">
+     <property name="title">
+      <string>Scene</string>
+     </property>
+     <layout class="QGridLayout" name="sceneLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="worldScaleLabel">
+        <property name="text">
+         <string>World scale:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QDoubleSpinBox" name="worldScale">
+        <property name="minimum">
+         <double>0.010000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>1000.000000000000000</double>
+        </property>
+        <property name="singleStep">
+         <double>0.500000000000000</double>
+        </property>
+        <property name="value">
+         <double>8.000000000000000</double>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="lightModeLabel">
+        <property name="text">
+         <string>Lighting mode:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="lightMode">
+        <item>
+         <property name="text">
+          <string>Off (rely on in-game lights)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Dome + key light (no distance falloff)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Point light at camera</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="lightBrightnessLabel">
+        <property name="text">
+         <string>Key light brightness:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QDoubleSpinBox" name="lightBrightness">
+        <property name="maximum">
+         <double>100000.000000000000000</double>
+        </property>
+        <property name="singleStep">
+         <double>5.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>100.000000000000000</double>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="ambientBrightnessLabel">
+        <property name="text">
+         <string>Ambient brightness:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QDoubleSpinBox" name="ambientBrightness">
+        <property name="maximum">
+         <double>100000.000000000000000</double>
+        </property>
+        <property name="singleStep">
+         <double>1.000000000000000</double>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="lightAngleLabel">
+        <property name="text">
+         <string>Key light angular size:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="QDoubleSpinBox" name="lightAngle">
+        <property name="suffix">
+         <string> degrees</string>
+        </property>
+        <property name="minimum">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>180.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>8.000000000000000</double>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <spacer name="verticalSpacer">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+     <property name="sizeHint" stdset="0">
+      <size>
+       <width>20</width>
+       <height>40</height>
+      </size>
+     </property>
+    </spacer>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

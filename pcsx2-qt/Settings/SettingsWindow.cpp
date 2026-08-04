@@ -18,6 +18,7 @@
 #include "Settings/GameSummaryWidget.h"
 #include "Settings/GraphicsSettingsWidget.h"
 #include "Settings/OSDSettingsWidget.h"
+#include "Settings/RemixSettingsWidget.h"
 #include "Settings/HotkeySettingsWidget.h"
 #include "Settings/InterfaceSettingsWidget.h"
 #include "Settings/MemoryCardSettingsWidget.h"
@@ -158,6 +159,11 @@ void SettingsWindow::setupUi(const GameList::Entry* game)
 	addWidget(m_graphics_settings = new GraphicsSettingsWidget(this, m_ui.settingsContainer), tr("Graphics"), QStringLiteral("image-fill"),
 		tr("<strong>Graphics Settings</strong><hr>These options determine the configuration of the graphical output.<br><br>Mouse over an "
 		   "option for additional information, and Shift+Wheel to scroll this panel."));
+	addWidget(m_remix_settings = new RemixSettingsWidget(this, m_ui.settingsContainer), tr("RTX Remix"),
+		QStringLiteral("sparkling-2-line"),
+		tr("<strong>RTX Remix Settings</strong><hr>These options control the RTX Remix renderer: which runtime is loaded, "
+		   "where each game's Remix files live, and how the scene is scaled and lit.<br><br>Mouse over an option for "
+		   "additional information, and Shift+Wheel to scroll this panel."));
 	addWidget(m_osd_settings = new OSDSettingsWidget(this, m_ui.settingsContainer), tr("On-Screen Display"),
 		QStringLiteral("heart-circle-line"),
 		tr("<strong>On-Screen Display Settings</strong><hr>These options control the on-screen display (OSD) overlays shown during gameplay.<br><br>Mouse over an option for additional information, and Shift+Wheel to scroll this panel."));

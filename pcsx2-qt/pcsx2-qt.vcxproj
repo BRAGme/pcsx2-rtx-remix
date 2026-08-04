@@ -105,6 +105,7 @@
     <ClCompile Include="Settings\DebugAnalysisSettingsWidget.cpp" />
     <ClCompile Include="Settings\DebugSettingsWidget.cpp" />
     <ClCompile Include="Settings\FolderSettingsWidget.cpp" />
+    <ClCompile Include="Settings\RemixSettingsWidget.cpp" />
     <ClCompile Include="Settings\GameCheatSettingsWidget.cpp" />
     <ClCompile Include="Settings\GamePatchSettingsWidget.cpp" />
     <ClCompile Include="Settings\MemoryCardConvertWorker.cpp" />
@@ -221,6 +222,7 @@
     <QtMoc Include="Debugger\SymbolTree\TypeString.h" />
     <ClInclude Include="Settings\ControllerSettingWidgetBinder.h" />
     <QtMoc Include="Settings\FolderSettingsWidget.h" />
+    <QtMoc Include="Settings\RemixSettingsWidget.h" />
     <QtMoc Include="Settings\DebugAnalysisSettingsWidget.h" />
     <QtMoc Include="Settings\DebugSettingsWidget.h" />
     <QtMoc Include="Settings\GameCheatSettingsWidget.h" />
@@ -343,6 +345,7 @@
     <QtUi Include="Settings\DEV9SettingsWidget.ui" />
     <QtUi Include="Settings\EmulationSettingsWidget.ui" />
     <QtUi Include="Settings\FolderSettingsWidget.ui" />
+    <QtUi Include="Settings\RemixSettingsWidget.ui" />
     <QtUi Include="Settings\GameCheatSettingsWidget.ui" />
     <QtUi Include="Settings\GameFixSettingsWidget.ui" />
     <QtUi Include="Settings\GameListSettingsWidget.ui" />

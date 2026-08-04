@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/Remix/RemixMaterials.h"
+#include "GS/Remix/RemixPaths.h"
 
 #include "GS/GSLocalMemory.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
@@ -408,6 +409,17 @@ namespace remix_ps2::materials
 			const u32 crc = VMManager::GetDiscCRC();
 			if (serial.empty() && crc == 0)
 				return paths;
+
+			// The per-game folder layer (Remix\<SERIAL>\rtx.conf, then user.conf) comes first, so
+			// the flat <exe dir>\<SERIAL>.conf files below still outrank it. That ordering is
+			// deliberate: those flat files predate this layout and are what the existing A/B
+			// harness and the hand-written hash lists live in, so adopting the folder must not
+			// silently change what a title already renders like.
+			if (const std::string game_dir = remix_ps2::paths::game_dir(); !game_dir.empty())
+			{
+				paths.push_back(Path::Combine(game_dir, "rtx.conf"));
+				paths.push_back(Path::Combine(game_dir, "user.conf"));
+			}
 
 			const std::string dir(Path::GetDirectory(FileSystem::GetProgramPath()));
 			const std::string sanitized(Path::SanitizeFileName(serial));

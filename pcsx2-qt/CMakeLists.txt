@@ -100,6 +100,9 @@ target_sources(pcsx2-qt PRIVATE
 	Settings/FolderSettingsWidget.cpp
 	Settings/FolderSettingsWidget.h
 	Settings/FolderSettingsWidget.ui
+	Settings/RemixSettingsWidget.cpp
+	Settings/RemixSettingsWidget.h
+	Settings/RemixSettingsWidget.ui
 	Settings/GameCheatSettingsWidget.cpp
 	Settings/GameCheatSettingsWidget.h
 	Settings/GameCheatSettingsWidget.ui

@@ -131,3 +131,7 @@ CMakeSettings.json
 /ci-artifacts/
 /out/
 /.cache/
+
+# Per-game Remix files (generated at runtime)
+bin/RemixGames/
+

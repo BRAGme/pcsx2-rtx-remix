@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/Remix/RemixRuntime.h"
+#include "GS/Remix/RemixPaths.h"
 
 #include "Config.h"
 
@@ -73,14 +74,6 @@ namespace remix_ps2
 		// <exe dir>\remix\d3d9.dll, unless PCSX2_REMIX_DLL points elsewhere.
 		// The runtime is deliberately NOT placed next to pcsx2-qt.exe: a file called d3d9.dll
 		// there would be picked up by anything else in the process that resolves that name.
-		std::wstring resolve_runtime_path()
-		{
-			if (std::wstring env = read_env(L"PCSX2_REMIX_DLL"); !env.empty())
-				return env;
-
-			return widen(Path::Combine(EmuFolders::AppRoot, "remix" FS_OSPATH_SEPARATOR_STR "d3d9.dll"));
-		}
-
 		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
 		void log_dll_identity(const std::wstring& path)
 		{
@@ -140,7 +133,12 @@ namespace remix_ps2
 		if (m_ok)
 			return true;
 
-		const std::wstring path = resolve_runtime_path();
+		// Before anything touches the DLL: this redirects RtxFileSys (mods/captures/logs) at
+		// this title's own folder and bridges the PCSX2 settings onto the PCSX2_REMIX_* knobs.
+		// Both are read-once inside the runtime, so there is no later opportunity.
+		paths::apply_before_runtime_load();
+
+		const std::wstring path = paths::runtime_dll();
 		if (path.empty())
 		{
 			ERROR_LOG("Remix: could not resolve a runtime path");
