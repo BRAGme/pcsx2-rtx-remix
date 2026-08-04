@@ -50,21 +50,6 @@ namespace remix_ps2
 			out[2] = (a[0] * b[1]) - (a[1] * b[0]);
 		}
 
-		bool unproject(const mat4& inverse_m, float ndc_x, float ndc_y, float ndc_z, float (&out)[3])
-		{
-			const float clip[4] = {ndc_x, ndc_y, ndc_z, 1.f};
-			float world[4]{};
-			transform_point(inverse_m, clip, world);
-
-			if (!std::isfinite(world[3]) || std::abs(world[3]) < 1e-9f)
-				return false;
-
-			out[0] = world[0] / world[3];
-			out[1] = world[1] / world[3];
-			out[2] = world[2] / world[3];
-			return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
-		}
-
 		// The eye is the world point whose clip x, y and w all vanish.
 		bool solve_camera_position(const mat4& m, float (&out)[3])
 		{
@@ -132,20 +117,41 @@ namespace remix_ps2
 				return false;
 			};
 
-			mat4 inverse_fused{};
-			if (!mat4_invert(fused, inverse_fused))
+			// Columns {0, 1, 3} only -- NOT the full 4x4 inverse this used to take.
+			//
+			// MEASURED on Rainbow Six 3 (-state 9), 33 s from a cold boot: of 141k candidate
+			// matrices, 115,172 were refused right here by mat4_invert and only 15,059 got far
+			// enough to be judged non-perspective. The title's VU1 emits z = w + const, so col2
+			// IS col3 apart from m[3][2] (= 2715.9) -- see RemixSubmit.cpp:674. Two columns that
+			// agree to within an offset make the 4x4 determinant a catastrophic cancellation in
+			// float, and the real camera matrix came back numerically singular along with the
+			// garbage. Nothing downstream wanted that column anyway: rebuild_projection_z
+			// discards the recovered z outright and takes near/far from world-unit constants.
+			//
+			// So take the basis from the same three well-conditioned equations solve_camera_position
+			// and make_clip_solver already use, for the reason the clip_solver comment gives --
+			// three equations in three unknowns is exactly determined, because w = 1/Q carries the
+			// absolute depth. This is equivalent for a title whose z column IS trustworthy, so it
+			// is not a Rainbow Six 3 special case.
+			clip_solver solver{};
+			if (!make_clip_solver(fused, solver))
 				return fail(split_stage::invert_fused);
 
 			float cam_pos[3]{};
 			if (!solve_camera_position(fused, cam_pos))
 				return fail(split_stage::camera_position);
 
+			// The eye is where clip w vanishes, so the point at clip w = 1 on the view axis is
+			// one unit of depth ahead of it, and (0, 1, 1) is that point displaced up the screen.
 			float center[3]{};
 			float above[3]{};
-			if (!unproject(inverse_fused, 0.f, 0.f, 0.5f, center) ||
-				!unproject(inverse_fused, 0.f, 1.f, 0.5f, above))
+			solve_world_position(solver, 0.f, 0.f, 1.f, center);
+			solve_world_position(solver, 0.f, 1.f, 1.f, above);
+
+			for (u32 k = 0; k < 3; ++k)
 			{
-				return fail(split_stage::unproject);
+				if (!std::isfinite(center[k]) || !std::isfinite(above[k]))
+					return fail(split_stage::unproject);
 			}
 
 			float forward[3] = {center[0] - cam_pos[0], center[1] - cam_pos[1], center[2] - cam_pos[2]};
