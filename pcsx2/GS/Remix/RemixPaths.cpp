@@ -90,6 +90,10 @@ namespace remix_ps2
 			// writes apart from the caller's.
 			std::unordered_set<std::string> s_external_env;
 
+			// Bumped by apply_knob whenever a knob's environment value actually changes. The
+			// backend caches its knob reads against this instead of re-reading the environment.
+			u64 s_knob_generation = 0;
+
 			bool externally_set(const knob& k)
 			{
 				return s_external_env.find(k.env) != s_external_env.end();
@@ -131,9 +135,26 @@ namespace remix_ps2
 				if (k.type == knob_type::Boolean)
 					text = StringUtil::ToChars(StringUtil::FromChars<bool>(raw).value_or(false) ? 1 : 0);
 
-				SetEnvironmentVariableW(env_name_for(k).c_str(), widen(text).c_str());
+				// Write only on a real change, and count the changes. A knob the settings page
+				// presents as live is only live if the backend re-reads it, and the backend cannot
+				// afford a GetEnvironmentVariableW per draw -- so it caches against this counter
+				// and re-reads when it moves. Comparing here is what keeps that counter meaningful:
+				// apply_live_knobs() runs every frame, so bumping unconditionally would invalidate
+				// every cache every frame and put the env read back in the hot path.
+				const std::wstring name = env_name_for(k);
+				const std::wstring wide = widen(text);
+				if (read_env(name.c_str()) == wide)
+					return;
+
+				SetEnvironmentVariableW(name.c_str(), wide.c_str());
+				++s_knob_generation;
 			}
 		} // namespace
+
+		u64 knob_generation()
+		{
+			return s_knob_generation;
+		}
 
 		bool per_game_enabled()
 		{

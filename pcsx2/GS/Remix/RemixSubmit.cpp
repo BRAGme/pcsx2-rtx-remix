@@ -2525,11 +2525,50 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// A knob that really is live, as opposed to one the settings page merely claims is.
+		//
+		// The `static const int value = read_env_int(...)` idiom below used to be applied to knobs
+		// the knob table marks latched=false, so the settings page offered them without a
+		// "(restart)" note and changing them did nothing until the emulator was restarted. Reading
+		// the environment on every call instead is not an option -- these sit in the per-draw path.
+		//
+		// So: parse once, then re-parse only when paths::apply_live_knobs() reports that the value
+		// behind the variable actually changed. Single-threaded by construction; every caller is on
+		// the GS thread, which is also the thread that bumps the generation.
+		class live_int
+		{
+		public:
+			constexpr live_int(const wchar_t* name, s64 fallback, s64 lo, s64 hi)
+				: m_name(name), m_fallback(fallback), m_lo(lo), m_hi(hi)
+			{
+			}
+
+			int get()
+			{
+				if (const u64 generation = remix_ps2::paths::knob_generation(); generation != m_generation)
+				{
+					m_generation = generation;
+					m_value = static_cast<int>(
+						std::clamp<s64>(remix_ps2::read_env_int(m_name, m_fallback), m_lo, m_hi));
+				}
+
+				return m_value;
+			}
+
+		private:
+			const wchar_t* m_name;
+			s64 m_fallback;
+			s64 m_lo;
+			s64 m_hi;
+			// Deliberately not 0: generation starts at 0, so this forces the first get() to parse.
+			u64 m_generation = ~0ull;
+			int m_value = 0;
+		};
+
 		int texture_stage_mode()
 		{
-			static const int value =
-				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_TEXSTAGE", 1), 0, 1));
-			return value;
+			static live_int value(L"PCSX2_REMIX_TEXSTAGE", 1, 0, 1);
+			return value.get();
 		}
 
 		int alpha_state_mode()
@@ -2683,20 +2722,25 @@ namespace RemixSubmit
 		// geometry, so the player is looking at the inside of it. Tagging it SKY moves it to the
 		// background at infinity.
 		//
-		// PCSX2_REMIX_SKY:      0 = off, 1 = depth-neutral (default).
-		// PCSX2_REMIX_SKYORDER: when > 0, additionally require the draw to be among the first N
-		//                       gate-passing draws of the frame.
+		// PCSX2_REMIX_SKY:      0 = off
+		//                       1 = depth-neutral (default): the draw must neither test nor write Z
+		//                       2 = draw order only: the first SKYORDER draws are sky whatever their
+		//                           depth state. This is dxvk-remix's own rtx.skyDrawcallIdThreshold
+		//                           rule, and it exists because the depth-neutral test is not
+		//                           universal -- a title that draws its sky with Z testing on can
+		//                           never be caught by mode 1, no matter what SKYORDER is set to.
+		// PCSX2_REMIX_SKYORDER: how many leading gate-passing draws of the frame are eligible.
+		//                       Narrows mode 1; REQUIRED by mode 2.
 		int sky_mode()
 		{
-			static const int value = static_cast<int>(remix_ps2::read_env_int(L"PCSX2_REMIX_SKY", 1));
-			return value;
+			static live_int value(L"PCSX2_REMIX_SKY", 1, 0, 2);
+			return value.get();
 		}
 
 		u32 sky_order_limit()
 		{
-			static const u32 value =
-				static_cast<u32>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_SKYORDER", 0)));
-			return value;
+			static live_int value(L"PCSX2_REMIX_SKYORDER", 0, 0, 100000);
+			return static_cast<u32>(value.get());
 		}
 
 		// 'depth_read'/'depth_write' come from GSRendererHW's own DepthRead()/DepthWrite()
@@ -2705,13 +2749,22 @@ namespace RemixSubmit
 		// interpretation of the same state.
 		bool classify_sky(bool depth_read, bool depth_write, u64 draw_ordinal)
 		{
-			if (sky_mode() == 0)
+			const int mode = sky_mode();
+			if (mode == 0)
 				return false;
+
+			const u32 limit = sky_order_limit();
+
+			if (mode == 2)
+			{
+				// Order alone. Guarded on a non-zero limit because "the first 0 draws" read as "no
+				// limit" in mode 1, and inheriting that here would tag the entire frame as sky.
+				return (limit != 0) && (draw_ordinal < limit);
+			}
 
 			if (depth_read || depth_write)
 				return false;
 
-			const u32 limit = sky_order_limit();
 			return (limit == 0) || (draw_ordinal < limit);
 		}
 

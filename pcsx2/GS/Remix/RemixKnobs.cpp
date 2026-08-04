@@ -60,13 +60,18 @@ namespace remix_ps2
 
 			// ------------------------------------------------------------------------ Sky
 			{"SKY", "Sky", "Sky classification", knob_type::Choice, 1, 0, 2, 1,
-				"Off|Classify and tag|Classify, tag and push to infinity",
-				"Detects the skybox and tags it so Remix treats it as sky rather than as geometry "
-				"a few feet in front of the camera.",
+				"Off|Depth-neutral draws|First N draws (needs Sky draw order)",
+				"Tags the skybox so Remix renders it at infinity instead of as geometry a few feet "
+				"in front of the camera. \"Depth-neutral\" catches a sky drawn with Z testing and Z "
+				"writing both off. If the title's sky tests Z, that test can never match it -- use "
+				"\"First N draws\" and set Sky draw order, which is how dxvk-remix does it natively. "
+				"Neither test is needed if you tag the sky texture by hand in the Remix developer "
+				"menu; that is exact, and it applies without a restart.",
 				false},
-			{"SKYORDER", "Sky", "Sky draw order", knob_type::Integer, 0, 0, 1000, 1, nullptr,
-				"How many leading draws in a frame are eligible to be classified as sky. 0 uses the "
-				"geometric test alone.",
+			{"SKYORDER", "Sky", "Sky draw order", knob_type::Integer, 0, 0, 100000, 1, nullptr,
+				"How many leading draws in a frame are eligible to be classified as sky. Narrows "
+				"\"Depth-neutral draws\" (0 = no limit); required by \"First N draws\", which does "
+				"nothing while this is 0.",
 				false},
 
 			// ------------------------------------------------------- Textures and Materials
@@ -148,7 +153,7 @@ namespace remix_ps2
 				"instead of hashing positions.",
 				false},
 			{"IDCOLOR", "Mesh Identity", "Include vertex colour in identity", knob_type::Boolean, 1, 0, 1, 1,
-				nullptr, "Folds vertex colour into the mesh hash.", false},
+				nullptr, "Folds vertex colour into the mesh hash.", true},
 			{"IDSLOTS", "Mesh Identity", "Identity slots", knob_type::Integer, 4, 1, 64, 1, nullptr,
 				"Candidate slots considered when matching a mesh to a previous one.", false},
 			{"MESHCAP", "Mesh Identity", "Mesh cache size", knob_type::Integer, 4096, 16, 65536, 256, nullptr,
@@ -160,7 +165,7 @@ namespace remix_ps2
 			{"INSTBUDGET", "Mesh Identity", "Instances per frame", knob_type::Integer, 0, 0, 1000000, 64,
 				nullptr, "Cap on instances submitted per frame. 0 is unlimited.", false},
 			{"REUSEHANDLE", "Mesh Identity", "Reuse mesh handles", knob_type::Boolean, 0, 0, 1, 1, nullptr,
-				"Reuses a mesh handle when the geometry is judged unchanged.", false},
+				"Reuses a mesh handle when the geometry is judged unchanged.", true},
 			{"REUSEPOOL", "Mesh Identity", "Mesh reuse pool", knob_type::Integer, 0, 0, 65536, 64, nullptr,
 				"Size of the pool of handles held for reuse. 0 disables pooling.", false},
 			{"BATCH", "Mesh Identity", "Batch draws", knob_type::Boolean, 0, 0, 1, 1, nullptr,
@@ -184,11 +189,11 @@ namespace remix_ps2
 			{"SCANKICKS", "Diagnostics", "VU kick scan depth", knob_type::Integer, 16, 0, 4096, 8, nullptr,
 				"How many VU1 kicks are scanned per frame when recovering the camera.", false},
 			{"NODEBUGSCENE", "Diagnostics", "Disable debug scene", knob_type::Boolean, 0, 0, 1, 1, nullptr,
-				"Suppresses the built-in debug geometry.", false},
+				"Suppresses the built-in debug geometry.", true},
 			{"NODRAWINSTANCE", "Diagnostics", "Do not submit instances", knob_type::Boolean, 0, 0, 1, 1,
-				nullptr, "Builds meshes but submits no instances. Isolates cost between the two.", false},
+				nullptr, "Builds meshes but submits no instances. Isolates cost between the two.", true},
 			{"SPIKE", "Diagnostics", "Log frame spikes", knob_type::Boolean, 0, 0, 1, 1, nullptr,
-				"Logs frames that took unusually long.", false},
+				"Logs frames that took unusually long.", true},
 		};
 	} // namespace
 

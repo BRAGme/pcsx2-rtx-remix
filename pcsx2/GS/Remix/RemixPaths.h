@@ -77,5 +77,10 @@ namespace remix_ps2
 		// game runs. Latched knobs are deliberately left alone. Call once per frame; it is a
 		// handful of settings lookups.
 		void apply_live_knobs();
+
+		// Counts how many times a knob's environment value has actually changed. A backend knob
+		// that wants to be live caches its parsed value alongside this and re-reads only when it
+		// moves, which keeps GetEnvironmentVariableW out of the per-draw path.
+		u64 knob_generation();
 	} // namespace paths
 } // namespace remix_ps2
