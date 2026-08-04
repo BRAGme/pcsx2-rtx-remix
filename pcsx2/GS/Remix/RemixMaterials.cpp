@@ -4,6 +4,8 @@
 #include "GS/Remix/RemixMaterials.h"
 
 #include "GS/GSLocalMemory.h"
+#include "GS/Renderers/HW/GSTextureReplacements.h"
+#include "common/StringUtil.h"
 #include "GS/Renderers/Common/GSRenderer.h"
 
 #include "Config.h"
@@ -120,6 +122,16 @@ namespace remix_ps2::materials
 		// untextured material was given a white 4x4 texture AND a white albedoConstant, so albedo
 		// going from 0 (nullptr) to ~580,000 is equally consistent with the texture resolving or with
 		// the constant being used once a path is merely named. Same colour either way, no information.
+		// PCSX2_REMIX_REPLACEALBEDO: point a material's albedoTexture at the user's replacement .dds
+		// on disk instead of the API pseudo-path. Default 1 -- the pseudo-path is measurably broken in
+		// the deployed runtime, so a real path is the only route that binds anything, and it falls
+		// back to the pseudo-path automatically when no replacement exists.
+		bool replacement_albedo()
+		{
+			static const bool value = read_env_int(L"PCSX2_REMIX_REPLACEALBEDO", 1) != 0;
+			return value;
+		}
+
 		bool albedo_probe()
 		{
 			static const bool value = read_env_int(L"PCSX2_REMIX_ALBEDOPROBE", 0) != 0;
@@ -173,6 +185,9 @@ namespace remix_ps2::materials
 			std::vector<u8> pixels;
 			u64 last_used_frame = 0;
 			u64 created_frame = 0; // frame CreateMaterial ran, for the late-rebuild probe
+			// Resolved replacement .dds path, empty when there is none. Held here because
+			// rebuild_material only receives content_hash and cannot redo the HashCacheKey lookup.
+			std::wstring albedo_file;
 			bool late_rebuilt = false;
 			u64 generation = 0; // tag-list generation this material was built for
 			u32 width = 0;
@@ -189,6 +204,8 @@ namespace remix_ps2::materials
 			u64 destroyed = 0;
 			u64 deferred = 0; // over the per-frame budget
 			u64 skip_no_source = 0;
+			u64 replacement_albedo = 0;   // materials bound to a real replacement .dds
+			u64 replacement_not_dds = 0;  // replacement existed but was not .dds, so unusable
 			u64 skip_target = 0; // render-target source: no stable content identity
 			u64 skip_unsupported = 0; // no rtx entry point, or absurd dimensions
 			u64 skip_failed = 0; // quarantined after a decode / runtime failure
@@ -710,7 +727,8 @@ namespace remix_ps2::materials
 			return true;
 		}
 
-		bool create(const runtime& rt, u64 content_hash, const GSTextureCache::Source& source, material_entry& entry)
+		bool create(const runtime& rt, u64 content_hash, const GSTextureCache::Source& source,
+			const GSTextureCache::HashCacheKey& key, material_entry& entry)
 		{
 			const Common::Timer::Value decode_start = Common::Timer::GetCurrentValue();
 			const bool decoded = decode(source, entry.pixels, entry.width, entry.height);
@@ -767,6 +785,38 @@ namespace remix_ps2::materials
 			wchar_t albedo_path[32]{};
 			::swprintf_s(albedo_path, L"0x%016llX", static_cast<unsigned long long>(content_hash));
 
+			// ...except it does NOT resolve in the deployed runtime, so on its own no texture ever
+			// reaches a surface. MEASURED: with the shared untextured material's 4x4 filled MAGENTA
+			// and albedoConstant left white, SOCOM -- where ~76% of draws use it -- renders
+			// mean_sat 0.038 with 0.11% coloured pixels. No magenta. A late material rebuild
+			// (PCSX2_REMIX_MATREBUILD=120) changes nothing, so it is not an ordering or lifetime race.
+			//
+			// So prefer a REAL FILE PATH when the user has a replacement pack. Remix resolves
+			// albedoTexture through its asset loader, which handles .dds, and PCSX2's replacement map
+			// is keyed on the very HashCacheKey we just computed -- an exact lookup, not a guess. It
+			// also renders the user's UPSCALED texture instead of the 8-bit original.
+			//
+			// .dds only: findAsset rejects anything else outright ("use the RTX-Remix toolkit and
+			// ingest the following asset"), so a PNG replacement would silently bind nothing and be
+			// worse than leaving the pseudo-path in place.
+			std::wstring replacement_path;
+			if (replacement_albedo())
+			{
+				if (const std::string* path = GSTextureReplacements::GetReplacementTexturePath(key))
+				{
+					if (StringUtil::EndsWithNoCase(*path, ".dds"))
+					{
+						replacement_path = StringUtil::UTF8StringToWideString(*path);
+						entry.albedo_file = replacement_path;
+						++s_stats.replacement_albedo;
+					}
+					else
+					{
+						++s_stats.replacement_not_dds;
+					}
+				}
+			}
+
 			remixapi_MaterialInfoOpaqueEXT opaque{};
 			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
 			opaque.pNext = nullptr;
@@ -805,7 +855,9 @@ namespace remix_ps2::materials
 			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
 			material.pNext = &opaque;
 			material.hash = content_hash;
-			material.albedoTexture = (material_stage() >= 4) ? albedo_path : nullptr;
+			material.albedoTexture = (material_stage() >= 4)
+				? (replacement_path.empty() ? albedo_path : replacement_path.c_str())
+				: nullptr;
 			material.normalTexture = nullptr;
 			material.tangentTexture = nullptr;
 			material.emissiveTexture = is_emissive ? albedo_path : nullptr;
@@ -872,7 +924,9 @@ namespace remix_ps2::materials
 			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
 			material.pNext = &opaque;
 			material.hash = content_hash;
-			material.albedoTexture = (material_stage() >= 4) ? albedo_path : nullptr;
+			material.albedoTexture = (material_stage() >= 4)
+				? (entry.albedo_file.empty() ? albedo_path : entry.albedo_file.c_str())
+				: nullptr;
 			material.emissiveTexture = is_emissive ? albedo_path : nullptr;
 			material.emissiveIntensity = intensity;
 			material.emissiveColorConstant = is_emissive ? remixapi_Float3D{1.f, 1.f, 1.f} : remixapi_Float3D{0.f, 0.f, 0.f};
@@ -1461,7 +1515,7 @@ namespace remix_ps2::materials
 			material_entry& entry = it->second;
 			entry.last_used_frame = frame;
 
-			if (!create(rt, content_hash, *source, entry))
+			if (!create(rt, content_hash, *source, key, entry))
 			{
 				entry.failed = true;
 				entry.texture = nullptr;
@@ -1680,13 +1734,14 @@ namespace remix_ps2::materials
 		return fmt::format(
 			"Remix: mat live {} | bind {} hit {} miss {} created {} destroyed {} deferred {} | "
 			"skip: nosrc {} target {} unsup {} failed {} | fail {} | "
-			"unique content {} tex0 {} (clut variants {}) | tags {} hits {} | "
+			"unique content {} tex0 {} (clut variants {}) | replacement dds {} skipped-nondds {} | tags {} hits {} | "
 			"hash {:.0f} ms ({:.2f} us/bind) decode {:.0f} ms",
 			s_entries.size(), s_stats.binds, s_stats.hits, s_stats.misses, s_stats.created,
 			s_stats.destroyed, s_stats.deferred, s_stats.skip_no_source, s_stats.skip_target,
 			s_stats.skip_unsupported, s_stats.skip_failed, s_stats.failures,
 			s_stats.unique_content, s_stats.unique_tex0,
 			(s_stats.unique_content > s_stats.unique_tex0) ? (s_stats.unique_content - s_stats.unique_tex0) : 0,
+			s_stats.replacement_albedo, s_stats.replacement_not_dds,
 			s_category_tags, s_category_hits,
 			hash_ms, hash_us_per_bind, decode_ms);
 	}

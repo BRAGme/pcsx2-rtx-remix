@@ -502,6 +502,16 @@ bool GSTextureReplacements::HasReplacementTextureWithOtherPalette(const GSTextur
 	return s_replacement_textures_without_clut_hash.find(name) != s_replacement_textures_without_clut_hash.end();
 }
 
+const std::string* GSTextureReplacements::GetReplacementTexturePath(const GSTextureCache::HashCacheKey& hash)
+{
+	// Same key construction as LookupReplacementTexture, deliberately: a path that did not agree with
+	// what the replacement system itself would load would be worse than no path at all.
+	const TextureName name(CreateTextureName(hash, 0));
+
+	const auto it = s_replacement_texture_filenames.find(name);
+	return (it != s_replacement_texture_filenames.end()) ? &it->second : nullptr;
+}
+
 GSTexture* GSTextureReplacements::LookupReplacementTexture(const GSTextureCache::HashCacheKey& hash, bool mipmap,
 	bool* pending, std::pair<u8, u8>* alpha_minmax)
 {
