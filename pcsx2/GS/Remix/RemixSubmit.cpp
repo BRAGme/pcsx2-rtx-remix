@@ -284,6 +284,10 @@ namespace RemixSubmit
 		remixapi_LightHandle s_debug_light = nullptr;
 
 		u64 s_frame_counter = 0;
+
+		// Last knob generation the mesh cache was flushed for. ~0 means "never observed", which
+		// is distinct from generation 0 and keeps the first frame from flushing an empty cache.
+		u64 s_knob_generation_seen = ~0ull;
 		u64 s_submitted_this_frame = 0;
 
 		// Consecutive frames that submitted nothing, and how many of them the beacon waits for.
@@ -5067,6 +5071,41 @@ namespace RemixSubmit
 		// that one applies the per-game .conf, and a title's .conf should outrank the GUI's
 		// global values the same way it outranks everything else.
 		remix_ps2::paths::apply_live_knobs();
+
+		// A knob that changes the GEOMETRY has to invalidate the mesh cache, or it only takes
+		// effect on meshes created after it -- which is what turning the crease angle on looked
+		// like in practice: the arm stayed faceted until enough turning evicted and rebuilt it.
+		//
+		// Deliberately keyed on the generation rather than on which knob moved. The cache holds
+		// vertex data, so every knob that feeds vertex data is in scope, and enumerating them
+		// here is a list that would silently fall out of date. Knob changes are user-driven and
+		// rare, so a full flush costs one frame of rebuilds and cannot accumulate.
+		if (const u64 generation = remix_ps2::paths::knob_generation(); generation != s_knob_generation_seen)
+		{
+			const bool first = (s_knob_generation_seen == ~0ull);
+			s_knob_generation_seen = generation;
+
+			// Not on the first observation: at that point the cache is empty and the generation
+			// is simply catching up with the writes apply_before_runtime_load already made.
+			if (!first)
+			{
+				const auto& api = s_remix.api();
+				for (auto& [key, entry] : s_meshes)
+				{
+					if (entry.handle)
+					{
+						remix_ps2::guarded_destroy_mesh(api.DestroyMesh, entry.handle);
+						++s_stats.meshes_destroyed;
+						++s_stats.meshes_destroyed_frame;
+					}
+				}
+
+				if (!s_meshes.empty())
+					INFO_LOG("Remix: settings changed, rebuilding {} cached meshes", s_meshes.size());
+
+				s_meshes.clear();
+			}
+		}
 
 		log_stats(false);
 	}
