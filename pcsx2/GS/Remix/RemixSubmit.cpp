@@ -433,14 +433,82 @@ namespace RemixSubmit
 		// Defined below with the other env helpers.
 		float env_float(const wchar_t* name, float fallback);
 
+		// A knob that really is live, as opposed to one the settings page merely claims is.
+		//
+		// The `static const int value = read_env_int(...)` idiom below used to be applied to knobs
+		// the knob table marks latched=false, so the settings page offered them without a
+		// "(restart)" note and changing them did nothing until the emulator was restarted. Reading
+		// the environment on every call instead is not an option -- these sit in the per-draw path.
+		//
+		// So: parse once, then re-parse only when paths::apply_live_knobs() reports that the value
+		// behind the variable actually changed. Single-threaded by construction; every caller is on
+		// the GS thread, which is also the thread that bumps the generation.
+		class live_int
+		{
+		public:
+			constexpr live_int(const wchar_t* name, s64 fallback, s64 lo, s64 hi)
+				: m_name(name), m_fallback(fallback), m_lo(lo), m_hi(hi)
+			{
+			}
+
+			int get()
+			{
+				if (const u64 generation = remix_ps2::paths::knob_generation(); generation != m_generation)
+				{
+					m_generation = generation;
+					m_value = static_cast<int>(
+						std::clamp<s64>(remix_ps2::read_env_int(m_name, m_fallback), m_lo, m_hi));
+				}
+
+				return m_value;
+			}
+
+		private:
+			const wchar_t* m_name;
+			s64 m_fallback;
+			s64 m_lo;
+			s64 m_hi;
+			// Deliberately not 0: generation starts at 0, so this forces the first get() to parse.
+			u64 m_generation = ~0ull;
+			int m_value = 0;
+		};
+
+		// The float twin of live_int, for the lighting knobs. Same contract: parse once, re-parse
+		// only when the settings page has actually moved the value.
+		class live_float
+		{
+		public:
+			constexpr live_float(const wchar_t* name, float fallback)
+				: m_name(name), m_fallback(fallback)
+			{
+			}
+
+			float get()
+			{
+				if (const u64 generation = remix_ps2::paths::knob_generation(); generation != m_generation)
+				{
+					m_generation = generation;
+					m_value = env_float(m_name, m_fallback);
+				}
+
+				return m_value;
+			}
+
+		private:
+			const wchar_t* m_name;
+			float m_fallback;
+			u64 m_generation = ~0ull;
+			float m_value = 0.f;
+		};
+
+
 		//   0 = no lights at all
 		//   1 = distance-independent fill: dome ambient + distant key. The default.
 		//   2 = the legacy camera-attached sphere light, kept for comparison
 		int light_mode()
 		{
-			static const int value =
-				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_LIGHTMODE", 1), 0, 2));
-			return value;
+			static live_int value(L"PCSX2_REMIX_LIGHTMODE", 1, 0, 2);
+			return value.get();
 		}
 
 		// Uniform ambient from every direction.
@@ -454,8 +522,8 @@ namespace RemixSubmit
 		// cost this project two rounds of "captures too dark to judge".
 		float ambient_radiance()
 		{
-			static const float value = env_float(L"PCSX2_REMIX_AMBIENT", 0.f);
-			return value;
+			static live_float value(L"PCSX2_REMIX_AMBIENT", 0.f);
+			return value.get();
 		}
 
 		// Directional key, and the light that actually carries the scene. Fixed in world space
@@ -471,14 +539,14 @@ namespace RemixSubmit
 		// with no lights of its own.
 		float key_radiance()
 		{
-			static const float value = env_float(L"PCSX2_REMIX_KEY", 100.f);
-			return value;
+			static live_float value(L"PCSX2_REMIX_KEY", 100.f);
+			return value.get();
 		}
 
 		float key_angle_degrees()
 		{
-			static const float value = env_float(L"PCSX2_REMIX_KEYANGLE", 8.f);
-			return value;
+			static live_float value(L"PCSX2_REMIX_KEYANGLE", 8.f);
+			return value.get();
 		}
 
 		// The world-space (or view-space, whichever is being submitted) bounding box of the
@@ -2525,46 +2593,6 @@ namespace RemixSubmit
 			return value;
 		}
 
-		// A knob that really is live, as opposed to one the settings page merely claims is.
-		//
-		// The `static const int value = read_env_int(...)` idiom below used to be applied to knobs
-		// the knob table marks latched=false, so the settings page offered them without a
-		// "(restart)" note and changing them did nothing until the emulator was restarted. Reading
-		// the environment on every call instead is not an option -- these sit in the per-draw path.
-		//
-		// So: parse once, then re-parse only when paths::apply_live_knobs() reports that the value
-		// behind the variable actually changed. Single-threaded by construction; every caller is on
-		// the GS thread, which is also the thread that bumps the generation.
-		class live_int
-		{
-		public:
-			constexpr live_int(const wchar_t* name, s64 fallback, s64 lo, s64 hi)
-				: m_name(name), m_fallback(fallback), m_lo(lo), m_hi(hi)
-			{
-			}
-
-			int get()
-			{
-				if (const u64 generation = remix_ps2::paths::knob_generation(); generation != m_generation)
-				{
-					m_generation = generation;
-					m_value = static_cast<int>(
-						std::clamp<s64>(remix_ps2::read_env_int(m_name, m_fallback), m_lo, m_hi));
-				}
-
-				return m_value;
-			}
-
-		private:
-			const wchar_t* m_name;
-			s64 m_fallback;
-			s64 m_lo;
-			s64 m_hi;
-			// Deliberately not 0: generation starts at 0, so this forces the first get() to parse.
-			u64 m_generation = ~0ull;
-			int m_value = 0;
-		};
-
 		int texture_stage_mode()
 		{
 			static live_int value(L"PCSX2_REMIX_TEXSTAGE", 1, 0, 1);
@@ -3511,6 +3539,149 @@ namespace RemixSubmit
 		}
 	}
 
+	namespace
+	{
+		// --- smooth normals -----------------------------------------------------------------
+		//
+		// The pass above gives every triangle a single face normal and writes it to all three of
+		// its corners, so a curved surface shades as a set of flat plates and the tessellation is
+		// visible -- on Rainbow Six 3 that reads as polygons on the squadmates' faces.
+		//
+		// Nothing in the developer menu can fix this. dxvk-remix has no smooth-normals category,
+		// and even if it did, categories select behaviour for the normals we send; they cannot
+		// invent normals we never sent. The PS2 has none to give us either: lighting runs on VU1
+		// and is baked into the vertex colours, so the GS draw stream carries no normal at all.
+		// They have to be generated here or not at all.
+		//
+		// PCSX2_REMIX_SMOOTHNORMALS is a crease angle in degrees. 0 (default) keeps today's flat
+		// normals. A corner is smoothed only when its own face normal lies within that angle of
+		// the averaged one, so a 60 degree setting rounds off a face while leaving a 90 degree
+		// building corner sharp -- one threshold can serve a scene containing both.
+		int smooth_normal_angle()
+		{
+			static live_int value(L"PCSX2_REMIX_SMOOTHNORMALS", 0, 0, 180);
+			return value.get();
+		}
+
+		void smooth_scratch_normals(float scene_scale)
+		{
+			const int degrees = smooth_normal_angle();
+			if (degrees <= 0)
+				return;
+
+			// Vertices are welded by position, because a PS2 draw is overwhelmingly an unindexed
+			// triangle list: the two corners that ought to share a normal are usually two separate
+			// entries holding the same coordinates, so averaging by index alone would do nothing.
+			//
+			// The tolerance is relative to the scene for the same reason the degenerate-area
+			// threshold above is -- maxpos is ~2,500 on Rainbow Six 3 and ~5,300 on SOCOM, so a
+			// fixed epsilon is either useless or merges the model.
+			const float step = std::max(scene_scale * 1e-5f, 1e-6f);
+			const float inv_step = 1.f / step;
+
+			static std::unordered_map<u64, u32> weld;
+			static std::vector<float> sums; // 3 floats per welded slot
+			static std::vector<u32> slot_of;
+
+			weld.clear();
+			sums.clear();
+			slot_of.assign(s_scratch_vertices.size(), 0u);
+
+			const auto slot_for = [&](u32 index) -> u32 {
+				const remixapi_HardcodedVertex& v = s_scratch_vertices[index];
+
+				u64 key = 1469598103934665603ull;
+				for (u32 axis = 0; axis < 3; ++axis)
+				{
+					const s64 q = static_cast<s64>(
+						std::llround(static_cast<double>(v.position[axis]) * static_cast<double>(inv_step)));
+					key = (key ^ static_cast<u64>(q)) * 1099511628211ull;
+				}
+
+				const auto found = weld.find(key);
+				if (found != weld.end())
+					return found->second;
+
+				const u32 slot = static_cast<u32>(sums.size() / 3);
+				sums.insert(sums.end(), {0.f, 0.f, 0.f});
+				weld.emplace(key, slot);
+				return slot;
+			};
+
+			// Accumulate the un-normalised cross product, which is twice the triangle area -- so
+			// large triangles weight the average more than slivers, without a separate area term.
+			for (size_t i = 0; (i + 2) < s_scratch_indices.size(); i += 3)
+			{
+				const u32 i0 = s_scratch_indices[i];
+				const u32 i1 = s_scratch_indices[i + 1];
+				const u32 i2 = s_scratch_indices[i + 2];
+
+				const remixapi_HardcodedVertex& v0 = s_scratch_vertices[i0];
+				const remixapi_HardcodedVertex& v1 = s_scratch_vertices[i1];
+				const remixapi_HardcodedVertex& v2 = s_scratch_vertices[i2];
+
+				const float e1[3] = {v1.position[0] - v0.position[0], v1.position[1] - v0.position[1],
+					v1.position[2] - v0.position[2]};
+				const float e2[3] = {v2.position[0] - v0.position[0], v2.position[1] - v0.position[1],
+					v2.position[2] - v0.position[2]};
+
+				const float n[3] = {
+					(e1[1] * e2[2]) - (e1[2] * e2[1]),
+					(e1[2] * e2[0]) - (e1[0] * e2[2]),
+					(e1[0] * e2[1]) - (e1[1] * e2[0])};
+
+				if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2]))
+					continue;
+
+				for (const u32 index : {i0, i1, i2})
+				{
+					const u32 slot = slot_for(index);
+					slot_of[index] = slot;
+					sums[(slot * 3) + 0] += n[0];
+					sums[(slot * 3) + 1] += n[1];
+					sums[(slot * 3) + 2] += n[2];
+				}
+			}
+
+			const float cos_limit = std::cos(static_cast<float>(degrees) * 3.14159265358979f / 180.f);
+
+			for (size_t i = 0; (i + 2) < s_scratch_indices.size(); i += 3)
+			{
+				for (u32 k = 0; k < 3; ++k)
+				{
+					const u32 index = s_scratch_indices[i + k];
+					remixapi_HardcodedVertex& target = s_scratch_vertices[index];
+					const u32 slot = slot_of[index];
+
+					const float s[3] = {sums[(slot * 3) + 0], sums[(slot * 3) + 1], sums[(slot * 3) + 2]};
+					const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]));
+
+					// Opposing faces can cancel to nothing. Keep the flat normal rather than
+					// normalising a zero vector into NaNs and handing them to the BVH build.
+					if (!std::isfinite(len) || len <= 0.f)
+						continue;
+
+					const float smoothed[3] = {s[0] / len, s[1] / len, s[2] / len};
+
+					// target.normal still holds this vertex's flat normal from the pass above.
+					const float dot = (smoothed[0] * target.normal[0]) + (smoothed[1] * target.normal[1]) +
+					                  (smoothed[2] * target.normal[2]);
+
+					// Past the crease angle the corner belongs to an edge, not a curve. doubleSided
+					// is set on our meshes, so a normal that ended up on the far side of the surface
+					// is a sign flip rather than a wrong direction -- compare on magnitude.
+					if (std::abs(dot) < cos_limit)
+						continue;
+
+					const float sign = (dot < 0.f) ? -1.f : 1.f;
+					target.normal[0] = smoothed[0] * sign;
+					target.normal[1] = smoothed[1] * sign;
+					target.normal[2] = smoothed[2] * sign;
+				}
+			}
+		}
+	} // namespace
+
 	void OnDrawPrims(const GSRendererHW& r, int rt_unscaled_width, int rt_unscaled_height, const void* tex_source)
 	{
 		if (!armed())
@@ -4038,7 +4209,8 @@ namespace RemixSubmit
 		}
 
 		// Flat per-triangle normals from the un-projected edges, AND -- load-bearing -- the
-		// point at which zero-area triangles are dropped instead of submitted.
+		// point at which zero-area triangles are dropped instead of submitted. The smoothing
+		// pass below runs after it and only rewrites the normals it produced.
 		//
 		// This code used to detect a degenerate triangle, decline to give it a normal, and hand
 		// it to CreateMesh anyway. A zero-area or slivered triangle is exactly what produces
@@ -4109,6 +4281,8 @@ namespace RemixSubmit
 			++s_stats.skip_all_degenerate;
 			return;
 		}
+
+		smooth_scratch_normals(degenerate_scale);
 
 		// --- material ------------------------------------------------------------------------
 		// Recomputed here rather than read off the Source: only HashCacheEntry* is stored

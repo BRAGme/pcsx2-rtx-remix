@@ -38,11 +38,11 @@ namespace remix_ps2
 				"is a corridor or an outdoor map; a point light at the camera does not.",
 				false},
 			{"KEY", "Lighting", "Key light brightness", knob_type::Float, 100.0, 0.0, 100000.0, 5.0,
-				nullptr, "Radiance of the key light.", true},
+				nullptr, "Radiance of the key light.", false},
 			{"KEYANGLE", "Lighting", "Key light angular size", knob_type::Float, 8.0, 0.1, 180.0, 1.0,
-				nullptr, "Angular diameter of the key light. Smaller is sharper shadows.", true},
+				nullptr, "Angular diameter of the key light. Smaller is sharper shadows.", false},
 			{"AMBIENT", "Lighting", "Ambient brightness", knob_type::Float, 0.0, 0.0, 100000.0, 1.0,
-				nullptr, "Radiance of the ambient dome. Raise to lift shadows that read as black.", true},
+				nullptr, "Radiance of the ambient dome. Raise to lift shadows that read as black.", false},
 
 			// --------------------------------------------------------------------- Camera
 			{"NOCAM", "Camera", "Disable camera recovery", knob_type::Boolean, 0, 0, 1, 1, nullptr,
@@ -120,6 +120,15 @@ namespace remix_ps2
 				false},
 
 			// ----------------------------------------------------------- Geometry and Filtering
+			{"SMOOTHNORMALS", "Geometry and Filtering", "Smooth normals (crease angle)",
+				knob_type::Integer, 0, 0, 180, 5, nullptr,
+				"Generates smooth vertex normals instead of one flat normal per triangle, so curved "
+				"surfaces stop reading as faceted plates -- the visible polygons on character faces. "
+				"The value is a crease angle in degrees: a corner is smoothed only if its own face "
+				"lies within that angle of the average, so 60 rounds off a face while leaving a 90 "
+				"degree building corner sharp. 0 keeps flat normals. The PS2 sends no normals of its "
+				"own, so nothing in the Remix developer menu can substitute for this.",
+				false},
 			{"UNTEXZ", "Geometry and Filtering", "Submit untextured draws", knob_type::Boolean, 1, 0, 1, 1,
 				nullptr,
 				"Routes untextured draws through the Z-to-w calibration and submits them. They are "
