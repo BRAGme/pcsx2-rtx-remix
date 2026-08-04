@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/Remix/RemixPaths.h"
+#include "GS/Remix/RemixKnobs.h"
 #include "GS/Remix/RemixRuntime.h"
 
 #include "Config.h"
@@ -15,6 +16,7 @@
 #include "fmt/format.h"
 
 #include <string>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include "common/RedtapeWindows.h"
@@ -78,31 +80,48 @@ namespace remix_ps2
 #endif
 			}
 
-			// Bridges one float setting onto a PCSX2_REMIX_* knob. Absent from the .ini means
-			// "leave the backend default alone" -- which is why every one of these is read with a
-			// sentinel rather than with the backend's own default value. Writing the backend
-			// default back out would be indistinguishable from the user having chosen it, and
-			// would then outrank a per-game .conf that wanted something else.
-			void bridge_float(const char* key, const wchar_t* env_name)
+			// Knobs whose variable was already set by the real environment when we started.
+			//
+			// These are never written, ever. The A/B harness passes knobs through the environment,
+			// and a live re-apply that overwrote them would make every measurement silently read
+			// whatever the GUI happened to hold instead of what the harness asked for. Recorded
+			// once, before we set anything ourselves, because after that we could not tell our own
+			// writes apart from the caller's.
+			std::unordered_set<std::string> s_external_env;
+
+			bool externally_set(const knob& k)
 			{
-				constexpr float kUnset = -1e30f;
-
-				const float value = Host::GetFloatSettingValue(kSection, key, kUnset);
-				if (value == kUnset)
-					return;
-
-				set_env_if_unset(env_name, widen(fmt::format("{:g}", value)));
+				return s_external_env.find(k.env) != s_external_env.end();
 			}
 
-			void bridge_int(const char* key, const wchar_t* env_name)
+			std::wstring env_name_for(const knob& k)
 			{
-				constexpr int kUnset = INT32_MIN;
+				return L"PCSX2_REMIX_" + widen(k.env);
+			}
 
-				const int value = Host::GetIntSettingValue(kSection, key, kUnset);
+			// Pushes one knob's setting into the environment.
+			//
+			// Absent from the .ini means "leave the backend default alone", so each is read with a
+			// sentinel rather than with the backend's own default. Writing the backend default back
+			// out would be indistinguishable from the user having chosen it, and would then outrank
+			// a per-game .conf that wanted something else.
+			void apply_knob(const knob& k)
+			{
+				if (externally_set(k))
+					return;
+
+				constexpr double kUnset = -1e30;
+
+				const double value = static_cast<double>(
+					Host::GetFloatSettingValue(kSection, k.env, static_cast<float>(kUnset)));
 				if (value == kUnset)
 					return;
 
-				set_env_if_unset(env_name, widen(fmt::format("{}", value)));
+				const std::string text = (k.type == knob_type::Float) ?
+					fmt::format("{:g}", value) :
+					fmt::format("{}", static_cast<s64>(value));
+
+				SetEnvironmentVariableW(env_name_for(k).c_str(), widen(text).c_str());
 			}
 		} // namespace
 
@@ -199,15 +218,40 @@ namespace remix_ps2
 			return s_game_id_at_init;
 		}
 
+		void apply_live_knobs()
+		{
+			// Latched knobs are skipped rather than written: the backend captured them at startup,
+			// so writing them now would change what the settings page reports the backend is using
+			// without changing anything the backend actually does.
+			size_t count = 0;
+			const knob* table = knobs(count);
+
+			for (size_t i = 0; i < count; ++i)
+			{
+				if (!table[i].latched)
+					apply_knob(table[i]);
+			}
+		}
+
 		void apply_before_runtime_load()
 		{
-			// Value knobs first: these are read through `static const` locals in RemixSubmit, so
-			// they latch on first use and there is no later point at which setting them works.
-			bridge_float("WorldScale", L"PCSX2_REMIX_CAMSCALE");
-			bridge_float("LightBrightness", L"PCSX2_REMIX_KEY");
-			bridge_float("LightAngle", L"PCSX2_REMIX_KEYANGLE");
-			bridge_float("AmbientBrightness", L"PCSX2_REMIX_AMBIENT");
-			bridge_int("LightMode", L"PCSX2_REMIX_LIGHTMODE");
+			// Record the caller's environment before we write a single variable, so the harness
+			// keeps its precedence for the rest of the session.
+			size_t count = 0;
+			const knob* table = knobs(count);
+
+			s_external_env.clear();
+			for (size_t i = 0; i < count; ++i)
+			{
+				if (!read_env(env_name_for(table[i]).c_str()).empty())
+					s_external_env.insert(table[i].env);
+			}
+
+			// Every knob, latched or not. The latched ones are read through `static const` locals
+			// in RemixSubmit, so they are captured the first time that code runs and this is the
+			// only moment at which setting them does anything at all.
+			for (size_t i = 0; i < count; ++i)
+				apply_knob(table[i]);
 
 			s_game_id_at_init = game_id();
 

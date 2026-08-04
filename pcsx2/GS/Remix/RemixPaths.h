@@ -72,5 +72,10 @@ namespace remix_ps2
 
 		// The serial apply_before_runtime_load bound the mod tree to, for the mismatch warning.
 		const std::string& game_id_at_init();
+
+		// Re-applies the knobs the backend re-reads, so a settings change takes effect while the
+		// game runs. Latched knobs are deliberately left alone. Call once per frame; it is a
+		// handful of settings lookups.
+		void apply_live_knobs();
 	} // namespace paths
 } // namespace remix_ps2

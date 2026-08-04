@@ -3,6 +3,7 @@
 
 #include "GS/Remix/RemixSubmit.h"
 #include "GS/Remix/RemixMaterials.h"
+#include "GS/Remix/RemixPaths.h"
 #include "GS/Remix/RemixRuntime.h"
 #include "GS/Remix/RemixTransforms.h"
 #include "GS/Remix/RemixVU1Capture.h"
@@ -4834,6 +4835,11 @@ namespace RemixSubmit
 		// Per-game settings. Ordered after refresh_categories only for log readability -- both
 		// poll independently, and this one also re-applies when the running game changes.
 		remix_ps2::materials::refresh_game_config(s_remix);
+
+		// Settings-page knobs the backend re-reads. Ordered AFTER refresh_game_config on purpose:
+		// that one applies the per-game .conf, and a title's .conf should outrank the GUI's
+		// global values the same way it outranks everything else.
+		remix_ps2::paths::apply_live_knobs();
 
 		log_stats(false);
 	}

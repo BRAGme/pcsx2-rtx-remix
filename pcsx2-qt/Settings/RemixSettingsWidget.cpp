@@ -6,6 +6,7 @@
 #include "SettingWidgetBinder.h"
 #include "SettingsWindow.h"
 
+#include "GS/Remix/RemixKnobs.h"
 #include "VMManager.h"
 
 #include "common/FileSystem.h"
@@ -13,7 +14,15 @@
 
 #include <QtCore/QDir>
 #include <QtCore/QUrl>
+#include <QtWidgets/QCheckBox>
+#include <QtWidgets/QComboBox>
+#include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QFileDialog>
+#include <QtWidgets/QFormLayout>
+#include <QtWidgets/QGroupBox>
+#include <QtWidgets/QLabel>
+#include <QtWidgets/QSpinBox>
+#include <QtWidgets/QVBoxLayout>
 
 RemixSettingsWidget::RemixSettingsWidget(SettingsWindow* settings_dialog, QWidget* parent)
 	: SettingsWidget(settings_dialog, parent)
@@ -40,12 +49,6 @@ RemixSettingsWidget::RemixSettingsWidget(SettingsWindow* settings_dialog, QWidge
 		m_ui.remixFolderOpen, m_ui.remixFolderReset, "Remix", "FolderPath",
 		Path::Combine(EmuFolders::DataRoot, "RemixGames"));
 
-	SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_ui.worldScale, "Remix", "WorldScale", 8.0f);
-	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.lightMode, "Remix", "LightMode", 1);
-	SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_ui.lightBrightness, "Remix", "LightBrightness", 100.0f);
-	SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_ui.ambientBrightness, "Remix", "AmbientBrightness", 0.0f);
-	SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_ui.lightAngle, "Remix", "LightAngle", 8.0f);
-
 	connect(m_ui.perGameFiles, &QCheckBox::checkStateChanged, this, [this]() { updateCurrentGameLabel(); });
 	connect(m_ui.remixFolder, &QLineEdit::textChanged, this, [this]() { updateCurrentGameLabel(); });
 
@@ -63,6 +66,10 @@ RemixSettingsWidget::RemixSettingsWidget(SettingsWindow* settings_dialog, QWidge
 		QtUtils::OpenURL(this, QUrl::fromLocalFile(folder));
 	});
 
+	buildKnobRows(sif);
+
+	connect(m_ui.filter, &QLineEdit::textChanged, this, &RemixSettingsWidget::applyFilter);
+
 	updateCurrentGameLabel();
 
 	dialog()->registerWidgetHelp(m_ui.perGameFiles, tr("Separate Remix Files Per Game"), tr("Checked"),
@@ -75,22 +82,143 @@ RemixSettingsWidget::RemixSettingsWidget(SettingsWindow* settings_dialog, QWidge
 		   "remix\\ folder."));
 	dialog()->registerWidgetHelp(m_ui.runtimePath, tr("Runtime DLL"), tr("Empty"),
 		tr("RTX Remix runtime to load. Leave empty to use remix\\d3d9.dll beside PCSX2."));
-	dialog()->registerWidgetHelp(m_ui.worldScale, tr("World Scale"), tr("8.00"),
-		tr("Scale applied when converting PS2 units into Remix world units. Affects how large the "
-		   "scene appears to lights and to the path tracer."));
-	dialog()->registerWidgetHelp(m_ui.lightMode, tr("Lighting Mode"), tr("Dome + key light"),
-		tr("How the scene is lit when the game's own lights are not reconstructed. A dome and a "
-		   "distant light have no distance falloff, so one brightness works whether the scene is "
-		   "a corridor or an outdoor map; a point light at the camera does not."));
-	dialog()->registerWidgetHelp(m_ui.lightBrightness, tr("Key Light Brightness"), tr("100.00"),
-		tr("Radiance of the key light."));
-	dialog()->registerWidgetHelp(m_ui.ambientBrightness, tr("Ambient Brightness"), tr("0.00"),
-		tr("Radiance of the ambient dome. Raise to lift shadows that read as pure black."));
-	dialog()->registerWidgetHelp(m_ui.lightAngle, tr("Key Light Angular Size"), tr("8.00 degrees"),
-		tr("Angular diameter of the key light. Smaller is sharper shadows, larger is softer."));
 }
 
 RemixSettingsWidget::~RemixSettingsWidget() = default;
+
+void RemixSettingsWidget::buildKnobRows(SettingsInterface* sif)
+{
+	size_t count = 0;
+	const remix_ps2::knob* table = remix_ps2::knobs(count);
+
+	// A game is running, so anything read once at backend start is already captured and editing it
+	// now would silently do nothing until a restart. Saying so beats letting the user change a
+	// value and conclude the feature is broken.
+	const bool running = VMManager::HasValidVM();
+
+	QGroupBox* group = nullptr;
+	QFormLayout* form = nullptr;
+	QString current_group;
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		const remix_ps2::knob& k = table[i];
+		const QString group_name = QString::fromUtf8(k.group);
+
+		if (group_name != current_group)
+		{
+			current_group = group_name;
+			group = new QGroupBox(group_name, m_ui.knobContainer);
+			form = new QFormLayout(group);
+			m_ui.knobLayout->addWidget(group);
+			m_groups.push_back(group);
+		}
+
+		QWidget* editor = nullptr;
+		const QString key = QString::fromUtf8(k.env);
+
+		switch (k.type)
+		{
+			case remix_ps2::knob_type::Boolean:
+			{
+				QCheckBox* box = new QCheckBox(group);
+				SettingWidgetBinder::BindWidgetToBoolSetting(
+					sif, box, "Remix", k.env, k.default_value != 0.0);
+				editor = box;
+				break;
+			}
+
+			case remix_ps2::knob_type::Choice:
+			{
+				QComboBox* box = new QComboBox(group);
+				for (const QString& entry : QString::fromUtf8(k.choices).split('|'))
+					box->addItem(entry);
+
+				SettingWidgetBinder::BindWidgetToIntSetting(
+					sif, box, "Remix", k.env, static_cast<int>(k.default_value));
+				editor = box;
+				break;
+			}
+
+			case remix_ps2::knob_type::Integer:
+			{
+				QSpinBox* box = new QSpinBox(group);
+				box->setRange(static_cast<int>(k.minimum), static_cast<int>(k.maximum));
+				box->setSingleStep(std::max(1, static_cast<int>(k.step)));
+				SettingWidgetBinder::BindWidgetToIntSetting(
+					sif, box, "Remix", k.env, static_cast<int>(k.default_value));
+				editor = box;
+				break;
+			}
+
+			case remix_ps2::knob_type::Float:
+			{
+				QDoubleSpinBox* box = new QDoubleSpinBox(group);
+				box->setRange(k.minimum, k.maximum);
+				box->setSingleStep(k.step);
+				// Enough places for the small gates (WFLAT defaults to 0.001) without turning the
+				// large ones into a wall of zeroes.
+				box->setDecimals((k.step < 0.01) ? 4 : 2);
+				SettingWidgetBinder::BindWidgetToFloatSetting(
+					sif, box, "Remix", k.env, static_cast<float>(k.default_value));
+				editor = box;
+				break;
+			}
+		}
+
+		if (!editor)
+			continue;
+
+		QString label_text = QString::fromUtf8(k.label);
+		if (k.latched)
+		{
+			label_text += tr(" (restart)");
+			editor->setEnabled(!running);
+		}
+
+		QLabel* label = new QLabel(label_text, group);
+		form->addRow(label, editor);
+
+		// The key is in the tooltip so a value seen in the .ini or a per-game .conf can be traced
+		// back to the control that sets it, and so the filter can match on it.
+		const QString tip = QString::fromUtf8(k.tooltip) +
+			tr("\n\nSetting: [Remix] %1   Environment: PCSX2_REMIX_%1").arg(key) +
+			(k.latched ? tr("\nRead once when the backend starts; applies after a restart.") : QString());
+
+		label->setToolTip(tip);
+		editor->setToolTip(tip);
+
+		m_rows.push_back({label, editor, group, label_text + QLatin1Char(' ') + key + QLatin1Char(' ') + group_name});
+	}
+}
+
+void RemixSettingsWidget::applyFilter(const QString& text)
+{
+	const QString needle = text.trimmed();
+
+	for (const knob_row& row : m_rows)
+	{
+		const bool match = needle.isEmpty() || row.haystack.contains(needle, Qt::CaseInsensitive);
+		row.label->setVisible(match);
+		row.editor->setVisible(match);
+	}
+
+	// A group whose every row was filtered out is just an empty box taking up space.
+	for (QGroupBox* group : m_groups)
+	{
+		bool any = false;
+		for (const knob_row& row : m_rows)
+		{
+			if (row.group == group && row.editor->isVisible())
+			{
+				any = true;
+				break;
+			}
+		}
+
+		group->setVisible(any);
+	}
+}
 
 QString RemixSettingsWidget::currentGameFolder() const
 {
