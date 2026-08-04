@@ -126,6 +126,15 @@ namespace remix_ps2::materials
 		// on disk instead of the API pseudo-path. Default 1 -- the pseudo-path is measurably broken in
 		// the deployed runtime, so a real path is the only route that binds anything, and it falls
 		// back to the pseudo-path automatically when no replacement exists.
+		// Re-upload a material''s texture whenever the material is rebuilt. Default 1: addTexture is a
+		// per-frame registration, so without this a rebuilt material resolves its albedo against a
+		// table that no longer contains our texture.
+		bool texture_reupload_on_rebuild()
+		{
+			static const bool value = read_env_int(L"PCSX2_REMIX_TEXREUPLOAD", 1) != 0;
+			return value;
+		}
+
 		bool replacement_albedo()
 		{
 			static const bool value = read_env_int(L"PCSX2_REMIX_REPLACEALBEDO", 1) != 0;
@@ -204,6 +213,7 @@ namespace remix_ps2::materials
 			u64 destroyed = 0;
 			u64 deferred = 0; // over the per-frame budget
 			u64 skip_no_source = 0;
+			u64 texture_reuploads = 0;    // re-registrations to keep the texture in this frame''s table
 			u64 replacement_albedo = 0;   // materials bound to a real replacement .dds
 			u64 replacement_not_dds = 0;  // replacement existed but was not .dds, so unusable
 			u64 skip_target = 0; // render-target source: no stable content identity
@@ -760,6 +770,21 @@ namespace remix_ps2::materials
 			info.data = entry.pixels.data();
 			info.dataSize = entry.pixels.size();
 
+			// Under the probe, paint EVERY uploaded texture magenta. The untextured-material variant
+			// only covers draws with no texture at all, which Rainbow Six 3 barely has -- and R6 3 is
+			// the only title reliable enough to test on (50% launch survival, 30 s sessions) since
+			// SOCOM''s crash rate beat 12 straight attempts. Any magenta on screen means an
+			// API-uploaded texture reached a surface.
+			if (albedo_probe())
+			{
+				for (size_t px = 0; px + 3 < entry.pixels.size(); px += 4)
+				{
+					entry.pixels[px + 0] = 0xFF; // B
+					entry.pixels[px + 1] = 0x00; // G
+					entry.pixels[px + 2] = 0xFF; // R
+				}
+			}
+
 			const u32 tex_status = guarded_create_texture(api.CreateTexture, &info, &entry.texture);
 			if (tex_status != REMIXAPI_ERROR_CODE_SUCCESS || !entry.texture)
 			{
@@ -904,6 +929,43 @@ namespace remix_ps2::materials
 			}
 
 			const remixapi_Interface& api = rt.api();
+
+			// Re-upload the texture immediately before rebuilding the material.
+			//
+			// RtxTextureManager::addTexture is a PER-FRAME registration -- its own header calls the
+			// preserve path "re-run addTexture for the bindless slot so THIS FRAME's texture table
+			// matches the dynamic path" -- and getTextureTable() returns that frame's table. The
+			// fork's createTexture calls addTexture exactly ONCE, so an API texture is present in the
+			// table only for the frame it was uploaded on, while the material's albedo pseudo-path is
+			// resolved against that table once, at finalization.
+			//
+			// That is the mechanism behind the user seeing colour "live a frame or two": a material
+			// whose finalization landed in the same frame as its texture upload resolved and looked
+			// right, and every other one bound nothing. It is also why a late rebuild alone
+			// (MATREBUILD=120) changed nothing -- by then the table had been rebuilt many times
+			// without our texture in it. Re-uploading first is what gives the rebuild a table to
+			// find; the decoded pixels are still resident on the entry for exactly this purpose.
+			if (texture_reupload_on_rebuild())
+			{
+				remixapi_TextureInfo rinfo{};
+				rinfo.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+				rinfo.pNext = nullptr;
+				rinfo.hash = content_hash;
+				rinfo.width = entry.width;
+				rinfo.height = entry.height;
+				rinfo.depth = 1;
+				rinfo.mipLevels = 1;
+				rinfo.format = textures_linear() ? REMIXAPI_FORMAT_B8G8R8A8_UNORM : REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+				rinfo.data = entry.pixels.data();
+				rinfo.dataSize = entry.pixels.size();
+
+				remixapi_TextureHandle refreshed = nullptr;
+				if (guarded_create_texture(api.CreateTexture, &rinfo, &refreshed) == REMIXAPI_ERROR_CODE_SUCCESS && refreshed)
+				{
+					entry.texture = refreshed;
+					++s_stats.texture_reuploads;
+				}
+			}
 
 			wchar_t albedo_path[32]{};
 			::swprintf_s(albedo_path, L"0x%016llX", static_cast<unsigned long long>(content_hash));
