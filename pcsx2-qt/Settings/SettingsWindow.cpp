@@ -160,7 +160,7 @@ void SettingsWindow::setupUi(const GameList::Entry* game)
 		tr("<strong>Graphics Settings</strong><hr>These options determine the configuration of the graphical output.<br><br>Mouse over an "
 		   "option for additional information, and Shift+Wheel to scroll this panel."));
 	addWidget(m_remix_settings = new RemixSettingsWidget(this, m_ui.settingsContainer), tr("RTX Remix"),
-		QStringLiteral("sparkling-2-line"),
+		QStringLiteral("lightbulb-line"),
 		tr("<strong>RTX Remix Settings</strong><hr>These options control the RTX Remix renderer: which runtime is loaded, "
 		   "where each game's Remix files live, and how the scene is scaled and lit.<br><br>Mouse over an option for "
 		   "additional information, and Shift+Wheel to scroll this panel."));
