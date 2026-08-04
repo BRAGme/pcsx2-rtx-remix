@@ -762,7 +762,7 @@ namespace remix_ps2::materials
 			opaque.roughnessTexture = nullptr;
 			opaque.metallicTexture = nullptr;
 			opaque.anisotropy = 0.f;
-			opaque.albedoConstant = albedo_probe() ? remixapi_Float3D{1.f, 0.f, 1.f} : remixapi_Float3D{1.f, 1.f, 1.f};
+			opaque.albedoConstant = {1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
 			opaque.roughnessConstant = 0.7f;
 			opaque.metallicConstant = 0.f;
@@ -850,7 +850,7 @@ namespace remix_ps2::materials
 
 			remixapi_MaterialInfoOpaqueEXT opaque{};
 			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
-			opaque.albedoConstant = albedo_probe() ? remixapi_Float3D{1.f, 0.f, 1.f} : remixapi_Float3D{1.f, 1.f, 1.f};
+			opaque.albedoConstant = {1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
 			opaque.roughnessConstant = 0.7f;
 			opaque.metallicConstant = 0.f;
@@ -1257,6 +1257,22 @@ namespace remix_ps2::materials
 			u8 white[4 * 4 * 4];
 			std::memset(white, 0xFF, sizeof(white));
 
+			// ALBEDOPROBE puts the distinctive colour in the TEXTURE rather than the constant, which
+			// is the only way round that actually discriminates. Magenta constant + white texture
+			// cannot tell "texture resolved" from "lookup failed and defaulted to white" -- both
+			// render white. Magenta TEXTURE + white constant can: magenta means the pseudo-path
+			// resolved, white means it did not. B,G,R,A order.
+			if (albedo_probe())
+			{
+				for (u32 px = 0; px < 4 * 4; ++px)
+				{
+					white[px * 4 + 0] = 0xFF; // B
+					white[px * 4 + 1] = 0x00; // G
+					white[px * 4 + 2] = 0xFF; // R
+					white[px * 4 + 3] = 0xFF; // A
+				}
+			}
+
 			remixapi_TextureInfo tex{};
 			tex.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
 			tex.pNext = nullptr;
@@ -1286,7 +1302,7 @@ namespace remix_ps2::materials
 			opaque.metallicTexture = nullptr;
 			opaque.anisotropy = 0.f;
 			// White, so the per-vertex RGBAQ colour is what decides the surface colour.
-			opaque.albedoConstant = albedo_probe() ? remixapi_Float3D{1.f, 0.f, 1.f} : remixapi_Float3D{1.f, 1.f, 1.f};
+			opaque.albedoConstant = {1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
 			opaque.roughnessConstant = 0.7f;
 			opaque.metallicConstant = 0.f;
