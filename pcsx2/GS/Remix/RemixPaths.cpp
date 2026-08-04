@@ -12,6 +12,7 @@
 #include "common/Console.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
+#include "common/StringUtil.h"
 
 #include "fmt/format.h"
 
@@ -110,16 +111,25 @@ namespace remix_ps2
 				if (externally_set(k))
 					return;
 
-				constexpr double kUnset = -1e30;
-
-				const double value = static_cast<double>(
-					Host::GetFloatSettingValue(kSection, k.env, static_cast<float>(kUnset)));
-				if (value == kUnset)
+				// Presence is tested as a STRING, never with an out-of-range numeric sentinel.
+				//
+				// This previously read the value as a float with -1e30 meaning "unset" and compared
+				// the result back against -1e30. float cannot represent -1e30 exactly, so that
+				// comparison was never true and every unset knob was treated as set and written out
+				// as "-1e+30". The integer knobs then parsed to 0, which set TEXBUDGET to 0 (so
+				// bind() returned null and nothing was ever textured) and SCANKICKS to 0 (so no VU
+				// kicks were scanned and the camera never solved). The screen went black.
+				//
+				// A string read has no unrepresentable value and no in-band signalling: empty means
+				// the key is absent, full stop.
+				const std::string raw = Host::GetStringSettingValue(kSection, k.env, "");
+				if (raw.empty())
 					return;
 
-				const std::string text = (k.type == knob_type::Float) ?
-					fmt::format("{:g}", value) :
-					fmt::format("{}", static_cast<s64>(value));
+				// Bools are stored by the Qt binder as true/false, everything else as a number.
+				std::string text = raw;
+				if (k.type == knob_type::Boolean)
+					text = StringUtil::ToChars(StringUtil::FromChars<bool>(raw).value_or(false) ? 1 : 0);
 
 				SetEnvironmentVariableW(env_name_for(k).c_str(), widen(text).c_str());
 			}
