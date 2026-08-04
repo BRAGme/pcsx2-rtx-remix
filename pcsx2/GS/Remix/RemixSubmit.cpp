@@ -196,6 +196,8 @@ namespace RemixSubmit
 			u64 cam_accept_sliced = 0; // accepted cameras that came from the back-slice
 			u64 cam_candidates = 0; // offered to the GS side, summed over frames
 			u64 cam_reject_split = 0; // split_view_projection_direct refused
+			// Same rejections, broken down by which step inside the split refused.
+			u64 cam_split_stage[static_cast<u32>(remix_ps2::split_stage::count)]{};
 			u64 cam_reject_score = 0; // split worked, score_perspective refused
 			u64 cam_accept = 0;
 			u64 cam_reject_degenerate = 0; // split and scored, but refuted by the geometry
@@ -1902,9 +1904,11 @@ namespace RemixSubmit
 							oriented, hyp.scale_x, hyp.offset_x, hyp.scale_y, hyp.offset_y);
 
 						remix_ps2::vp_split split{};
-						if (!remix_ps2::split_view_projection_direct(normalized, split))
+						remix_ps2::split_stage stage = remix_ps2::split_stage::accepted;
+						if (!remix_ps2::split_view_projection_direct(normalized, split, &stage))
 						{
 							++s_stats.cam_reject_split;
+							++s_stats.cam_split_stage[static_cast<u32>(stage)];
 							if (dump)
 								fmt::format_to(std::back_inserter(detail), " {}/{}=-", hyp.name, major ? 'C' : 'R');
 
@@ -3472,6 +3476,27 @@ namespace RemixSubmit
 				s_stats.cam_reject_extent, s_stats.cam_accept, s_stats.cam_accept_sliced,
 				s_active_camera.valid ? "world score " : "view-space",
 				s_active_camera.valid ? fmt::format("{:.2f} near {:.5g}", s_active_camera.score, s_active_camera.near_plane) : "");
+
+			// The split breakdown, printed only when something was rejected. One opaque count
+			// could not tell "the matrix was singular" from "the recovered projection was not a
+			// perspective", which are different bugs with different fixes.
+			if (s_stats.cam_reject_split != 0)
+			{
+				std::string split_detail;
+				for (u32 i = 1; i < static_cast<u32>(remix_ps2::split_stage::count); ++i)
+				{
+					if (s_stats.cam_split_stage[i] == 0)
+						continue;
+
+					fmt::format_to(std::back_inserter(split_detail), "{}{} {}",
+						split_detail.empty() ? "" : " | ",
+						remix_ps2::split_stage_name(static_cast<remix_ps2::split_stage>(i)),
+						s_stats.cam_split_stage[i]);
+				}
+
+				INFO_LOG("Remix: split refusals by stage -- {}",
+					split_detail.empty() ? std::string("(none recorded)") : split_detail);
+			}
 		}
 	} // namespace
 

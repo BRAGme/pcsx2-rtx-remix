@@ -124,41 +124,47 @@ namespace remix_ps2
 			return true;
 		}
 
-		bool try_split_once(const mat4& fused, vp_split& out)
+		bool try_split_once(const mat4& fused, vp_split& out, split_stage* stage = nullptr)
 		{
+			const auto fail = [&](split_stage reason) {
+				if (stage)
+					*stage = reason;
+				return false;
+			};
+
 			mat4 inverse_fused{};
 			if (!mat4_invert(fused, inverse_fused))
-				return false;
+				return fail(split_stage::invert_fused);
 
 			float cam_pos[3]{};
 			if (!solve_camera_position(fused, cam_pos))
-				return false;
+				return fail(split_stage::camera_position);
 
 			float center[3]{};
 			float above[3]{};
 			if (!unproject(inverse_fused, 0.f, 0.f, 0.5f, center) ||
 				!unproject(inverse_fused, 0.f, 1.f, 0.5f, above))
 			{
-				return false;
+				return fail(split_stage::unproject);
 			}
 
 			float forward[3] = {center[0] - cam_pos[0], center[1] - cam_pos[1], center[2] - cam_pos[2]};
 			if (!normalize3(forward))
-				return false;
+				return fail(split_stage::forward);
 
 			float up_hint[3] = {above[0] - center[0], above[1] - center[1], above[2] - center[2]};
 			if (!normalize3(up_hint))
-				return false;
+				return fail(split_stage::up_hint);
 
 			float right[3]{};
 			cross3(up_hint, forward, right);
 			if (!normalize3(right))
-				return false;
+				return fail(split_stage::basis);
 
 			float up[3]{};
 			cross3(forward, right, up);
 			if (!normalize3(up))
-				return false;
+				return fail(split_stage::basis);
 
 			// viewToWorld: rows are right / up / forward / position (Remix's own layout).
 			mat4 view_to_world = mat4_identity();
@@ -172,19 +178,26 @@ namespace remix_ps2
 
 			mat4 world_to_view{};
 			if (!mat4_invert(view_to_world, world_to_view))
-				return false;
+				return fail(split_stage::invert_view);
 
 			// M = V * P  =>  P = viewToWorld * M.
 			const mat4 projection = mat4_multiply(view_to_world, fused);
 
 			if (!mat4_is_finite(projection) || classify_perspective(projection) != 1)
-				return false;
+				return fail(split_stage::not_perspective);
 
 			out.view = world_to_view;
 			out.projection = projection;
 			out.l1_error = mat4_l1_error(mat4_multiply(world_to_view, projection), fused);
 			out.used_transpose = false;
-			return std::isfinite(out.l1_error);
+
+			if (!std::isfinite(out.l1_error))
+				return fail(split_stage::error_not_finite);
+
+			if (stage)
+				*stage = split_stage::accepted;
+
+			return true;
 		}
 	} // namespace
 
@@ -505,12 +518,36 @@ namespace remix_ps2
 		       std::abs(m[3][3] - 1.f) < tol;
 	}
 
-	bool split_view_projection_direct(const mat4& fused, vp_split& out)
+	const char* split_stage_name(split_stage stage)
+	{
+		switch (stage)
+		{
+			case split_stage::accepted: return "accepted";
+			case split_stage::not_finite: return "nonfinite";
+			case split_stage::invert_fused: return "singular";
+			case split_stage::camera_position: return "campos";
+			case split_stage::unproject: return "unproject";
+			case split_stage::forward: return "forward";
+			case split_stage::up_hint: return "uphint";
+			case split_stage::basis: return "basis";
+			case split_stage::invert_view: return "viewinv";
+			case split_stage::not_perspective: return "notpersp";
+			case split_stage::error_not_finite: return "errnan";
+			default: return "?";
+		}
+	}
+
+	bool split_view_projection_direct(const mat4& fused, vp_split& out, split_stage* stage)
 	{
 		if (!mat4_is_finite(fused))
-			return false;
+		{
+			if (stage)
+				*stage = split_stage::not_finite;
 
-		return try_split_once(fused, out);
+			return false;
+		}
+
+		return try_split_once(fused, out, stage);
 	}
 
 	mat4 normalize_screen_clip(const mat4& fused, float scale_x, float offset_x, float scale_y, float offset_y)

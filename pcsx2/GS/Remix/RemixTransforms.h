@@ -96,7 +96,29 @@ namespace remix_ps2
 	// asks for the split of each hypothesis separately -- split_view_projection's internal
 	// retry would transpose a matrix the normaliser had already been composed into, which
 	// mixes conventions and can accept a meaningless answer.
-	bool split_view_projection_direct(const mat4& fused, vp_split& out);
+	// Which step of the split refused, so the stats line can name the stage rather than report
+	// one opaque count. Every candidate on Rainbow Six 3 fails here, and "split-reject 4066432"
+	// does not distinguish "the matrix was not invertible" from "the recovered projection was
+	// not a perspective" -- which are different bugs with different fixes.
+	enum class split_stage : u32
+	{
+		accepted = 0,
+		not_finite,      // the fused matrix had a NaN or an infinity
+		invert_fused,    // fused matrix is singular
+		camera_position, // no solution for the eye point
+		unproject,       // could not unproject the two reference clip points
+		forward,         // eye-to-centre vector is degenerate
+		up_hint,         // centre-to-above vector is degenerate
+		basis,           // right/up cross products are degenerate
+		invert_view,     // the assembled viewToWorld is singular
+		not_perspective, // the recovered projection failed classify_perspective
+		error_not_finite,// the reconstruction error came back non-finite
+		count
+	};
+
+	const char* split_stage_name(split_stage stage);
+
+	bool split_view_projection_direct(const mat4& fused, vp_split& out, split_stage* stage = nullptr);
 
 	// ---------------------------------------------------------------------------------------
 	// PS2 joint: screen-clip normalisation and the world un-projection
