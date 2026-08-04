@@ -126,6 +126,15 @@ namespace remix_ps2::materials
 			return value;
 		}
 
+		// Frames to wait after a material is created before rebuilding it once. 0 = never.
+		// See the probe at the bind() cache-hit path for what this is testing.
+		u64 material_late_rebuild()
+		{
+			static const u64 value =
+				static_cast<u64>(std::max<s64>(0, read_env_int(L"PCSX2_REMIX_MATREBUILD", 0)));
+			return value;
+		}
+
 		bool textures_linear()
 		{
 			static const bool value = read_env_int(L"PCSX2_REMIX_TEXLINEAR", 0) != 0;
@@ -163,6 +172,8 @@ namespace remix_ps2::materials
 			// BGRA8 resident for the same reason (RemixTextures.cpp, "kept resident").
 			std::vector<u8> pixels;
 			u64 last_used_frame = 0;
+			u64 created_frame = 0; // frame CreateMaterial ran, for the late-rebuild probe
+			bool late_rebuilt = false;
 			u64 generation = 0; // tag-list generation this material was built for
 			u32 width = 0;
 			u32 height = 0;
@@ -1446,6 +1457,7 @@ namespace remix_ps2::materials
 			// is that stable address; a local built here and copied in afterwards would leave
 			// the runtime holding a pointer into a dead stack frame.
 			it = s_entries.emplace(content_hash, material_entry{}).first;
+			it->second.created_frame = frame;
 			material_entry& entry = it->second;
 			entry.last_used_frame = frame;
 
@@ -1547,7 +1559,20 @@ namespace remix_ps2::materials
 			// stale. Rebuilding is cheap (the texture is kept) and the caller folds
 			// generation() into its mesh hash, so meshes pick the new handle up too.
 			if (it->second.generation != s_generation)
+			{
 				rebuild_material(rt, content_hash, it->second, frame);
+			}
+			else if (material_late_rebuild() > 0 && !it->second.late_rebuilt &&
+					 frame >= it->second.created_frame + material_late_rebuild())
+			{
+				// PCSX2_REMIX_MATREBUILD probe: rebuild once, N frames after creation, so the albedo
+				// pseudo-path resolves against a texture table the CreateTexture EmitCs has definitely
+				// been applied to. A material resolves its texture ONCE at finalization and caches an
+				// empty TextureRef forever if the lookup misses, so a late rebuild is the test for
+				// whether the albedo failure is an ordering/lifetime problem at all.
+				it->second.late_rebuilt = true;
+				rebuild_material(rt, content_hash, it->second, frame);
+			}
 		}
 
 		it->second.last_used_frame = frame;
