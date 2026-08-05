@@ -164,8 +164,17 @@ namespace remix_ps2::materials
 		// See the probe at the bind() cache-hit path for what this is testing.
 		u64 material_late_rebuild()
 		{
-			static const u64 value =
-				static_cast<u64>(std::max<s64>(0, read_env_int(L"PCSX2_REMIX_MATREBUILD", 0)));
+			// Live, not latched: this is a refresh interval, and finding the right one means
+			// trying several against a scene that is visibly losing its textures.
+			static u64 value = 0;
+			static u64 generation = ~0ull;
+
+			if (const u64 now = remix_ps2::paths::knob_generation(); now != generation)
+			{
+				generation = now;
+				value = static_cast<u64>(std::max<s64>(0, read_env_int(L"PCSX2_REMIX_MATREBUILD", 120)));
+			}
+
 			return value;
 		}
 
@@ -210,7 +219,10 @@ namespace remix_ps2::materials
 			// Resolved replacement .dds path, empty when there is none. Held here because
 			// rebuild_material only receives content_hash and cannot redo the HashCacheKey lookup.
 			std::wstring albedo_file;
-			bool late_rebuilt = false;
+			// Frame of the most recent albedo re-resolve. Not a one-shot flag: Remix's texture table
+			// is a per-frame registration, so a material that resolved once can lose its texture at
+			// any later point and has to be able to resolve again.
+			u64 last_rebuild_frame = 0;
 			u64 generation = 0; // tag-list generation this material was built for
 			u32 width = 0;
 			u32 height = 0;
@@ -1702,15 +1714,26 @@ namespace remix_ps2::materials
 			{
 				rebuild_material(rt, content_hash, it->second, frame);
 			}
-			else if (material_late_rebuild() > 0 && !it->second.late_rebuilt &&
-					 frame >= it->second.created_frame + material_late_rebuild())
+			else if (const u64 interval = material_late_rebuild();
+					 interval > 0 && frame >= std::max(it->second.created_frame, it->second.last_rebuild_frame) + interval)
 			{
-				// PCSX2_REMIX_MATREBUILD probe: rebuild once, N frames after creation, so the albedo
-				// pseudo-path resolves against a texture table the CreateTexture EmitCs has definitely
-				// been applied to. A material resolves its texture ONCE at finalization and caches an
-				// empty TextureRef forever if the lookup misses, so a late rebuild is the test for
-				// whether the albedo failure is an ordering/lifetime problem at all.
-				it->second.late_rebuilt = true;
+				// Re-resolve the albedo on an interval. This was a ONE-SHOT probe -- rebuild once,
+				// N frames after creation -- which tested whether the albedo failure was an
+				// ordering race at creation. It is not: it is a lifetime problem that recurs.
+				//
+				// A material resolves its texture ONCE at finalization and caches an empty
+				// TextureRef forever if the lookup misses. Remix's texture table is a PER-FRAME
+				// registration and we register at CreateTexture only, so once the runtime drops
+				// the entry the material holds a dead reference and the surface renders white --
+				// permanently, because bind() still finds the material and reports a cache hit, so
+				// nothing ever rebuilds it. MEASURED on Rainbow Six 3: squadmates render textured,
+				// then turn white a few seconds later while "mat live 29 | bind 1049346 hit
+				// 1049271 miss 75 created 75" shows binds still hitting and no re-creation at all.
+				//
+				// Rebuilding re-runs CreateTexture (TEXREUPLOAD, on by default), which re-registers
+				// the texture, and re-resolves the pseudo-path against the table that registration
+				// just landed in.
+				it->second.last_rebuild_frame = frame;
 				rebuild_material(rt, content_hash, it->second, frame);
 			}
 		}
