@@ -309,6 +309,25 @@ namespace remix_ps2
 			set_env_if_unset(L"DXVK_CAPTURE_PATH", widen(game_subdir("captures")));
 			set_env_if_unset(L"DXVK_LOG_PATH", widen(game_subdir("logs")));
 
+			// The config layer, which is NOT part of the RtxFileSys table above and so was left
+			// behind when the rest of the tree went per-game.
+			//
+			// The runtime opens its layers by RELATIVE name -- the log says "Found config file:
+			// rtx.conf", not a path -- so they resolve against the working directory and every
+			// title shared the one rtx.conf next to the exe. That is why a texture categorised in
+			// the developer menu for one game was in scope for all of them, and why
+			// RemixGames\<SERIAL>\ only ever collected a logs folder.
+			//
+			// DXVK_RTX_CONFIG_FILE is the runtime's own override for it (confirmed present in the
+			// shipped d3d9.dll's string table alongside DXVK_CONFIG_FILE and DXVK_USE_CONF_FOR_EXE).
+			// Pointed at the per-game folder, the tags a user saves land with the game they were
+			// made for.
+			//
+			// NOT VERIFIED: whether the user.conf layer follows it. There is no
+			// DXVK_USER_CONFIG_FILE in that string table, so user.conf may stay next to the exe --
+			// in which case per-game covers the mod layer only and the user layer stays global.
+			set_env_if_unset(L"DXVK_RTX_CONFIG_FILE", widen(Path::Combine(game_dir(), "rtx.conf")));
+
 			INFO_LOG("Remix: per-game files for '{}' under '{}'", s_game_id_at_init, game_dir());
 		}
 	} // namespace paths
