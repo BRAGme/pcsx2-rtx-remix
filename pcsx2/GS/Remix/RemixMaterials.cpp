@@ -123,11 +123,8 @@ namespace remix_ps2::materials
 		// untextured material was given a white 4x4 texture AND a white albedoConstant, so albedo
 		// going from 0 (nullptr) to ~580,000 is equally consistent with the texture resolving or with
 		// the constant being used once a path is merely named. Same colour either way, no information.
-		// PCSX2_REMIX_REPLACEALBEDO: point a material's albedoTexture at the user's replacement .dds
-		// on disk instead of the API pseudo-path. Default 1 -- the pseudo-path is measurably broken in
-		// the deployed runtime, so a real path is the only route that binds anything, and it falls
-		// back to the pseudo-path automatically when no replacement exists.
-		// Re-upload a material''s texture whenever the material is rebuilt. Default 1: addTexture is a
+
+		// Re-upload a material's texture whenever the material is rebuilt. Default 1: addTexture is a
 		// per-frame registration, so without this a rebuilt material resolves its albedo against a
 		// table that no longer contains our texture.
 		bool texture_reupload_on_rebuild()
@@ -241,6 +238,14 @@ namespace remix_ps2::materials
 			u64 texture_reuploads = 0;    // re-registrations to keep the texture in this frame''s table
 			u64 replacement_albedo = 0;   // materials bound to a real replacement .dds
 			u64 replacement_not_dds = 0;  // replacement existed but was not .dds, so unusable
+			// Times the replacement lookup was actually ATTEMPTED, i.e. REPLACEALBEDO was on at a
+			// create(). MEASURED 2026-08-06: SOCOM with PCSX2_REMIX_REPLACEALBEDO=1 in the launch
+			// environment reported `replacement dds 0 skipped-nondds 0` over 153 unique textures,
+			// and those two counters cannot tell "the knob never applied" apart from "the knob
+			// applied and PCSX2's replacement map has no entry for any of this title's hashes".
+			// Without this probe the arm has no positive check that the work happened at all,
+			// which is the standing rule this project has broken three times.
+			u64 replacement_probe = 0;
 			u64 skip_target = 0; // render-target source: no stable content identity
 			u64 skip_unsupported = 0; // no rtx entry point, or absurd dimensions
 			u64 skip_failed = 0; // quarantined after a decode / runtime failure
@@ -776,6 +781,31 @@ namespace remix_ps2::materials
 		bool create(const runtime& rt, u64 content_hash, const GSTextureCache::Source& source,
 			const GSTextureCache::HashCacheKey& key, material_entry& entry)
 		{
+			// One-shot on the first create, because MATSTAGE decides whether this function hands
+			// Remix anything at all and NOTHING else in the log says what it is.
+			//
+			// MEASURED 2026-08-06, and it cost most of a session: SOCOM was rendering untextured
+			// with `replacement dds 0 probe 0`, which reads as "the replacement route is broken".
+			// It was not. `gamesettings\SCUS-97545_D7CFDCCF.ini` -- PCSX2's per-game settings
+			// overlay, a config layer distinct from `<SERIAL>.conf` -- carried a stale
+			// `[Remix] MATSTAGE = 1` from an old bisection, so every create returned at the
+			// `material_stage() < 2` gate below: no CreateTexture, no CreateMaterial, every
+			// surface shaded by a null material. Clearing it took the same scene from
+			// `replacement dds 0` to `replacement dds 1 probe 1` with no other change.
+			//
+			// Note the precedence trap this exposes: the overlay reaches the backend through
+			// apply_knob() -> the process environment -> apply_before_runtime_load(), which runs
+			// BEFORE refresh_game_config() reads `<SERIAL>.conf`. The conf then skips those keys
+			// as "already set in the environment", so the settings overlay silently OUTRANKS the
+			// per-game conf -- the reverse of the documented order.
+			static bool logged_stage = false;
+			if (!logged_stage)
+			{
+				logged_stage = true;
+				INFO_LOG("Remix: first material create -- MATSTAGE {} (env '{}')", material_stage(),
+					StringUtil::WideStringToUTF8String(read_env(L"PCSX2_REMIX_MATSTAGE")));
+			}
+
 			const Common::Timer::Value decode_start = Common::Timer::GetCurrentValue();
 			const bool decoded = decode(source, entry.pixels, entry.width, entry.height);
 			s_stats.decode_ticks += Common::Timer::GetCurrentValue() - decode_start;
@@ -863,6 +893,8 @@ namespace remix_ps2::materials
 			std::wstring replacement_path;
 			if (replacement_albedo())
 			{
+				++s_stats.replacement_probe;
+
 				if (const std::string* path = GSTextureReplacements::GetReplacementTexturePath(key))
 				{
 					if (StringUtil::EndsWithNoCase(*path, ".dds"))
@@ -1853,14 +1885,19 @@ namespace remix_ps2::materials
 		return fmt::format(
 			"Remix: mat live {} | bind {} hit {} miss {} created {} destroyed {} deferred {} | "
 			"skip: nosrc {} target {} unsup {} failed {} | fail {} | "
-			"unique content {} tex0 {} (clut variants {}) | replacement dds {} skipped-nondds {} | tags {} hits {} | "
+			"unique content {} tex0 {} (clut variants {}) | replacement dds {} skipped-nondds {} probe {} "
+			"packmap {} | tags {} hits {} | "
 			"hash {:.0f} ms ({:.2f} us/bind) decode {:.0f} ms",
 			s_entries.size(), s_stats.binds, s_stats.hits, s_stats.misses, s_stats.created,
 			s_stats.destroyed, s_stats.deferred, s_stats.skip_no_source, s_stats.skip_target,
 			s_stats.skip_unsupported, s_stats.skip_failed, s_stats.failures,
 			s_stats.unique_content, s_stats.unique_tex0,
 			(s_stats.unique_content > s_stats.unique_tex0) ? (s_stats.unique_content - s_stats.unique_tex0) : 0,
-			s_stats.replacement_albedo, s_stats.replacement_not_dds,
+			s_stats.replacement_albedo, s_stats.replacement_not_dds, s_stats.replacement_probe,
+			// `packmap` is PCSX2's own replacement map, not ours: 0 means ReloadReplacementMap
+			// found nothing, which separates a missing/mis-placed pack (or LoadTextureReplacements
+			// off) from a pack that is loaded but whose hashes do not match this title's.
+			GSTextureReplacements::HasAnyReplacementTextures() ? 1 : 0,
 			s_category_tags, s_category_hits,
 			hash_ms, hash_us_per_bind, decode_ms);
 	}
