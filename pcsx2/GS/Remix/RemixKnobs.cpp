@@ -98,14 +98,12 @@ namespace remix_ps2
 				nullptr, "Uploads textures as linear rather than sRGB.", true},
 			{"TEXREUPLOAD", "Textures and Materials", "Re-upload on rebuild", knob_type::Boolean, 1, 0, 1, 1,
 				nullptr, "Re-uploads texture data when a material is rebuilt.", true},
-			{"MATREBUILD", "Textures and Materials", "Material refresh interval", knob_type::Integer, 120, 0, 100000, 30,
+			{"MATREBUILD", "Textures and Materials", "Material refresh interval", knob_type::Integer, 0, 0, 100000, 30,
 				nullptr,
-				"Frames between re-resolving a material's texture. Remix registers textures per "
-				"frame but we register once, so a material that loses its texture holds a dead "
-				"reference forever and its surfaces render white -- which is why textured "
-				"characters turn blank after a few seconds. Refreshing re-registers the texture and "
-				"re-resolves the link. 0 disables it and restores that bug; raise it if the "
-				"rebuild churn costs more than it is worth.",
+				"Frames between re-resolving a material's texture. 0 (default) disables it. Leave it "
+				"off: a rebuild swaps the material handle without invalidating cached meshes, so "
+				"with stable mesh identity on, meshes keep the old handle until it is destroyed and "
+				"their surfaces go white on a timer. Diagnostic only.",
 				false},
 			{"TEXBUDGET", "Textures and Materials", "Texture uploads per frame", knob_type::Integer, 32, 0, 4096, 8,
 				nullptr,

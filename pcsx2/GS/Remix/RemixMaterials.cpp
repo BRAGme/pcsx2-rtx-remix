@@ -172,7 +172,7 @@ namespace remix_ps2::materials
 			if (const u64 now = remix_ps2::paths::knob_generation(); now != generation)
 			{
 				generation = now;
-				value = static_cast<u64>(std::max<s64>(0, read_env_int(L"PCSX2_REMIX_MATREBUILD", 120)));
+				value = static_cast<u64>(std::max<s64>(0, read_env_int(L"PCSX2_REMIX_MATREBUILD", 0)));
 			}
 
 			return value;
@@ -1717,9 +1717,19 @@ namespace remix_ps2::materials
 			else if (const u64 interval = material_late_rebuild();
 					 interval > 0 && frame >= std::max(it->second.created_frame, it->second.last_rebuild_frame) + interval)
 			{
-				// Re-resolve the albedo on an interval. This was a ONE-SHOT probe -- rebuild once,
-				// N frames after creation -- which tested whether the albedo failure was an
-				// ordering race at creation. It is not: it is a lifetime problem that recurs.
+				// Re-resolve the albedo on an interval. Was a ONE-SHOT probe; periodic is strictly
+				// more general, and 0 (the default) still disables it entirely.
+				//
+				// DEFAULTED OFF, and NOT a fix for the white-out. Two reasons, both learned the
+				// hard way. First, the measurement at the top of this file already recorded that
+				// MATREBUILD=120 changes nothing, so the albedo failure is not an ordering or
+				// lifetime race and re-resolving cannot address it. Second, and worse: a rebuild
+				// swaps the material handle WITHOUT bumping generation(), and generation() is what
+				// the caller folds into its mesh hash (RemixSubmit.cpp:4404, :4461) to make cached
+				// meshes pick a new handle up. With stable mesh identity on, a mesh built before
+				// the rebuild keeps the OLD handle, which reap() then destroys once it ages past
+				// mesh_idle_frames() -- so turning this on makes surfaces go white on a timer.
+				// Anything that re-enables it must bump generation() in the same breath.
 				//
 				// A material resolves its texture ONCE at finalization and caches an empty
 				// TextureRef forever if the lookup misses. Remix's texture table is a PER-FRAME
