@@ -4900,7 +4900,11 @@ namespace RemixSubmit
 				"f={} d={} k={} kf={} kt={} cm={:016X} co=0x{:08x} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
 				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
 				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
-				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
+				// w to six significant figures, not one decimal. At one decimal every draw whose w
+				// spread is under 0.1 reads as perfectly flat, and the minw gate sits at 0.01 --
+				// so the printed value could not resolve the very range the gate acts on, nor tell
+				// a w of exactly 0 (where the un-projection is undefined) from a small one.
+				"w=[{:.6g},{:.6g}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
 				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
 				s_frame_counter, s_submitted_this_frame,
 				RemixVU1Capture::KickSeq(), s_latched_kick_seq, RemixVU1Capture::GSKickSeq(),
