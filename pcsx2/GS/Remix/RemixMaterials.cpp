@@ -353,7 +353,14 @@ namespace remix_ps2::materials
 			// deployed tag, not the clone.
 			//
 			// Also needs rtx.viewModel.enable, which defaults false.
-			{"rtx.viewModelTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL},
+			//
+			// Spelled pcsx2.*, not rtx.*, for the same reason as pcsx2.emissiveTextures: the
+			// runtime has no such option, so an rtx.* spelling makes the loader push it through
+			// SetConfigVariable and Remix rejects it -- measured as
+			// "rtx.viewModelTextures = ... FAILED (GENERAL_FAILURE)" in the per-game config lines,
+			// even though our own parser had already applied the flag correctly. The tag worked
+			// and the log said it failed, which is the worst of both.
+			{"pcsx2.viewModelTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL},
 		};
 
 		std::unordered_map<u64, remixapi_InstanceCategoryFlags> s_categories;
