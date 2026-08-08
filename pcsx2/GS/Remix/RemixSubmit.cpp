@@ -122,6 +122,7 @@ namespace RemixSubmit
 			// Counted, never rejected: this number sizes the opportunity to fold those passes into
 			// one surface with a combined material, which is where the level's baked lighting is.
 			u64 multipass_overlay = 0;
+			u64 cam_sky = 0; // frames a REMIXAPI_CAMERA_TYPE_SKY camera was submitted for
 			u64 skip_minw = 0; // draw sits at or inside the eye
 			// Draw that merely REACHES the eye: its furthest vertex is fine, its nearest is not.
 			// skip_minw cannot see these, because that gate tests max w.
@@ -1706,6 +1707,22 @@ namespace RemixSubmit
 			std::fflush(file);
 		}
 
+		// Whether to submit a second camera as REMIXAPI_CAMERA_TYPE_SKY.
+		//
+		// Remix keeps one camera per type and renders instances tagged
+		// REMIXAPI_INSTANCE_CATEGORY_BIT_SKY with the sky one. We have been tagging sky instances
+		// since the classifier landed but never submitting the camera to go with them, so the
+		// developer menu's SKY entry reads empty and sky geometry is rendered with the world
+		// camera -- which puts the backdrop at whatever distance the un-projection happened to
+		// give it, a few units in front of the player rather than at infinity.
+		bool sky_camera_enabled()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_SKYCAM", 1) != 0;
+			return value;
+		}
+
+		bool s_logged_sky_camera = false;
+
 		void submit_camera()
 		{
 			// The extent the previous frame actually submitted, in whichever space is in use.
@@ -1745,6 +1762,30 @@ namespace RemixSubmit
 
 			remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &camera_info);
 			++s_stats.cam_world;
+
+			if (sky_camera_enabled())
+			{
+				// Same orientation, same projection, no translation. A skybox is a direction, not
+				// a place: stripping the eye position is what makes it stay at infinity while the
+				// player walks, instead of sliding past like scenery. The view matrix is
+				// row-vector (see to_camera_matrix above), so the eye offset lives in row 3.
+				remixapi_CameraInfo sky_info = camera_info;
+				sky_info.type = REMIXAPI_CAMERA_TYPE_SKY;
+				sky_info.view[3][0] = 0.f;
+				sky_info.view[3][1] = 0.f;
+				sky_info.view[3][2] = 0.f;
+
+				remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &sky_info);
+				++s_stats.cam_sky;
+
+				if (!s_logged_sky_camera)
+				{
+					s_logged_sky_camera = true;
+					INFO_LOG("Remix: sky camera submitted -- world orientation, translation "
+							 "stripped. PCSX2_REMIX_SKYCAM=0 disables it and restores rendering "
+							 "sky instances with the world camera.");
+				}
+			}
 
 			if (light_mode() == 2)
 			{
@@ -3415,7 +3456,7 @@ namespace RemixSubmit
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} | "
-					 "warn stq {} | cam world {} fallback {} | "
+					 "warn stq {} | cam world {} fallback {} skycam {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
 					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
@@ -3427,7 +3468,7 @@ namespace RemixSubmit
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
 				s_stats.skip_minw, s_stats.skip_min_vertex_w,
-				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
+				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_sky,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
 				s_stats.skip_all_degenerate, s_stats.meshes_created_peak,
@@ -5350,6 +5391,7 @@ namespace RemixSubmit
 		s_refuted_matrices.clear();
 		s_camera_last_accept_frame = 0;
 		s_logged_world_camera = false;
+		s_logged_sky_camera = false;
 		s_light_placed = false;
 		s_sun_placed = false;
 		s_drawdump_started = false;

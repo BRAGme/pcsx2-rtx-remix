@@ -68,6 +68,14 @@ namespace remix_ps2
 				"Neither test is needed if you tag the sky texture by hand in the Remix developer "
 				"menu; that is exact, and it applies without a restart.",
 				false},
+			{"SKYCAM", "Sky", "Sky camera", knob_type::Boolean, 1, 0, 1, 1, nullptr,
+				"Submits a second camera to Remix as the sky camera -- the world camera's "
+				"orientation with its position stripped out. Remix renders anything tagged as sky "
+				"with this camera, which is what keeps a backdrop at infinity while you walk "
+				"instead of sliding past like scenery. Without it the sky entry in the Remix "
+				"developer menu's camera list stays empty and sky geometry is drawn with the "
+				"world camera.",
+				false},
 			{"SKYORDER", "Sky", "Sky draw order", knob_type::Integer, 0, 0, 100000, 1, nullptr,
 				"How many leading draws in a frame are eligible to be classified as sky. Narrows "
 				"\"Depth-neutral draws\" (0 = no limit); required by \"First N draws\", which does "
