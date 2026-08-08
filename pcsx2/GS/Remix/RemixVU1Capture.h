@@ -58,6 +58,10 @@ namespace RemixVU1Capture
 
 	struct Frame
 	{
+		// Value of g_kick_seq at the instant this frame was published. Together with a live
+		// KickSeq() read on the GS thread it measures how far behind the GS side is running,
+		// which is what decides whether a draw can be joined to the kick that produced it.
+		u64 kick_seq_end;
 		u32 count; // candidates in items[]
 		u32 kicks_seen;
 		u32 kicks_scanned;
@@ -74,6 +78,29 @@ namespace RemixVU1Capture
 	extern std::atomic<bool> g_armed;
 
 	inline bool Armed() { return g_armed.load(std::memory_order_relaxed); }
+
+	// Monotonic count of XGKICKs this session, incremented on every kick including the ones
+	// dropped for reentrancy -- it is a sequence number, not a workload counter, so a gap in it
+	// must mean "a kick happened here that we did not scan" rather than nothing at all.
+	//
+	// Diagnostic only. Read from the GS thread to answer whether draws can be attributed to the
+	// kick that produced them; nothing in the render path depends on it.
+	extern std::atomic<u64> g_kick_seq;
+
+	inline u64 KickSeq() { return g_kick_seq.load(std::memory_order_relaxed); }
+
+	// The transported twin of the above: the kick sequence carried on the MTGS ring alongside the
+	// packet the GS thread is currently transferring. Written by the ring dispatch on seeing a
+	// Command::RemixKickSeq, read at draw time.
+	//
+	// Plain, not atomic, and deliberately so: both the write and the read happen on the GS thread.
+	// A live KickSeq() read at draw time is up to two frames stale (measured: 2106 kicks on
+	// Rainbow Six 3) because the GS thread trails the EE by VsyncQueueSize -- this is the value
+	// that is actually contemporaneous with the draw.
+	extern u64 g_gs_kick_seq;
+
+	inline void SetGSKickSeq(u64 seq) { g_gs_kick_seq = seq; }
+	inline u64 GSKickSeq() { return g_gs_kick_seq; }
 
 	void SetArmed(bool enabled);
 

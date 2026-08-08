@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS.h"
+#include "GS/Remix/RemixVU1Capture.h"
 #include "Gif_Unit.h"
 #include "MTGS.h"
 #include "MTVU.h"
@@ -454,6 +455,17 @@ void MTGS::MainLoop()
 					if (offset != ~0u)
 						GSgifTransfer((u8*)&path.buffer[offset], size / 16);
 					path.readAmount.fetch_sub(size, std::memory_order_acq_rel);
+					break;
+				}
+
+				case Command::RemixKickSeq:
+				{
+					// GS thread. Names the kick the *next* packet command was built under; the
+					// Remix backend reads it at draw time. tag.data[2] is the path, kept for
+					// diagnostics only.
+					RemixVU1Capture::SetGSKickSeq(
+						(static_cast<u64>(static_cast<u32>(tag.data[1])) << 32) |
+						static_cast<u64>(static_cast<u32>(tag.data[0])));
 					break;
 				}
 
@@ -1048,15 +1060,40 @@ void MTGS::SetRunIdle(bool enabled)
 	s_run_idle_flag.store(enabled, std::memory_order_release);
 }
 
+// Stamps the ring with the VU1 kick sequence current at packet completion.
+//
+// Completion, not the XGKICK itself: one kick is not one packet -- a wrapping kick calls
+// CopyGSPacketData then TransferGSPacketData, and Gif_AddBlankGSPacket / Gif_Path_MTVU::fakePacket
+// produce packets with no kick behind them at all. These two funnels are 1:1 with ring commands by
+// construction, which is the property the attribution depends on.
+//
+// Costs nothing when Remix is closed: Armed() is one relaxed atomic load.
+static void Gif_SendRemixKickSeq(GIF_PATH path)
+{
+	if (!RemixVU1Capture::Armed())
+		return;
+
+	const u64 seq = RemixVU1Capture::KickSeq();
+
+	MTGS::SendSimplePacket(MTGS::Command::RemixKickSeq,
+		static_cast<int>(static_cast<u32>(seq)), static_cast<int>(static_cast<u32>(seq >> 32)),
+		static_cast<int>(path));
+}
+
 // Used in MTVU mode... MTVU will later complete a real packet
 void Gif_AddGSPacketMTVU(GS_Packet& gsPack, GIF_PATH path)
 {
+	Gif_SendRemixKickSeq(path);
 	MTGS::SendSimpleGSPacket(MTGS::Command::MTVUGSPacket, 0, 0, path);
 }
 
 void Gif_AddCompletedGSPacket(GS_Packet& gsPack, GIF_PATH path)
 {
 	//DevCon.WriteLn("Adding Completed Gif Packet [size=%x]", gsPack.size);
+	// Ahead of both branches: the COPY_GS_PACKET_TO_MTGS path sends its packet through
+	// PrepDataPacket/SendDataPacket rather than SendSimpleGSPacket, and both must be stamped.
+	Gif_SendRemixKickSeq(path);
+
 	if (COPY_GS_PACKET_TO_MTGS)
 	{
 		MTGS::PrepDataPacket(path, gsPack.size / 16);

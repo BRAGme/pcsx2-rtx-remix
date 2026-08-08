@@ -624,6 +624,12 @@ namespace RemixSubmit
 		bool s_frame_bounds_world = false;
 		bool s_last_bounds_world = false;
 
+		// Diagnostic (phase 1 of per-draw camera association): the kick sequence the VU side had
+		// reached when the candidate set this frame is drawing from was published. Compared against
+		// a live RemixVU1Capture::KickSeq() at draw time, the difference is the GS thread's lag in
+		// kicks -- and therefore whether a live read can attribute a draw to its own kick at all.
+		u64 s_latched_kick_seq = 0;
+
 		// The largest eye-space depth submitted this frame, and the hashes of world matrices
 		// refuted by the extent check below.
 		//
@@ -1767,6 +1773,8 @@ namespace RemixSubmit
 			// The producer is on another thread behind a seqlock; never let its count index
 			// this side's loop without a bound of our own.
 			frame.count = std::min(frame.count, RemixVU1Capture::max_candidates);
+
+			s_latched_kick_seq = frame.kick_seq_end;
 
 			s_stats.vu_kicks += frame.kicks_seen;
 			s_stats.vu_kicks_scanned += frame.kicks_scanned;
@@ -4831,12 +4839,14 @@ namespace RemixSubmit
 		if (s_drawdump_frames_left > 0 || explode_ratio > 0.f)
 		{
 			const std::string draw_state_line = fmt::format(
-				"f={} d={} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
+				"f={} d={} k={} kf={} kt={} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
 				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
 				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
 				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
 				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
-				s_frame_counter, s_submitted_this_frame, vertex_count, s_scratch_indices.size() / 3,
+				s_frame_counter, s_submitted_this_frame,
+				RemixVU1Capture::KickSeq(), s_latched_kick_seq, RemixVU1Capture::GSKickSeq(),
+				vertex_count, s_scratch_indices.size() / 3,
 				fst_draw ? 1 : 0, world_mode ? 1 : 0,
 				ds.is_sky ? 1 : 0,
 				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),

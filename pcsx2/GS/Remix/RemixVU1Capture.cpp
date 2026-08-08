@@ -404,6 +404,10 @@ namespace RemixVU1Capture
 
 		void publish()
 		{
+			// Stamped here rather than per kick: publish() runs inside the scan guard, so this is
+			// the last point at which s_frame is provably owned by one thread.
+			s_frame.kick_seq_end = g_kick_seq.load(std::memory_order_relaxed);
+
 			const u32 seq = s_seq.load(std::memory_order_relaxed);
 
 			s_seq.store(seq + 1, std::memory_order_relaxed);
@@ -417,6 +421,8 @@ namespace RemixVU1Capture
 	} // namespace
 
 	std::atomic<bool> g_armed{false};
+	std::atomic<u64> g_kick_seq{0};
+	u64 g_gs_kick_seq = 0;
 
 	void SetArmed(bool enabled)
 	{
@@ -424,6 +430,8 @@ namespace RemixVU1Capture
 		{
 			// A fresh session must not inherit the previous one's candidates.
 			s_seq.store(0, std::memory_order_relaxed);
+			g_kick_seq.store(0, std::memory_order_relaxed);
+			g_gs_kick_seq = 0;
 			s_drop_before_seq.store(0, std::memory_order_relaxed);
 			s_published = Frame{};
 			s_frame = Frame{};
@@ -468,6 +476,10 @@ namespace RemixVU1Capture
 
 	void OnXGKick()
 	{
+		// Before the reentrancy gate on purpose: this is the kick *sequence*, so a kick that is
+		// dropped below still has to advance it or the numbering stops describing the guest.
+		g_kick_seq.fetch_add(1, std::memory_order_relaxed);
+
 		// VU1 is executed by the EE thread, or by the MTVU thread, or by both in the same
 		// session (vif1's _vuXGKICKTransfer runs on the EE side while vu1Thread executes the
 		// program). Everything below writes one shared per-frame accumulator, so let exactly

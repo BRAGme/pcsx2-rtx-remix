@@ -33,6 +33,11 @@ namespace MTGS
 		MTVUGSPacket,
 		InitAndReadFIFO,
 		AsyncCall,
+		// Carries the VU1 XGKICK sequence number the following GS packet was produced under, so
+		// the RTX Remix backend can attribute a draw to the camera that was live when the guest
+		// built it. Queued immediately before the packet command; the ring is strictly FIFO, so
+		// it is popped immediately before it too. Only emitted while Remix is armed.
+		RemixKickSeq,
 	};
 
 	struct FreezeData
