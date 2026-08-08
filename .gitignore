@@ -135,3 +135,10 @@ CMakeSettings.json
 # Per-game Remix files (generated at runtime)
 bin/RemixGames/
 
+
+# Runtime-written Remix state and build caches (never curated -- the per-game confs are tracked)
+bin/rtx.conf
+/user.conf
+/metrics.txt
+*.dxvk-cache
+__pycache__/
