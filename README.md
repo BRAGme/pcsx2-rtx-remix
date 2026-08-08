@@ -68,14 +68,15 @@ All three stills are frames lifted from screen captures on this branch. Emulator
 and this branch moves several times a day, so each one is labelled with **when it was captured and
 what the branch tip was at that moment**. Nothing here is a render of a build that does not exist.
 
-![Rainbow Six 3, outdoor scene, path traced](docs/Remix/README-assets/pcsx2-r6-3-valley.jpg)
+![Ghost Recon 2, outdoor river valley, path traced](docs/Remix/README-assets/pcsx2-gr2-valley.jpg)
 
-*Tom Clancy's Rainbow Six 3 (SLUS-20883). Captured 2026-08-08 08:58; branch tip `b87dc8e8f`.
+*Tom Clancy's Ghost Recon 2 (SLUS-21105). Captured 2026-08-08 08:58; branch tip `b87dc8e8f`.
 Textures, vertex normals and path-traced lighting; the near-black sky is the game's own.*
 
 ![Rainbow Six 3, a squad moving through a lodge interior, path traced](docs/Remix/README-assets/pcsx2-r6-3-squad.jpg)
 
-*Same title, a separate capture: 2026-08-08 08:24, branch tip `37a25ae09` at that moment. Albedo on
+*A different title, Tom Clancy's Rainbow Six 3 (SLUS-20883), captured 2026-08-08 08:24; branch tip
+`37a25ae09` at that moment. Albedo on
 brick, plank and the framed oil painting; character models with their own textures; contact shadows
 and the light shaft are the path tracer, not baked. The status bar bottom right is the emulator's
 own -- `RTX Remix` names the active renderer, at 60 fps. The Remix developer menu was open during
@@ -102,7 +103,8 @@ Read this before building anything. The backend renders, and it is not finished.
 
 | Title | Serial | What was verified | When, and on what |
 |---|---|---|---|
-| Tom Clancy's Rainbow Six 3 | `SLUS-20883` | World geometry, albedo textures, generated vertex normals, path-traced lighting | Capture 2026-08-08 08:58, branch tip `b87dc8e8f` |
+| Tom Clancy's Ghost Recon 2 | `SLUS-21105` | World geometry, albedo textures, generated vertex normals, path-traced lighting | Capture 2026-08-08 08:58, branch tip `b87dc8e8f` |
+| Tom Clancy's Rainbow Six 3 | `SLUS-20883` | World geometry, albedo textures, characters, path-traced lighting | Capture 2026-08-08 08:24, branch tip `37a25ae09` |
 | SOCOM: U.S. Navy SEALs -- Combined Assault | `SCUS-97545` | World geometry, albedo textures, characters, path-traced lighting | Capture 2026-08-02 23:11, tip `a311a7c5d` -- **not re-verified since** |
 
 SOCOM is listed honestly rather than confidently. Between `a311a7c5d` and the current tip the
