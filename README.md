@@ -89,9 +89,10 @@ this capture and has been cropped out of the right edge.*
 current build.** SOCOM has not been re-verified since; see the status table. The floating compass
 in the top right is the world-space UI problem, not a Remix artefact.*
 
-<!-- video link: the source clips are not committed -- a git repo is a poor video host. Upload
-     pcsx2__2026-08-02__23-11-48.mp4 and PCSX2-RTX-Remix__2026-08-08__08-58-43.mp4 to YouTube or
-     Discord and drop the URLs here. -->
+**Video:** [Ghost Recon 2 under the backend, 13 s, 22 MB](https://github.com/BRAGme/pcsx2-rtx-remix/releases/download/remix-preview-1/pcsx2-rtx-remix-ghost-recon-2.mp4)
+-- the same capture the first still is from, so the same date and branch tip apply. It is a release
+asset rather than an embed, so the link downloads rather than streams. Audio is stripped: the source
+capture carries two tracks and one of them is a microphone.
 
 ---
 
