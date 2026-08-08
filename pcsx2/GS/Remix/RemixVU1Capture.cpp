@@ -268,6 +268,28 @@ namespace RemixVU1Capture
 		// past that, "the camera at this kick" stops being a true statement.
 		constexpr u64 s_kick_lookback = 2048;
 
+		// How many of a frame's scanned kicks may contribute the pinned window.
+		//
+		// 4 was hardcoded, and it is right for a title that writes its camera to the pinned
+		// address early in the frame -- R6 3 save state 9 does. Save state 7 does not: its camera
+		// reaches VU1[0x240] later, so within the first four kicks the address holds something
+		// else and the pinned re-read never offers the real matrix. Measured there: 0x240 is the
+		// ONLY offset of 20,000 distinct candidates whose split ever succeeds, and it surfaces
+		// twice in 30 seconds.
+		//
+		// Raising this trades set capacity for reach: the address is re-uploaded per frame but its
+		// contents change between kicks, so each distinct content costs one 1000-scored slot out
+		// of max_candidates. Default 4 keeps the old behaviour exactly.
+		u32 pinned_kick_window()
+		{
+			static const u32 value = []() -> u32 {
+				const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_PINKICKS", 4);
+				return (env <= 0) ? 0u : static_cast<u32>(std::min<s64>(env, 4096));
+			}();
+
+			return value;
+		}
+
 		bool finite_window(const float* m);
 
 		void record_kick_camera(u64 seq)
@@ -701,7 +723,8 @@ namespace RemixVU1Capture
 		// its contents are rewritten between kicks, and letting every kick contribute a
 		// 1000-scored entry would evict the whole rest of the set.
 		const u32 pinned = s_pinned_offset.load(std::memory_order_relaxed);
-		if (pinned != s_no_pin && s_frame.kicks_scanned <= 4 && (pinned + s_matrix_bytes) <= VU1_MEMSIZE)
+		if (pinned != s_no_pin && s_frame.kicks_scanned <= pinned_kick_window() &&
+			(pinned + s_matrix_bytes) <= VU1_MEMSIZE)
 		{
 			float m[16];
 			std::memcpy(m, mem + pinned, sizeof(m));
