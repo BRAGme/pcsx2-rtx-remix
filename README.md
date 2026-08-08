@@ -1,27 +1,288 @@
-# PCSX2
+# PCSX2 with a native RTX Remix render backend
 
-![Windows Build Status](https://img.shields.io/github/actions/workflow/status/PCSX2/pcsx2/windows_build_matrix.yml?label=%F0%9F%96%A5%EF%B8%8F%20Windows%20Builds)
-![Linux Build Status](https://img.shields.io/github/actions/workflow/status/PCSX2/pcsx2/linux_build_matrix.yml?label=%F0%9F%90%A7%20Linux%20Builds)
-![MacOS Build Status](https://img.shields.io/github/actions/workflow/status/PCSX2/pcsx2/macos_build_matrix.yml?label=%F0%9F%8D%8E%20MacOS%20Builds)
-[![Codacy Badge](https://app.codacy.com/project/badge/Grade/1f7c0d75fec74d6daa6adb084e5b4f71)](https://app.codacy.com/gh/PCSX2/pcsx2/dashboard?utm_source=github.com&utm_medium=referral&utm_content=PCSX2/pcsx2&utm_campaign=Badge_Grade)
-[![Discord Server](https://img.shields.io/discord/309643527816609793?color=%235CA8FA&label=PCSX2%20Discord&logo=discord&logoColor=white)](https://discord.com/invite/TCz3t9k)
+This is a fork of [PCSX2](https://github.com/PCSX2/pcsx2) that adds a **render backend which
+submits PlayStation 2 geometry to the RTX Remix runtime through the Remix API**, so a PS2 title is
+path traced rather than rasterised.
 
-PCSX2 is a free and open-source PlayStation 2 (PS2) emulator. Its purpose is to emulate the PS2's hardware, using a combination of MIPS CPU [Interpreters](<https://en.wikipedia.org/wiki/Interpreter_(computing)>), [Recompilers](https://en.wikipedia.org/wiki/Dynamic_recompilation) and a [Virtual Machine](https://en.wikipedia.org/wiki/Virtual_machine) which manages hardware states and PS2 system memory. This allows you to play PS2 games on your PC, with many additional features and benefits.
+It is not a d3d9 wrapper and there is no proxy DLL in the chain. The backend calls `remixapi_*`
+directly -- it creates meshes, materials, instances, lights and a camera, and hands them to the
+runtime every frame. That matters here because the usual way a game reaches Remix is by having its
+fixed-function D3D9 calls intercepted, and **the PlayStation 2 has no fixed-function transform unit
+to intercept**. There is no `SetTransform` to read a view matrix out of. The view-projection lives
+inside a VU1 microprogram that the game uploaded, so the backend has to recover it from the
+microcode itself; see [How the camera is recovered](#how-the-camera-is-recovered).
 
-## Project Details
+The sibling project is [rpcs3-rtx](https://github.com/BRAGme/rpcs3-rtx), the same idea for
+PlayStation 3 / RSX. That one is further along.
 
-PCSX2 has been in development for more than 20 years. Past versions could only run a few public domain game demos, but newer versions can run most games at full speed, including popular titles such as Final Fantasy X and Devil May Cry 3. Visit the [PCSX2 compatibility list](https://pcsx2.net/compat/) to check the latest compatibility status of games (with more than 2500 titles tested).
+Everything about the base emulator -- compatibility, BIOS requirements, controllers, the rest of it
+-- is unchanged and is documented in
+[upstream's README](https://github.com/PCSX2/pcsx2/blob/master/README.md).
 
-Installers and binaries for both stable and nightly builds are available from [our website](https://pcsx2.net/downloads/).
+---
 
-## System Requirements
+## Requirements
 
-PCSX2 supports Windows, Linux, and Mac platforms. Our [setup documentation page](https://pcsx2.net/docs/setup/requirements) contains additional details on software and hardware requirements.
+**This fork does not work with the stock NVIDIA RTX Remix runtime.** It requires the
+**Remix Plus** fork of dxvk-remix:
 
-Please note that a BIOS dump from a legitimately-owned PS2 console is required to use the emulator. For more information, visit [this page](https://pcsx2.net/docs/setup/bios/).
+| | |
+|---|---|
+| Runtime | [`RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix), maintainer Kim2091 |
+| Release tag | `remix-plus-1.5.1` (tag object `f4173a9c8b94736363cb27c3bd228059780acbcf`) |
+| Asset | `Remix_Plus_v1.5.1_x64_games_release.zip` |
+| API version | `0.1000.0` (the vendored `remix_c.h`) |
 
-## Contributing / Building
+Two independent reasons stock will not do:
 
-PCSX2 supports translation into other languages using [Crowdin](https://crowdin.com/project/pcsx2-emulator).
+1. **The version handshake rejects it.** Remix Plus reserves `REMIXAPI_VERSION_MINOR = 1000`
+   (`pcsx2/GS/Remix/remix_c.h:58-67`) and the compatibility check treats every minor as breaking
+   while `MAJOR == 0`. Stock dxvk-remix is on the `0.6.x` line, so the two refuse each other rather
+   than running with mismatched struct layouts and category bits.
+2. **`remixapi_CreateTexture` does not exist in stock.** The backend needs to hand the runtime
+   texture data it decoded from PS2 memory; there is no on-disk file to point at.
 
-See the [Contribution Guide](https://pcsx2.net/docs/contributing/) for more info on how to contribute.
+The vendored `pcsx2/GS/Remix/remix_c.h` is never hand-edited -- it is copied wholesale from the
+fork's `public/include/remix/remix_c.h` at the pinned tag, in the same commit that changes the
+deployed runtime. A single missed struct member silently misroutes every interface slot after the
+divergence, which fails at runtime rather than at build time.
+
+### Installing the runtime
+
+The backend looks for the runtime DLL in this order (`pcsx2/GS/Remix/RemixPaths.cpp:233-247`):
+
+1. `PCSX2_REMIX_DLL`, if set, used verbatim;
+2. the `RuntimePath` value under `[Remix]` in the settings;
+3. `<install>\remix\d3d9.dll`.
+
+So unzip the Remix Plus release into a `remix\` **subfolder** alongside `pcsx2-qtx64.exe`, giving
+you `<install>\remix\d3d9.dll`. **Do not drop `d3d9.dll` directly next to the executable.** A file
+by that name there gets picked up by anything else in the process that resolves it, which is
+precisely the failure the explicit subdirectory exists to avoid.
+
+---
+
+## What it looks like
+
+All three stills are frames lifted from screen captures on this branch. Emulator captures date fast
+and this branch moves several times a day, so each one is labelled with **when it was captured and
+what the branch tip was at that moment**. Nothing here is a render of a build that does not exist.
+
+![Rainbow Six 3, outdoor scene, path traced](docs/Remix/README-assets/pcsx2-r6-3-valley.jpg)
+
+*Tom Clancy's Rainbow Six 3 (SLUS-20883). Captured 2026-08-08 08:58; branch tip `b87dc8e8f`.
+Textures, vertex normals and path-traced lighting; the near-black sky is the game's own.*
+
+![Rainbow Six 3, interior, path traced](docs/Remix/README-assets/pcsx2-r6-3-interior.jpg)
+
+*Same title and same capture. Albedo textures resolving on world geometry, with contact shadowing
+from the path tracer.*
+
+![SOCOM Combined Assault, textured](docs/Remix/README-assets/pcsx2-socom-textured.jpg)
+
+*SOCOM: U.S. Navy SEALs -- Combined Assault (SCUS-97545). Captured **2026-08-02 23:11**, branch tip
+**`a311a7c5d`** -- six days and ~30 commits before the current tip. **This is not a picture of the
+current build.** SOCOM has not been re-verified since; see the status table. The floating compass
+in the top right is the world-space UI problem, not a Remix artefact.*
+
+<!-- video link: the source clips are not committed -- a git repo is a poor video host. Upload
+     pcsx2__2026-08-02__23-11-48.mp4 and PCSX2-RTX-Remix__2026-08-08__08-58-43.mp4 to YouTube or
+     Discord and drop the URLs here. -->
+
+---
+
+## Current status
+
+Read this before building anything. The backend renders, and it is not finished.
+
+### What has been seen working
+
+| Title | Serial | What was verified | When, and on what |
+|---|---|---|---|
+| Tom Clancy's Rainbow Six 3 | `SLUS-20883` | World geometry, albedo textures, generated vertex normals, path-traced lighting | Capture 2026-08-08 08:58, branch tip `b87dc8e8f` |
+| SOCOM: U.S. Navy SEALs -- Combined Assault | `SCUS-97545` | World geometry, albedo textures, characters, path-traced lighting | Capture 2026-08-02 23:11, tip `a311a7c5d` -- **not re-verified since** |
+
+SOCOM is listed honestly rather than confidently. Between `a311a7c5d` and the current tip the
+material path was rewritten several times over (`8f229137d`, `1952014f4`, `64d2b28f0`,
+`870e3f991`), and the device loss below makes SOCOM expensive to get into a mission at all, so it
+has not had a clean re-measurement. Assume it needs one. No other title has been measured; absence
+from this table means untested, not broken.
+
+### Known blockers
+
+**One camera per frame, applied to every draw.** The backend picks a single view-projection from
+the frame's candidate set and uses it for the whole frame. Per-draw camera association is not
+built. This is the headline limitation and it is measurable: on Rainbow Six 3 save state 9 the
+frames that anchor to world space run at 99.84%, but on save state 7 -- which runs a *different*
+VU1 microprogram emitting roughly 20,000 distinct candidate matrices in 30 s -- three 30 s runs
+measured 35.3%, 48.4% and 68.3% (`9c271c790`). The rest fall back to view space. A wall was removed
+there; the job is not finished.
+
+**Reproducible device loss (`0x60D0DEAD`) on some titles.** On SOCOM the hang lands within a
+fraction of a second of the renderer going live, and loading heavy mission geometry is what
+triggers it. This is not tuneable from the harness side -- four different entry strategies were
+measured and the ceiling is the crash, not the navigation. The measurements are written up in
+[`tools/remix-harness/README.md`](tools/remix-harness/README.md).
+
+**Vertex explosions on some draws.** Geometry occasionally lands at runaway positions and reads as
+white shards across the frame. `PCSX2_REMIX_POSLIMIT` drops vertices past a distance threshold as a
+blunt mitigation; the underlying decode is not fully solved.
+
+**No binary release yet.** Build from source for now -- see below. A release is planned once the
+camera limitation is addressed enough that a binary would not mostly generate "it's broken"
+reports.
+
+---
+
+## How the camera is recovered
+
+This is the part worth stealing if you are doing the same thing for another emulator.
+
+RTX Remix needs a camera: a view-projection matrix, per frame, in a coordinate system the runtime
+can reason about. On PC titles this is nearly free, because a fixed-function D3D9 game *tells* the
+driver its view and projection matrices through `SetTransform`, and a Remix-style interposer just
+reads them. **The PlayStation 2 has no such call.** The GS -- the part of the console that a
+graphics API would correspond to -- consumes vertices that are already in screen space. Everything
+upstream of that, including the entire transform, happens in VU1, a vector unit running a
+microprogram the game uploaded at some earlier point. There is no API surface. There is a 16 KB
+block of vector memory and a program you did not write.
+
+The first approach was the obvious one: scan VU1 data memory for 16-float windows that look like a
+projection matrix, and score them. It half-works and it is miserable. A frame produces on the order
+of a thousand plausible windows, most of them reinterpreted pointers or packed integer data that
+happens to decode as finite floats, and the scoring is a heuristic argument about shape with no
+ground truth behind it.
+
+The backend now does something deterministic instead: **a back-slice of the VU1 microcode itself**.
+The transform in a VU program is not arbitrary; it is the canonical matrix-vector product, and on
+VU1 it is written one way:
+
+```
+MULAx   ACC,     VF[m0], VF[v]x
+MADDAy  ACC,     VF[m1], VF[v]y
+MADDAz  ACC,     VF[m2], VF[v]z
+MADDw   VF[out], VF[m3], VF[v]w
+```
+
+Two properties make that decodable rather than merely plausible. First, **the broadcast field names
+the matrix row directly** -- the operand broadcast by component *i* is row *i* -- so row order
+comes out of the instruction encoding and not out of the order the instructions happen to appear
+in. Second, **back-slicing the load that last wrote each `VF[mi]`** (`LQ`, `LQI` or `LQD`) yields
+that row's address in VU1 data memory. Do that for all four rows and you have not scored a guess:
+you have the address the matrix lives at, derived from the program that uses it.
+
+From there the backend walks forward. A chain whose result is later `CLIP`ped is in clip space; a
+chain whose result feeds a `DIV` is the perspective divide. Those two facts identify which of the
+several matrix chains in a microprogram is the view-projection, as opposed to a bone palette or an
+object placement. The recovered address is then re-read at each `XGKICK` -- the instruction that
+hands a completed primitive buffer to the GS -- so the matrix that is read is the one the program
+was actually using when it submitted geometry, and it stays valid as the game animates it.
+
+The encodings are pinned to PCSX2's own tables (`microVU_Tables.inl`, `microVU_Misc.h`,
+`VU1microInterp.cpp`) rather than to documentation, so a change in how PCSX2 decodes VU1 cannot
+silently desynchronise the slicer. The design and the exact table references are in
+[`pcsx2/GS/Remix/RemixVU1Slice.h`](pcsx2/GS/Remix/RemixVU1Slice.h); the per-frame capture and
+candidate ranking are in
+[`pcsx2/GS/Remix/RemixVU1Capture.cpp`](pcsx2/GS/Remix/RemixVU1Capture.cpp).
+
+What is *not* solved is selection. A title can run several microprograms and emit thousands of
+distinct matrices per frame, and the backend still has to choose one per frame -- see the blocker
+above. The recovery is deterministic; the choice among recoveries is not yet.
+
+Worth noting for anyone porting the idea: RPCS3's `match_mad_chain` uses the same broadcast-names-
+the-row trick on RSX vertex programs, and VU1's `_bc_` field maps onto it almost exactly. The
+technique generalises better than the console-specific plumbing around it does.
+
+---
+
+## Building
+
+Windows, Visual Studio 2022, x64. This is what
+[`tools/remix-harness/build.cmd`](tools/remix-harness/build.cmd) has always run:
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+cd <repo>
+msbuild PCSX2_qt.sln /m /v:m /p:Configuration=Release /p:Platform=x64
+```
+
+Upstream's normal prerequisites apply; nothing extra is needed for the Remix backend beyond the
+runtime, which is loaded at run time and is not a build dependency.
+
+The CMake presets in `CMakePresets.json` want `clang-cl`, which is not installed on the machine
+this fork is developed on, so **the CMake path is untested here**. Use the `sln`.
+
+Select the backend in *Settings -> Graphics -> Renderer*. Remix is renderer index 16 if you are
+setting it from `bin\inis\PCSX2.ini` directly, which is what the test harness does.
+
+---
+
+## Running, and per-game configuration
+
+Remix settings live in the GUI on their own page
+(`pcsx2-qt/Settings/RemixSettingsWidget.{h,cpp,ui}`).
+
+Per-game Remix settings go in `bin/<serial>.conf`. Two curated examples are tracked:
+
+- [`bin/SCUS-97545.conf`](bin/SCUS-97545.conf) -- SOCOM: Combined Assault
+- [`bin/SLUS-20883.conf`](bin/SLUS-20883.conf) -- Rainbow Six 3
+
+These are read at frame boundaries and pushed through `remixapi_SetConfigVariable`, which writes
+Remix's **user** layer -- so they outrank `rtx.conf` and any Logic-graph layer. Keys spelled
+`PCSX2_REMIX_*` set this backend's own knobs instead of Remix's. **An environment variable that is
+already set always beats the file**, which is deliberate: it keeps A/B harnesses authoritative over
+whatever the GUI last wrote.
+
+Read those two files even if you do not play those games. They are written in the house style --
+measured numbers rather than adjectives -- and they record *why* each setting is what it is. For
+example, volumetric fog was not dimming SOCOM but hiding it: with volumetrics on, 2,502,313 lit
+pixels at a uniform grey and 0.00% coloured; with them off, 26,874 lit pixels and 34.31% coloured.
+
+Runtime-generated per-game state (Remix logs, captures, mods) goes to `bin/RemixGames/<serial>/`,
+which is gitignored.
+
+### Knobs
+
+The backend has 60 tuning knobs, each settable three equivalent ways: the environment variable
+`PCSX2_REMIX_<name>`, the settings key `[Remix]/<name>`, or the GUI page.
+
+**[`docs/Remix/KNOBS.md`](docs/Remix/KNOBS.md)** is the full reference -- name, type, default,
+range and effect, grouped. It is generated from the table in `pcsx2/GS/Remix/RemixKnobs.cpp`, which
+is the single declaration the GUI and the environment bridge both read, so a knob cannot be wired
+to the wrong variable and the default shown in the GUI cannot drift from the default the backend
+applies.
+
+### Test harness
+
+[`tools/remix-harness/`](tools/remix-harness/README.md) holds the measurement scripts: an
+equal-wall-time A/B runner over two builds, capture and image-metric tools, and a scripted route
+into a SOCOM mission that survives the startup window the GPU hang lives in. Its README is also
+where the traps are written down -- black `PrintWindow` captures, signed exit codes, zombie
+processes that make a crashed run look like a survival. Worth reading before trusting any
+measurement from this fork, including the ones quoted above.
+
+---
+
+## License and credits
+
+GPL-3.0, unchanged from upstream. This fork adds files under `pcsx2/GS/Remix/`,
+`pcsx2-qt/Settings/Remix*`, `tools/remix-harness/` and `docs/Remix/`; everything else is PCSX2's.
+
+- **[PCSX2](https://github.com/PCSX2/pcsx2)** and its contributors -- the emulator this is a fork
+  of, and the source of everything that is not the Remix backend.
+- **[NVIDIA RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix)** -- the runtime and the API
+  this targets.
+- **[Remix Plus](https://github.com/RemixProjGroup/dxvk-remix)** (maintainer Kim2091) -- the
+  dxvk-remix fork this pins, without whose `remixapi_CreateTexture` and extended API surface none
+  of this would be possible.
+
+Bugs here are this fork's, not upstream's. Please do not take PCSX2 issues about the Remix
+renderer to the PCSX2 project.
+
+### Provenance
+
+Development on this branch is AI-assisted: work is done with Claude and the commits carry a
+`Co-Authored-By` trailer (earlier ones an `(AI-assisted)` subject suffix). The code, the decisions
+and the measurements are owned by a human, and every performance or behaviour claim in this README
+and in the commit log is backed by a number that was actually measured on this machine -- which is
+also why the status table above says "not re-verified" where that is the truth.
