@@ -157,6 +157,16 @@ namespace remix_ps2
 				false},
 			{"MINW", "Geometry and Filtering", "Minimum w", knob_type::Float, 0.01, 0.0, 1000.0, 0.01,
 				nullptr, "Draws with a smaller maximum w are skipped.", false},
+			{"MINVW", "Geometry and Filtering", "Minimum vertex w", knob_type::Float, 0.0, 0.0, 1000.0, 0.001,
+				nullptr,
+				"Skips a draw any of whose vertices falls below this w, rather than one whose "
+				"furthest vertex does. A draw can span a fine far end and a degenerate near end, "
+				"and \"Minimum w\" passes it untouched. At very small w there is no precision left "
+				"to reconstruct a world position from, which is how a surface ends up pinned in "
+				"front of the view and staying there as you turn. 0 disables it. Raise it in small "
+				"steps -- the first-person weapon genuinely sits near the eye, so too high a value "
+				"removes that too.",
+				false},
 			{"MAXW", "Geometry and Filtering", "Maximum w", knob_type::Float, 0.0, 0.0, 100000.0, 1.0,
 				nullptr, "Draws beyond this w are skipped. 0 disables the gate.", false},
 			{"EXPLODEK", "Geometry and Filtering", "Vertex explosion limit", knob_type::Float, 32.0, 0.0, 100000.0, 4.0,

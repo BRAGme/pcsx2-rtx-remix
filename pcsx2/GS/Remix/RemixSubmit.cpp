@@ -123,6 +123,9 @@ namespace RemixSubmit
 			// one surface with a combined material, which is where the level's baked lighting is.
 			u64 multipass_overlay = 0;
 			u64 skip_minw = 0; // draw sits at or inside the eye
+			// Draw that merely REACHES the eye: its furthest vertex is fine, its nearest is not.
+			// skip_minw cannot see these, because that gate tests max w.
+			u64 skip_min_vertex_w = 0;
 			u64 skip_maxw = 0; // draw sits entirely beyond the far-field cap (PCSX2_REMIX_MAXW)
 			// Hyperextended draws: the ones whose AABB diagonal exceeds explode_ratio_limit()
 			// times their own furthest w, i.e. "vertex explosion" turned into a number. Counted,
@@ -2408,6 +2411,28 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// The near-vertex twin of min_submitted_w(): reject a draw any of whose vertices falls
+		// below this w, rather than one whose furthest vertex does. A draw can span [0.007, 3.3]
+		// -- fine at the far end, degenerate at the near end -- and the max-w gate above passes it
+		// untouched.
+		//
+		// 0 (the default) disables it. It is off by default because it rejects whole draws and the
+		// first-person weapon genuinely sits near the eye; the per-draw dump's w range is what a
+		// value should be set from.
+		float min_vertex_w()
+		{
+			static const float value = []() -> float {
+				const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_MINVW");
+				if (env.empty())
+					return 0.f;
+
+				const float parsed = static_cast<float>(::_wtof(env.c_str()));
+				return (std::isfinite(parsed) && parsed >= 0.f) ? parsed : 0.f;
+			}();
+
+			return value;
+		}
+
 		// The far-field twin of min_submitted_w(): reject a draw whose *nearest* vertex is beyond
 		// this w, so nothing in the frame sits further out than the cap. 0 (the default) disables
 		// it and nothing changes.
@@ -3389,7 +3414,7 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} | "
+					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} | "
 					 "warn stq {} | cam world {} fallback {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
@@ -3401,7 +3426,7 @@ namespace RemixSubmit
 				s_stats.skip_const_q, s_stats.skip_w_flat, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
-				s_stats.skip_minw,
+				s_stats.skip_minw, s_stats.skip_min_vertex_w,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
@@ -4158,6 +4183,29 @@ namespace RemixSubmit
 			if (min_w_limit > 0.f && max_w < min_w_limit)
 			{
 				++s_stats.skip_minw;
+				return;
+			}
+
+			// The near-vertex twin of the gate above. That one drops a draw lying ENTIRELY inside
+			// the eye; this one drops a draw that merely REACHES it, which the max-w test cannot
+			// see.
+			//
+			// Measured on Rainbow Six 3 slot 9: exactly two draws per frame carry vertices at
+			// w ~ 0.007 while their max w is comfortable, so nothing currently rejects them.
+			// d=14 spans w [0.0074, 3.3343] -- a 448x ratio across six triangles covering 36.6% of
+			// the screen -- and both draws' w values repeat to four decimal places every frame,
+			// i.e. they do not move relative to the camera. Reconstruction from clip x/y/w has no
+			// precision left at that w, and with this title's z = w + 2715.9 there is no
+			// independent depth to stabilise it.
+			//
+			// Default 0 (off). This rejects whole draws, and the first-person weapon legitimately
+			// lives near the eye -- on R6 3 the other near draw is ~430 triangles over half the
+			// screen -- so a value that removes the artefact may remove the weapon with it. Set it
+			// from the w range in the per-draw dump, not by guessing.
+			const float min_vertex_w_limit = min_vertex_w();
+			if (min_vertex_w_limit > 0.f && min_w < min_vertex_w_limit)
+			{
+				++s_stats.skip_min_vertex_w;
 				return;
 			}
 
