@@ -133,9 +133,10 @@ measured and the ceiling is the crash, not the navigation. The measurements are 
 white shards across the frame. `PCSX2_REMIX_POSLIMIT` drops vertices past a distance threshold as a
 blunt mitigation; the underlying decode is not fully solved.
 
-**No binary release yet.** Build from source for now -- see below. A release is planned once the
-camera limitation is addressed enough that a binary would not mostly generate "it's broken"
-reports.
+**A binary build is available** -- see [Releases](https://github.com/BRAGme/pcsx2-rtx-remix/releases),
+marked prerelease because everything above is still true of it. It does not include the Remix Plus
+runtime or a PS2 BIOS; both are described in the zip's `SETUP.txt`. Building from source is still
+documented below, and the packaging list is `tools/package-release.sh`.
 
 ---
 
