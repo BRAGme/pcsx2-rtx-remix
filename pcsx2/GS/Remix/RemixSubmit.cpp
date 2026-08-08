@@ -123,6 +123,7 @@ namespace RemixSubmit
 			// one surface with a combined material, which is where the level's baked lighting is.
 			u64 multipass_overlay = 0;
 			u64 cam_sky = 0; // frames a REMIXAPI_CAMERA_TYPE_SKY camera was submitted for
+			u64 cam_viewmodel = 0; // ditto for REMIXAPI_CAMERA_TYPE_VIEW_MODEL
 			u64 skip_minw = 0; // draw sits at or inside the eye
 			// Draw that merely REACHES the eye: its furthest vertex is fine, its nearest is not.
 			// skip_minw cannot see these, because that gate tests max w.
@@ -1723,6 +1724,18 @@ namespace RemixSubmit
 
 		bool s_logged_sky_camera = false;
 
+		// Whether to submit a REMIXAPI_CAMERA_TYPE_VIEW_MODEL camera. Harmless on its own: the
+		// runtime's viewmodel path early-outs on rtx.viewModel.enable (default False) and then on
+		// an empty candidate list, and the portal-only paths a valid viewmodel camera unlocks are
+		// inert without two active ray portals.
+		bool view_model_camera_enabled()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_VMCAM", 1) != 0;
+			return value;
+		}
+
+		bool s_logged_view_model_camera = false;
+
 		void submit_camera()
 		{
 			// The extent the previous frame actually submitted, in whichever space is in use.
@@ -1784,6 +1797,29 @@ namespace RemixSubmit
 					INFO_LOG("Remix: sky camera submitted -- world orientation, translation "
 							 "stripped. PCSX2_REMIX_SKYCAM=0 disables it and restores rendering "
 							 "sky instances with the world camera.");
+				}
+			}
+
+			if (view_model_camera_enabled())
+			{
+				// The world camera verbatim. A viewmodel is at the eye, so unlike the sky its
+				// translation stays; the runtime derives its own perspective correction from
+				// whatever we send here (createViewModelInstances), and sending the world camera
+				// makes that correction neutral. A narrower viewmodel FOV would go here if the
+				// weapon ever needs to stop clipping into walls.
+				remixapi_CameraInfo vm_info = camera_info;
+				vm_info.type = REMIXAPI_CAMERA_TYPE_VIEW_MODEL;
+
+				remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &vm_info);
+				++s_stats.cam_viewmodel;
+
+				if (!s_logged_view_model_camera)
+				{
+					s_logged_view_model_camera = true;
+					INFO_LOG("Remix: view-model camera submitted. Instances only reach it if they "
+							 "carry REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL -- tag them by hash "
+							 "with rtx.viewModelTextures -- and the runtime also needs "
+							 "rtx.viewModel.enable, which defaults False.");
 				}
 			}
 
@@ -3456,7 +3492,7 @@ namespace RemixSubmit
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} | "
-					 "warn stq {} | cam world {} fallback {} skycam {} | "
+					 "warn stq {} | cam world {} fallback {} skycam {} vmcam {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
 					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
@@ -3468,7 +3504,7 @@ namespace RemixSubmit
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
 				s_stats.skip_minw, s_stats.skip_min_vertex_w,
-				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_sky,
+				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_sky, s_stats.cam_viewmodel,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
 				s_stats.skip_all_degenerate, s_stats.meshes_created_peak,
@@ -4050,8 +4086,36 @@ namespace RemixSubmit
 		// expressed in the synthetic camera's space. Both paths consume the same NDC, so the
 		// only difference is the three lines that turn (ndc, w) into a position.
 		const bool world_mode = s_active_camera.valid;
-		const remix_ps2::clip_solver& solver = s_active_camera.solver;
 		const float position_limit = max_position_magnitude();
+
+		// Sky geometry has to be solved in a space with no eye in it.
+		//
+		// solve_world_position computes (clip - bias) * B^-1, and for an accepted type-1
+		// perspective the solver's bias IS the eye-translation term: it is the fused matrix's
+		// row 3 restricted to columns {0,1,3}, and classify_perspective has already pinned the
+		// other row-3 entries to ~0. So subtracting it adds +eye to every vertex. For world
+		// geometry that is correct and is the whole point. For a backdrop it is wrong: the guest
+		// drew the sky with its own translation-free matrix, so the eye gets added to something
+		// that never had one, and the dome and the sun ride the camera -- which is exactly the
+		// reported "sun/moon follows me from behind".
+		//
+		// Zeroing bias leaves the 3x3 orientation inverse untouched, so this is precisely "world
+		// rotation, zero eye" -- the same space the sky camera is submitted in by submit_camera().
+		// Both halves have to agree or the sky is displaced by the full eye position, which on
+		// save state 7 is ~20,000 units and puts the backdrop somewhere off in the distance
+		// instead of behind the level.
+		remix_ps2::clip_solver sky_solver = s_active_camera.solver;
+		sky_solver.bias[0] = 0.f;
+		sky_solver.bias[1] = 0.f;
+		sky_solver.bias[2] = 0.f;
+
+		// classify_sky is evaluated again by build_draw_state below; it reads only the cached
+		// depth bits and s_submitted_this_frame, neither of which moves between here and there,
+		// so the two agree by construction.
+		const bool sky_draw = sky_camera_enabled() &&
+			classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(), s_submitted_this_frame);
+
+		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : s_active_camera.solver;
 
 		const GSVertex* const verts = r.m_vertex->buff;
 
@@ -5392,6 +5456,7 @@ namespace RemixSubmit
 		s_camera_last_accept_frame = 0;
 		s_logged_world_camera = false;
 		s_logged_sky_camera = false;
+		s_logged_view_model_camera = false;
 		s_light_placed = false;
 		s_sun_placed = false;
 		s_drawdump_started = false;

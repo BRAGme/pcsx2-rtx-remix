@@ -343,6 +343,17 @@ namespace remix_ps2::materials
 			// stay compatible with. Ours, so the user still has a by-hash lever for foliage and
 			// decals that the ATE auto-classifier misses.
 			{"rtx.pcsx2AlphaCutoutTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT},
+			// Routes an instance to the VIEW_MODEL camera rather than the world one. This is the
+			// only way to reach that camera from the API: categoryToCameraType checks this bit
+			// first and returns CameraType::ViewModel, and the result becomes
+			// prototype.cameraType (rtx_remix_api.cpp, remix-plus-1.5.1). There is no such
+			// texture-list option in the runtime, so the name is ours -- but the BIT is the
+			// runtime's, verified present at 1 << 26 in the deployed tag's public header. The
+			// April source checkout has neither the bit nor the ViewModel branch, so read the
+			// deployed tag, not the clone.
+			//
+			// Also needs rtx.viewModel.enable, which defaults false.
+			{"rtx.viewModelTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL},
 		};
 
 		std::unordered_map<u64, remixapi_InstanceCategoryFlags> s_categories;
