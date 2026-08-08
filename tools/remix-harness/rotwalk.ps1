@@ -1,5 +1,8 @@
 param(
-    [string]$Bin = "C:\Users\Tristan\Documents\GitHub\pcsx2\bin",
+    # The repo build, resolved from this script's location so a fresh checkout needs no editing.
+    [string]$Bin = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\bin")),
+    # Where captures land. Anywhere writable will do; it is created if missing.
+    [string]$Scratch = (Join-Path $env:TEMP "remix-harness"),
     [int]$Stable = 1,
     [string]$Tag = "rw",
     # Title selection. Defaults are Rainbow Six 3 slot 9 (the warehouse state); SOCOM is
@@ -18,7 +21,7 @@ param(
     [string]$TitleMatch = 'Rainbow Six 3'
 )
 
-$scratch = "C:\Users\Tristan\AppData\Local\Temp\claude\C--Users-Tristan-Documents-GitHub\867daea0-c913-4e87-8427-856883dcdb0c\scratchpad"
+New-Item -ItemType Directory -Force -Path $Scratch | Out-Null
 $isoPath = Join-Path "E:\PS2 Games" $Iso
 
 $sig = @'
@@ -112,23 +115,23 @@ $script:GameHwnd = $hwnd
 $focused = [Inp2]::ForceForeground($hwnd)
 Write-Output "focused=$focused"
 
-& "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_1_still.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+& "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_1_still.png" -TitleMatch $TitleMatch | Select-Object -Last 1
 Start-Sleep -Seconds 2
-& "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_2_still2.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+& "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_2_still2.png" -TitleMatch $TitleMatch | Select-Object -Last 1
 
 # Rotate: hold look-left in steps, capturing a quarter turn at a time.
 Hold 0x4A 900      # J
-& "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_3_rot90.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+& "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_3_rot90.png" -TitleMatch $TitleMatch | Select-Object -Last 1
 Hold 0x4A 900
-& "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_4_rot180.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+& "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_4_rot180.png" -TitleMatch $TitleMatch | Select-Object -Last 1
 Hold 0x4A 1800
-& "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_5_rot360.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+& "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_5_rot360.png" -TitleMatch $TitleMatch | Select-Object -Last 1
 
 # Walk forward, then back.
 Hold 0x57 1200     # W
-& "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_6_fwd.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+& "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_6_fwd.png" -TitleMatch $TitleMatch | Select-Object -Last 1
 Hold 0x53 1200     # S
-& "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_7_back.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+& "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_7_back.png" -TitleMatch $TitleMatch | Select-Object -Last 1
 
 if ($p.HasExited) { Write-Output ("DIED DURING code=0x{0:X8}" -f ([uint32]($p.ExitCode -band 0xFFFFFFFFL))) }
 cmd /c "taskkill /F /T /IM pcsx2-qtx64.exe" 2>&1 | Out-Null

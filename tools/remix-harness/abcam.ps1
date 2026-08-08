@@ -27,9 +27,12 @@ param(
     [int]$StartRound = 1,
     [int]$Live       = 60,
     [string]$Install = "E:\Emulators\PCSX2 RTX Remix",
-    [string]$Stash   = "C:\Users\Tristan\.claude\forge\20260804-1209-r6-3-camera-clipsplit-ab\stash",
-    [string]$Results = "C:\Users\Tristan\.claude\forge\20260804-1209-r6-3-camera-clipsplit-ab\results",
-    [string]$Fingerprint = "C:\Users\Tristan\.claude\forge\20260804-1209-r6-3-camera-clipsplit-ab\results\fingerprint.txt",
+    # Working area for the run. Anywhere writable will do; $Results is created, $Stash is an INPUT
+    # -- populate $Stash\armA and $Stash\armB with the two builds' pcsx2-qtx64.exe (+pdb) first.
+    [string]$Scratch = (Join-Path $env:TEMP "remix-harness"),
+    [string]$Stash   = (Join-Path $Scratch "stash"),
+    [string]$Results = (Join-Path $Scratch "results"),
+    [string]$Fingerprint = (Join-Path $Results "fingerprint.txt"),
     [string]$Iso     = "E:\PS2 Games\Tom Clancy's Rainbow Six 3 (USA).iso",
     [int]$Slot       = 9,
     # An explicit state FILE, not a slot index.

@@ -4,7 +4,8 @@ param(
     [string]$Iso = "SOCOM Combined Assault.iso",
     [int]$Live = 25,
     [string]$Name = "arm",
-    [string]$Bin = "C:\Users\Tristan\Documents\GitHub\pcsx2\bin",
+    # The repo build, resolved from this script's location so a fresh checkout needs no editing.
+    [string]$Bin = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\bin")),
     [hashtable]$Env = @{}
 )
 

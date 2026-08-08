@@ -12,7 +12,10 @@
 # and compare only adjacent pairs that are both actually lit.
 
 param(
-    [string]$Bin = "C:\Users\Tristan\Documents\GitHub\pcsx2\bin",
+    # The repo build, resolved from this script's location so a fresh checkout needs no editing.
+    [string]$Bin = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\bin")),
+    # Where captures land. Anywhere writable will do; it is created if missing.
+    [string]$Scratch = (Join-Path $env:TEMP "remix-harness"),
     [string]$Tag = "gs",
     [string]$Iso = "Tom Clancy's Rainbow Six 3 (USA).iso",
     [int]$Slot = 9,
@@ -27,7 +30,7 @@ param(
     [hashtable]$Extra = @{}
 )
 
-$scratch = "C:\Users\Tristan\AppData\Local\Temp\claude\C--Users-Tristan-Documents-GitHub\867daea0-c913-4e87-8427-856883dcdb0c\scratchpad"
+New-Item -ItemType Directory -Force -Path $Scratch | Out-Null
 $isoPath = Join-Path "E:\PS2 Games" $Iso
 
 $sig = @'
@@ -93,7 +96,7 @@ Write-Output ("focused=" + [Fg]::Force($hwnd))
 
 # No input is sent at any point. The camera does not move.
 for ($i = 1; $i -le $Shots; $i++) {
-    & "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_$i.png" -TitleMatch $TitleMatch | Select-Object -Last 1
+    & "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_$i.png" -TitleMatch $TitleMatch | Select-Object -Last 1
     if ($i -lt $Shots) { Start-Sleep -Milliseconds $GapMs }
 }
 

@@ -4,8 +4,15 @@ Measurement scripts for the `remix-backend` branch. Committed because they previ
 a `%TEMP%` scratchpad, where a cleanup would have destroyed them — several encode measurements and
 traps that cost real time to find.
 
-Every script assumes the repo build at `..\..\bin`. Paths inside them point at a session scratchpad
-that will not exist on a fresh checkout; repoint `$scratch` at the top of the ones that use it.
+Every script defaults `-Bin` to the repo build at `..\..\bin`, resolved from the script's own
+location, so a fresh checkout needs no editing. Captures and A/B results go to `-Scratch`, which
+defaults to `%TEMP%\remix-harness` and is created if missing; `abcam.ps1` derives `-Stash`,
+`-Results` and `-Fingerprint` from it, and `-Stash\armA` / `-Stash\armB` are an **input** you
+populate with the two builds before the run.
+
+Still machine-specific and worth checking before a run: the ISO directory (`E:\PS2 Games`), the
+deployed install `abcam.ps1 -Install` points at, and `build.cmd`'s Visual Studio path. All are
+parameters or one-line edits.
 
 ## The scripts
 

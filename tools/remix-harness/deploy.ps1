@@ -12,7 +12,10 @@
 # ~11,785 / ~11,794.
 
 param(
-    [string]$Bin = "C:\Users\Tristan\Documents\GitHub\pcsx2\bin",
+    # The repo build, resolved from this script's location so a fresh checkout needs no editing.
+    [string]$Bin = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\bin")),
+    # Where captures land. Anywhere writable will do; it is created if missing.
+    [string]$Scratch = (Join-Path $env:TEMP "remix-harness"),
     [string]$Tag = "dep",
     [int]$Stable = 0,
     [int]$DebugView = 0,
@@ -32,7 +35,7 @@ param(
     [hashtable]$Extra = @{}
 )
 
-$scratch = "C:\Users\Tristan\AppData\Local\Temp\claude\C--Users-Tristan-Documents-GitHub\867daea0-c913-4e87-8427-856883dcdb0c\scratchpad"
+New-Item -ItemType Directory -Force -Path $Scratch | Out-Null
 $isoPath = "E:\PS2 Games\SOCOM Combined Assault.iso"
 
 $sig = @'
@@ -184,7 +187,7 @@ if ($entered -and (Alive $p)) {
     for ($s = 1; $s -le 3; $s++) {
         Start-Sleep -Seconds ([int]($SettleSec / 3))
         if (-not (Alive $p)) { Write-Output "  died during settle $s"; break }
-        & "$scratch\capture.ps1" -OutPath "$scratch\${Tag}_$s.png" -TitleMatch "Combined Assault" | Select-Object -Last 1
+        & "$PSScriptRoot\capture.ps1" -OutPath "$Scratch\${Tag}_$s.png" -TitleMatch "Combined Assault" | Select-Object -Last 1
     }
 }
 
