@@ -292,6 +292,44 @@ namespace RemixVU1Capture
 
 		bool finite_window(const float* m);
 
+		// Finite is not the same as usable: an all-zero block passes every finiteness test, and
+		// VU1[pin] reads as all zeros for long stretches of every frame because the guest only
+		// holds a camera there part of the time.
+		bool usable_matrix(const float* m)
+		{
+			bool any_nonzero = false;
+			for (u32 i = 0; i < 16 && !any_nonzero; ++i)
+				any_nonzero = (m[i] != 0.f);
+
+			return any_nonzero && finite_window(m);
+		}
+
+		// The last contents of the pinned address that looked like a usable matrix, and the
+		// generation it was seen in.
+		//
+		// The scan samples only the first few kicks of a frame, and the camera is not reliably at
+		// the pinned address during them -- which is why R6 3 save state 7 hovers around half its
+		// frames world-anchored while state 9 sits at 99.8%. Remembering the last good read lets a
+		// frame that sampled an empty address still offer a camera instead of dropping the whole
+		// frame into view space.
+		float s_pin_retained[16]{};
+		bool s_pin_retained_valid = false;
+		u32 s_pin_retained_generation = 0;
+
+		// Generations (frames) a retained matrix stays offerable. 0 (default) disables retention
+		// and restores the previous behaviour exactly. A retained camera is by definition stale, so
+		// this trades "the world lags the view by a few frames" against "the world is glued to the
+		// view for this frame" -- the second is worse, but only up to a point, hence the bound.
+		u32 pin_hold_frames()
+		{
+			static const u32 value = []() -> u32 {
+				const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_PINHOLD", 0);
+				return (env <= 0) ? 0u : static_cast<u32>(std::min<s64>(env, 600));
+			}();
+
+			return value;
+		}
+
 		void record_kick_camera(u64 seq)
 		{
 			KickCameraSlot& slot = s_kick_ring[seq & (kick_ring_size - 1)];
@@ -309,16 +347,10 @@ namespace RemixVU1Capture
 			{
 				std::memcpy(slot.m, mem + offset, s_matrix_bytes);
 
-				// finite_window() alone is not enough: an all-zero block is perfectly finite, and
-				// VU1[pin] reads as zero for part of every Rainbow Six 3 frame -- the guest has not
-				// (or no longer has) a camera at that address when those kicks run. Accepting it
-				// produced a phantom "second camera" that was really an empty address, so a kick
-				// with nothing at the pin must record nothing and let the lookup walk back.
-				bool any_nonzero = false;
-				for (u32 i = 0; i < 16 && !any_nonzero; ++i)
-					any_nonzero = (slot.m[i] != 0.f);
-
-				valid = (any_nonzero && finite_window(slot.m)) ? 1u : 0u;
+				// A kick with nothing at the pin must record nothing and let the lookup walk back.
+				// Accepting an empty address here is what produced a phantom "second camera" that
+				// was really sixteen zeros.
+				valid = usable_matrix(slot.m) ? 1u : 0u;
 			}
 
 			slot.offset = offset;
@@ -577,6 +609,9 @@ namespace RemixVU1Capture
 			// is unreachable through LookupKickCamera.
 			for (u32 i = 0; i < kick_ring_size; ++i)
 				s_kick_ring[i].stamp.store(0, std::memory_order_relaxed);
+
+			s_pin_retained_valid = false;
+			s_pin_retained_generation = 0;
 			s_drop_before_seq.store(0, std::memory_order_relaxed);
 			s_published = Frame{};
 			s_frame = Frame{};
@@ -802,8 +837,24 @@ namespace RemixVU1Capture
 			// exactly when it is most needed. The structural bonus rides on top so that, among the
 			// several different things the address holds across a frame, the kick where it really
 			// does hold the camera outranks the kicks where it does not.
-			if (finite_window(m))
+			if (usable_matrix(m))
+			{
 				insert_candidate(m, ranked(2000.f, m), pinned, start_pc, ucode, 3);
+
+				std::memcpy(s_pin_retained, m, sizeof(s_pin_retained));
+				s_pin_retained_valid = true;
+				s_pin_retained_generation = generation;
+			}
+			else if (s_pin_retained_valid && (pin_hold_frames() > 0) &&
+					 (generation >= s_pin_retained_generation) &&
+					 ((generation - s_pin_retained_generation) <= pin_hold_frames()))
+			{
+				// 1999, not 2000: a fresh read of the address must always outrank a remembered
+				// one, but a remembered one still has to outrank every slice candidate or it is
+				// back to being evicted by the flood this whole path exists to survive.
+				insert_candidate(s_pin_retained, ranked(1999.f, s_pin_retained), pinned, start_pc,
+					ucode, 3);
+			}
 		}
 
 		trace("scanned", s_frame.windows_survived, s_frame.count);
