@@ -73,10 +73,13 @@ what the branch tip was at that moment**. Nothing here is a render of a build th
 *Tom Clancy's Rainbow Six 3 (SLUS-20883). Captured 2026-08-08 08:58; branch tip `b87dc8e8f`.
 Textures, vertex normals and path-traced lighting; the near-black sky is the game's own.*
 
-![Rainbow Six 3, interior, path traced](docs/Remix/README-assets/pcsx2-r6-3-interior.jpg)
+![Rainbow Six 3, a squad moving through a lodge interior, path traced](docs/Remix/README-assets/pcsx2-r6-3-squad.jpg)
 
-*Same title and same capture. Albedo textures resolving on world geometry, with contact shadowing
-from the path tracer.*
+*Same title, a separate capture: 2026-08-08 08:24, branch tip `37a25ae09` at that moment. Albedo on
+brick, plank and the framed oil painting; character models with their own textures; contact shadows
+and the light shaft are the path tracer, not baked. The status bar bottom right is the emulator's
+own -- `RTX Remix` names the active renderer, at 60 fps. The Remix developer menu was open during
+this capture and has been cropped out of the right edge.*
 
 ![SOCOM Combined Assault, textured](docs/Remix/README-assets/pcsx2-socom-textured.jpg)
 
