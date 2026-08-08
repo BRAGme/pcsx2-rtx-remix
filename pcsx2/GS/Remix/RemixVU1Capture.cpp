@@ -341,6 +341,67 @@ namespace RemixVU1Capture
 		// Keeps the frame's top max_candidates by shape score, de-duplicated by content.
 		// VU1 memory is double-buffered through VIF1.TOPS, so the same matrix routinely
 		// appears at two addresses in the same scan.
+		// A tie-break for candidates the microcode located, which all used to enter at a flat 1000.
+		//
+		// That flat score is worse than a lottery. insert_candidate evicts on
+		// `score <= worst -> return`, so once 32 slots hold 1000 every later 1000 is refused
+		// outright: the set freezes on the first 32 distinct matrices of the frame and nothing
+		// after them can ever get in -- not even the pinned re-read, which also scored 1000. On
+		// R6 3 save state 7 the microprogram emits ~20,000 distinct matrices and the real camera
+		// arrives late, so it was structurally unable to be considered.
+		//
+		// Both terms are pure bonuses on top of the existing score, so nothing is demoted relative
+		// to today and a title whose camera has neither property ranks exactly as it did.
+		//
+		// Measured over 24,204 dumped candidates on state 7 (the real camera is 2 of them):
+		//   unit forward axis alone   2,772 (11.45%)
+		//   z-column == w-column      35     (0.14%)
+		//   both                      2      (0.008%)  <- exactly the real camera, twice
+		float slice_rank_bonus(const float* m)
+		{
+			// Rows 0-2 of the w column are the view direction of a view-projection, so a real
+			// camera has them unit length. An arbitrary block of VU1 floats rarely does.
+			const float wx = m[3];
+			const float wy = m[7];
+			const float wz = m[11];
+			const float mag = std::sqrt((wx * wx) + (wy * wy) + (wz * wz));
+			const float unit = std::isfinite(mag) ?
+				std::max(0.f, 1.f - std::min(1.f, std::abs(mag - 1.f))) : 0.f;
+
+			// z column identical to the w column, i.e. z = w + const. R6 3 emits exactly this on
+			// both measured save states. A title without the pathology scores 0 here and its
+			// ranking is unchanged; this can only ever promote, never demote.
+			const bool z_is_w = (m[2] == m[3]) && (m[6] == m[7]) && (m[10] == m[11]);
+
+			return unit + (z_is_w ? 1.f : 0.f);
+		}
+
+		// Default OFF, on measurement. Three 30 s runs per arm on R6 3 state 7, world-anchored
+		// share of frames:
+		//
+		//   bonus on   37.9  41.0  45.3   (mean 41.4)
+		//   bonus off  35.3  48.4  68.3   (mean 50.7)
+		//
+		// The ranges overlap and three runs cannot settle it, but the bonus is certainly not the
+		// improvement it was written to be, and the arm without it is ahead on both mean and
+		// median. What actually recovered this state was giving the pinned re-read a score above
+		// the slice band (see the 2000 below) so the eviction rule stops refusing it -- that is in
+		// both arms, and both are far above the 0 / 0 / 24.9 the original flat 1000 produced.
+		//
+		// Kept as a knob rather than deleted because the discriminator itself is sound in
+		// isolation: over 24,204 dumped candidates it selects 2, and both are the real camera.
+		// Something about applying it as an insertion score is what does not carry through.
+		bool slice_rank_enabled()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_SLICERANK", 0) != 0;
+			return value;
+		}
+
+		float ranked(float base, const float* m)
+		{
+			return slice_rank_enabled() ? (base + slice_rank_bonus(m)) : base;
+		}
+
 		void insert_candidate(const float* m, float score, u32 offset, u32 start_pc, u64 ucode, u8 source = 0)
 		{
 			const u64 content = hash_bits(m, 16);
@@ -665,7 +726,7 @@ namespace RemixVU1Capture
 
 				if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && finite_window(m))
 				{
-					insert_candidate(m, 1000.f, offset, start_pc, ucode, 1);
+					insert_candidate(m, ranked(1000.f, m), offset, start_pc, ucode, 1);
 					++s_frame.sliced_published;
 				}
 
@@ -676,7 +737,7 @@ namespace RemixVU1Capture
 				if (matrix.rows[0].vi_base != 0 &&
 					read_sliced_matrix(mem, matrix, true, tops, m, offset) && finite_window(m))
 				{
-					insert_candidate(m, 999.f, offset, start_pc, ucode, 2);
+					insert_candidate(m, ranked(999.f, m), offset, start_pc, ucode, 2);
 					++s_frame.sliced_published;
 				}
 			}
@@ -735,8 +796,14 @@ namespace RemixVU1Capture
 			// fact all of them were the same sliced matrix), and cost it the non-scan ranking
 			// bonus that says an address a camera was actually recovered from outranks a shape
 			// score.
+			// 2000, not 1000. The pin is the one candidate we have positive evidence for -- a
+			// camera was actually recovered from this address -- and at 1000 it was being refused
+			// by the `score <= worst` rule the moment the set filled with other 1000s, which is
+			// exactly when it is most needed. The structural bonus rides on top so that, among the
+			// several different things the address holds across a frame, the kick where it really
+			// does hold the camera outranks the kicks where it does not.
 			if (finite_window(m))
-				insert_candidate(m, 1000.f, pinned, start_pc, ucode, 3);
+				insert_candidate(m, ranked(2000.f, m), pinned, start_pc, ucode, 3);
 		}
 
 		trace("scanned", s_frame.windows_survived, s_frame.count);
