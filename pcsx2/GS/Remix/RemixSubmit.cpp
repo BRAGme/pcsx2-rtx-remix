@@ -4838,14 +4838,39 @@ namespace RemixSubmit
 		// and the w range -- so duplicating a shortened field set for them would be strictly worse.
 		if (s_drawdump_frames_left > 0 || explode_ratio > 0.f)
 		{
+			// The camera this draw was actually built under, from the per-kick ring, identified by
+			// content hash. Diagnostic for now -- nothing is placed with it yet. If cm varies
+			// across the draws of one frame, the title renders with more than one view matrix and
+			// the single frame camera is provably wrong for some of them; if it is constant, the
+			// door welded to the screen has some other cause.
+			float kick_m[16];
+			u32 kick_offset = 0;
+			u64 kick_hash = 0;
+
+			if (RemixVU1Capture::LookupKickCamera(RemixVU1Capture::GSKickSeq(), kick_m, kick_offset))
+			{
+				kick_hash = 0xCBF29CE484222325ULL;
+				for (u32 i = 0; i < 16; ++i)
+				{
+					u32 bits = 0;
+					std::memcpy(&bits, &kick_m[i], sizeof(bits));
+					kick_hash = (kick_hash ^ bits) * 0x100000001B3ULL;
+				}
+			}
+			else
+			{
+				kick_offset = 0xFFFFFFFFu;
+			}
+
 			const std::string draw_state_line = fmt::format(
-				"f={} d={} k={} kf={} kt={} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
+				"f={} d={} k={} kf={} kt={} cm={:016X} co=0x{:08x} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
 				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
 				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
 				"w=[{:.1f},{:.1f}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
 				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
 				s_frame_counter, s_submitted_this_frame,
 				RemixVU1Capture::KickSeq(), s_latched_kick_seq, RemixVU1Capture::GSKickSeq(),
+				kick_hash, kick_offset,
 				vertex_count, s_scratch_indices.size() / 3,
 				fst_draw ? 1 : 0, world_mode ? 1 : 0,
 				ds.is_sky ? 1 : 0,

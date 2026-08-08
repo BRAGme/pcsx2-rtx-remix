@@ -248,6 +248,53 @@ namespace RemixVU1Capture
 			return std::isfinite(score);
 		}
 
+		// --- per-kick camera ring -----------------------------------------------------------
+		//
+		// Written by the VU thread on every kick, read by the GS thread up to two frames later.
+		// Per-slot seqlock: the stamp is cleared first, written last, and re-read by the reader
+		// after its copy, so a reader that raced a writer reports a miss instead of returning a
+		// torn matrix.
+		struct KickCameraSlot
+		{
+			std::atomic<u64> stamp; // kick_seq + 1 once complete; 0 while being written
+			float m[16];
+			u32 offset;
+			u32 valid; // 0 = no readable camera at the pinned offset for this kick
+		};
+
+		KickCameraSlot s_kick_ring[kick_ring_size]{};
+
+		// How far back a lookup will walk when the exact kick recorded nothing. One frame's worth:
+		// past that, "the camera at this kick" stops being a true statement.
+		constexpr u64 s_kick_lookback = 2048;
+
+		bool finite_window(const float* m);
+
+		void record_kick_camera(u64 seq)
+		{
+			KickCameraSlot& slot = s_kick_ring[seq & (kick_ring_size - 1)];
+
+			// Mark in-progress before touching the payload, and fence so the clear cannot be
+			// reordered after the writes it is meant to protect.
+			slot.stamp.store(0, std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_release);
+
+			const u32 offset = s_pinned_offset.load(std::memory_order_relaxed);
+			const u8* const mem = vuRegs[1].Mem;
+			u32 valid = 0;
+
+			if (mem && offset != s_no_pin && (offset + s_matrix_bytes) <= VU1_MEMSIZE)
+			{
+				std::memcpy(slot.m, mem + offset, s_matrix_bytes);
+				valid = finite_window(slot.m) ? 1u : 0u;
+			}
+
+			slot.offset = offset;
+			slot.valid = valid;
+
+			slot.stamp.store(seq + 1, std::memory_order_release);
+		}
+
 		bool finite_window(const float* m)
 		{
 			for (u32 i = 0; i < 16; ++i)
@@ -432,6 +479,11 @@ namespace RemixVU1Capture
 			s_seq.store(0, std::memory_order_relaxed);
 			g_kick_seq.store(0, std::memory_order_relaxed);
 			g_gs_kick_seq = 0;
+
+			// Clearing the stamps is enough to retire the ring: any payload behind a zero stamp
+			// is unreachable through LookupKickCamera.
+			for (u32 i = 0; i < kick_ring_size; ++i)
+				s_kick_ring[i].stamp.store(0, std::memory_order_relaxed);
 			s_drop_before_seq.store(0, std::memory_order_relaxed);
 			s_published = Frame{};
 			s_frame = Frame{};
@@ -474,11 +526,51 @@ namespace RemixVU1Capture
 		s_pinned_offset.store(offset, std::memory_order_relaxed);
 	}
 
+	bool LookupKickCamera(u64 seq, float (&m)[16], u32& offset)
+	{
+		for (u64 back = 0; (back <= s_kick_lookback) && (back <= seq); ++back)
+		{
+			const u64 want = seq - back;
+			const KickCameraSlot& slot = s_kick_ring[want & (kick_ring_size - 1)];
+
+			const u64 stamp = slot.stamp.load(std::memory_order_acquire);
+			if (stamp != (want + 1))
+				continue; // never written, or already recycled by a later kick
+
+			float copy[16];
+			std::memcpy(copy, slot.m, sizeof(copy));
+			const u32 copy_offset = slot.offset;
+			const u32 copy_valid = slot.valid;
+
+			// Re-read the stamp after the copy: if a writer took this slot mid-read the payload
+			// above is a mix of two kicks and must be discarded, not returned.
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (slot.stamp.load(std::memory_order_relaxed) != stamp)
+				continue;
+
+			if (copy_valid == 0)
+				continue; // this kick genuinely had no camera; keep walking back
+
+			std::memcpy(m, copy, sizeof(copy));
+			offset = copy_offset;
+			return true;
+		}
+
+		return false;
+	}
+
 	void OnXGKick()
 	{
 		// Before the reentrancy gate on purpose: this is the kick *sequence*, so a kick that is
 		// dropped below still has to advance it or the numbering stops describing the guest.
-		g_kick_seq.fetch_add(1, std::memory_order_relaxed);
+		const u64 seq = g_kick_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+
+		// Also ahead of the gate, and ahead of the scan budget further down. The budget caps the
+		// SEARCH for a camera; this is not a search -- it is a 64-byte read from an address the
+		// search already found. At ~1053 kicks/frame against a budget of 16, putting it behind the
+		// gate would record 1.5% of kicks and defeat the point of a per-kick ring. Two threads
+		// cannot collide here: distinct kicks take distinct sequence numbers, so distinct slots.
+		record_kick_camera(seq);
 
 		// VU1 is executed by the EE thread, or by the MTVU thread, or by both in the same
 		// session (vif1's _vuXGKICKTransfer runs on the EE side while vu1Thread executes the

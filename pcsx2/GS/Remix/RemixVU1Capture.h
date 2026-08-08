@@ -102,6 +102,23 @@ namespace RemixVU1Capture
 	inline void SetGSKickSeq(u64 seq) { g_gs_kick_seq = seq; }
 	inline u64 GSKickSeq() { return g_gs_kick_seq; }
 
+	// Per-kick camera ring. The transported sequence above names the kick a draw was built under;
+	// this is where the camera that was live at that kick is kept, so the draw can be placed with
+	// its own camera rather than the one frame-latched at VSync.
+	//
+	// Depth follows the measured lag: a draw arrives up to 2106 kicks after its packet was queued
+	// -- two frames at ~1053 kicks/frame on Rainbow Six 3 -- so a shorter ring would have the entry
+	// overwritten before the draw asks for it. 4096 is the next power of two, ~360 KB.
+	inline constexpr u32 kick_ring_size = 4096;
+
+	// GS thread. Fills `m` with the camera live at `seq`, or at the most recent earlier kick that
+	// had one, and reports the VU1 offset it was read from.
+	//
+	// False means the ring holds nothing usable for that kick. The caller must fall back to the
+	// frame camera on false -- never guess, because a wrong camera places geometry in view space,
+	// which is the defect this whole mechanism exists to remove.
+	bool LookupKickCamera(u64 seq, float (&m)[16], u32& offset);
+
 	void SetArmed(bool enabled);
 
 	// GS thread. Records the VU1 data-memory offset a camera was last accepted from, so the
