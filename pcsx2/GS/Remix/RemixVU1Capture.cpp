@@ -286,7 +286,17 @@ namespace RemixVU1Capture
 			if (mem && offset != s_no_pin && (offset + s_matrix_bytes) <= VU1_MEMSIZE)
 			{
 				std::memcpy(slot.m, mem + offset, s_matrix_bytes);
-				valid = finite_window(slot.m) ? 1u : 0u;
+
+				// finite_window() alone is not enough: an all-zero block is perfectly finite, and
+				// VU1[pin] reads as zero for part of every Rainbow Six 3 frame -- the guest has not
+				// (or no longer has) a camera at that address when those kicks run. Accepting it
+				// produced a phantom "second camera" that was really an empty address, so a kick
+				// with nothing at the pin must record nothing and let the lookup walk back.
+				bool any_nonzero = false;
+				for (u32 i = 0; i < 16 && !any_nonzero; ++i)
+					any_nonzero = (slot.m[i] != 0.f);
+
+				valid = (any_nonzero && finite_window(slot.m)) ? 1u : 0u;
 			}
 
 			slot.offset = offset;

@@ -630,6 +630,12 @@ namespace RemixSubmit
 		// kicks -- and therefore whether a live read can attribute a draw to its own kick at all.
 		u64 s_latched_kick_seq = 0;
 
+		// Distinct per-kick cameras already written to the draw dump. Small fixed set: a title
+		// rendering with more than a handful of view matrices per frame would be a finding in
+		// itself, and the count on the stats line stays exact regardless of this cap.
+		u64 s_logged_kick_cams[8] = {};
+		u32 s_logged_kick_cam_count = 0;
+
 		// The largest eye-space depth submitted this frame, and the hashes of world matrices
 		// refuted by the extent check below.
 		//
@@ -4862,6 +4868,34 @@ namespace RemixSubmit
 				kick_offset = 0xFFFFFFFFu;
 			}
 
+			// One line per distinct camera the ring reports, the first time it is seen, as the 16
+			// floats sit in VU1 memory. Uninterpreted on purpose: row- versus column-major is the
+			// GS side's guess, and the point of this dump is to read the structure off the raw
+			// values rather than through that guess. A backdrop/sky transform carries no
+			// translation; a shadow transform is anchored at the light rather than the eye.
+			if (kick_hash != 0 &&
+				s_logged_kick_cam_count < (sizeof(s_logged_kick_cams) / sizeof(s_logged_kick_cams[0])))
+			{
+				bool seen = false;
+				for (u32 i = 0; i < s_logged_kick_cam_count; ++i)
+					seen = seen || (s_logged_kick_cams[i] == kick_hash);
+
+				if (!seen)
+				{
+					s_logged_kick_cams[s_logged_kick_cam_count++] = kick_hash;
+
+					drawdump_write(fmt::format(
+						"CAMERA {:016X} off=0x{:04x} f={} d={} | "
+						"[{: .6g} {: .6g} {: .6g} {: .6g}] [{: .6g} {: .6g} {: .6g} {: .6g}] "
+						"[{: .6g} {: .6g} {: .6g} {: .6g}] [{: .6g} {: .6g} {: .6g} {: .6g}]",
+						kick_hash, kick_offset, s_frame_counter, s_submitted_this_frame,
+						kick_m[0], kick_m[1], kick_m[2], kick_m[3],
+						kick_m[4], kick_m[5], kick_m[6], kick_m[7],
+						kick_m[8], kick_m[9], kick_m[10], kick_m[11],
+						kick_m[12], kick_m[13], kick_m[14], kick_m[15]));
+				}
+			}
+
 			const std::string draw_state_line = fmt::format(
 				"f={} d={} k={} kf={} kt={} cm={:016X} co=0x{:08x} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
 				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
@@ -5268,6 +5302,7 @@ namespace RemixSubmit
 		s_sun_placed = false;
 		s_drawdump_started = false;
 		s_drawdump_frames_left = 0;
+		s_logged_kick_cam_count = 0;
 		s_stable_frames = 0;
 		s_last_startup_rect = RECT{};
 
