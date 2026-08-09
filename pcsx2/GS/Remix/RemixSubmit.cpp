@@ -198,6 +198,8 @@ namespace RemixSubmit
 			// A rejected camera leaves the runtime on its previous one, which is what a scene that
 			// teleports between two viewpoints looks like. Count the failures separately.
 			u64 cam_failed = 0;
+			// Draws rejected for rendering into a small off-screen target (PCSX2_REMIX_MINRT).
+			u64 skip_offscreen_rt = 0;
 			// World-anchor (step 9) accounting. Every one of these has to be readable in a
 			// null result: "no candidate" and "candidates that never split" and "splits that
 			// scored zero" are three completely different findings.
@@ -2979,6 +2981,40 @@ namespace RemixSubmit
 		// of them the stats-line counter is the number that matters.
 		u32 s_explode_dumped = 0;
 
+		// PCSX2_REMIX_FARDUMP=N dumps draws that put a vertex further than N world units from the
+		// origin. 0 disables it.
+		//
+		// The 'explode' check asks whether a draw is large *relative to its own eye depth*, so it
+		// answers "is this draw stretched" and reads 0 on SOCOM Winterblade while the screen is
+		// visibly in pieces. A draw can be perfectly compact and still be placed 100k units from
+		// where it belongs, and nothing measured that. This is the missing half: absolute placement,
+		// not relative shape.
+		//
+		// Latched: this is read once per draw on a hot path, and a getenv per draw would distort
+		// the very timing the dump is meant to describe.
+		float far_dump_limit()
+		{
+			static const float value =
+				static_cast<float>(remix_ps2::read_env_int(L"PCSX2_REMIX_FARDUMP", 0));
+			return value;
+		}
+
+		u32 s_fardump_written = 0;
+
+		// Largest render-target side seen this session. The main framebuffer is by definition the
+		// biggest thing the title draws into, so this converges on it within the first frame and
+		// gives the off-screen gate below something title-independent to compare against.
+		int s_largest_rt_side = 0;
+
+		// Percentage of the largest render target's side below which a target is treated as
+		// off-screen. 0 disables the gate. Latched -- it is read once per draw.
+		int offscreen_rt_min_percent()
+		{
+			static const int value =
+				static_cast<int>(remix_ps2::read_env_int(L"PCSX2_REMIX_MINRT", 0));
+			return value;
+		}
+
 		void drawdump_write(const std::string& line)
 		{
 			static constexpr u32 max_lines = 40000;
@@ -3531,7 +3567,7 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} | "
+					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} offscreenrt {} | "
 					 "warn stq {} | cam world {} fallback {} skycam {} vmcam {} REFUSED {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
@@ -3543,7 +3579,7 @@ namespace RemixSubmit
 				s_stats.skip_const_q, s_stats.skip_w_flat, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
-				s_stats.skip_minw, s_stats.skip_min_vertex_w,
+				s_stats.skip_minw, s_stats.skip_min_vertex_w, s_stats.skip_offscreen_rt,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_sky, s_stats.cam_viewmodel,
 				s_stats.cam_failed,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
@@ -4074,6 +4110,36 @@ namespace RemixSubmit
 			return;
 		}
 
+		// Draws that render into a small OFF-SCREEN target are not world geometry.
+		//
+		// MEASURED on SOCOM Winterblade (slot 1): the frame's main target is 640x448 and carries
+		// 1,859 of 1,867 dumped draws. The other 8 go to a 128x128 target, and every single one of
+		// the 200 draws caught by PCSX2_REMIX_FARDUMP=25000 was one of them -- unanimous on six
+		// independent fields: rt=128x128, sky=1, fbmsk=0x00ffffff (alpha only), the untextured
+		// material, ZTST=1 (depth test always), tex psm=0x00.
+		//
+		// They are a render-to-texture pass: the game is baking an alpha mask into a small texture
+		// it will sample later. Un-projecting them with the *main* camera is meaningless, and the
+		// result is spectacular -- a draw covering 62x75 pixels comes out with a world extent of
+		// 115,012 units and a w range spanning 0.0156 to 72,812 within one draw. Two or three of
+		// those per frame put gigantic geometry through the path tracer.
+		//
+		// The rule is deliberately "much smaller than the largest target seen", not a fixed size:
+		// PS2 titles pick their own framebuffer dimensions, so any constant would be wrong
+		// somewhere. Threshold in PCSX2_REMIX_MINRT as a percentage of the largest target's
+		// smaller side; 0 disables the gate entirely.
+		s_largest_rt_side = std::max({s_largest_rt_side, rt_unscaled_width, rt_unscaled_height});
+
+		if (const int min_rt_pct = offscreen_rt_min_percent(); min_rt_pct > 0 && s_largest_rt_side > 0)
+		{
+			const int side = std::min(rt_unscaled_width, rt_unscaled_height);
+			if ((side * 100) < (s_largest_rt_side * min_rt_pct))
+			{
+				++s_stats.skip_offscreen_rt;
+				return;
+			}
+		}
+
 		const u32 vertex_count = r.m_vertex->next;
 		const u32 index_count = r.m_index->tail;
 
@@ -4168,6 +4234,11 @@ namespace RemixSubmit
 		scene_bounds draw_bounds{};
 		float min_w = std::numeric_limits<float>::max();
 		float max_w = -std::numeric_limits<float>::max();
+		// Largest |component| this draw put into out.position. The session-wide s_max_seen_position
+		// on the stats line is a running max over every vertex ever submitted, so it names a number
+		// and nothing else -- it cannot say whether one draw went far away or the whole world did.
+		// This is the per-draw version, and it is what the FARDUMP trigger below reads.
+		float draw_max_pos = 0.f;
 		u32 min_z = 0xFFFFFFFFu;
 		u32 max_z = 0;
 		// Screen-space extent in pixels, (XY - XYOFFSET)/16 per GSState::GetXYWindow
@@ -4279,8 +4350,10 @@ namespace RemixSubmit
 				return;
 			}
 
-			s_max_seen_position = std::max({s_max_seen_position, std::abs(out.position[0]),
+			const float vert_max_pos = std::max({std::abs(out.position[0]),
 				std::abs(out.position[1]), std::abs(out.position[2])});
+			s_max_seen_position = std::max(s_max_seen_position, vert_max_pos);
+			draw_max_pos = std::max(draw_max_pos, vert_max_pos);
 
 			draw_bounds.add(out.position);
 			min_w = std::min(min_w, w);
@@ -5036,7 +5109,10 @@ namespace RemixSubmit
 		// hyperextension offenders: bucketing an explosion by class needs the same fields the sky
 		// rule was derived from -- FST, world or view space, whether the texture is a render target,
 		// and the w range -- so duplicating a shortened field set for them would be strictly worse.
-		if (s_drawdump_frames_left > 0 || explode_ratio > 0.f)
+		const float far_limit = far_dump_limit();
+		const bool far_hit = (far_limit > 0.f) && (draw_max_pos > far_limit);
+
+		if (s_drawdump_frames_left > 0 || explode_ratio > 0.f || far_hit)
 		{
 			// The camera this draw was actually built under, from the per-kick ring, identified by
 			// content hash. Diagnostic for now -- nothing is placed with it yet. If cm varies
@@ -5136,6 +5212,19 @@ namespace RemixSubmit
 				++s_explode_dumped;
 				drawdump_write(fmt::format("EXPLODE ratio={:.1f}x limit={:g}x extent={:.2f} | {}",
 					explode_ratio, explode_ratio_limit(), draw_bounds.diagonal(), draw_state_line));
+			}
+
+			// Absolute-placement offenders. Same cap and the same reasoning as EXPLODE above: the
+			// point is to name the class the far draws belong to, not to log every one. The extent
+			// is printed alongside the distance on purpose -- a compact draw sitting 100k units out
+			// is a placement bug, a draw whose own extent is 100k is a stretched one, and the two
+			// want completely different fixes.
+			if (far_hit && s_fardump_written < 200)
+			{
+				++s_fardump_written;
+				drawdump_write(fmt::format("FARDRAW maxpos={:.0f} limit={:g} extent={:.2f} "
+										   "w=[{:.2f}..{:.2f}] | {}",
+					draw_max_pos, far_limit, draw_bounds.diagonal(), min_w, max_w, draw_state_line));
 			}
 		}
 
