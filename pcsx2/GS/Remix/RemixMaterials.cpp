@@ -181,6 +181,19 @@ namespace remix_ps2::materials
 			return value;
 		}
 
+		// Whether to give render-to-texture sources a material by snapshotting them.
+		//
+		// Off by default: it costs a GPU->CPU download per distinct render target and it takes a
+		// ONE-OFF snapshot, so anything animated freezes at whatever the first frame held. Worth it
+		// on SOCOM, where the sky IS a render target and rejecting it left the scene with no sky
+		// and nothing to light it from.
+		u32 rt_texture_interval()
+		{
+			static const u32 value =
+				static_cast<u32>(std::max<s64>(0, read_env_int(L"PCSX2_REMIX_RTTEX", 0)));
+			return value;
+		}
+
 		// One line per unique content hash, to the emulator log and to logs\remix_textures.txt.
 		// This is the modder-facing artefact: the hash printed here is exactly the value that
 		// goes into rtx.conf (rtx.skyBoxTextures, rtx.ignoreTextures, ...) and that the runtime
@@ -247,6 +260,7 @@ namespace remix_ps2::materials
 			// which is the standing rule this project has broken three times.
 			u64 replacement_probe = 0;
 			u64 skip_target = 0; // render-target source: no stable content identity
+			u64 rt_snapshots = 0; // GPU->local-memory downloads taken for a render-target source
 			u64 skip_unsupported = 0; // no rtx entry point, or absurd dimensions
 			u64 skip_failed = 0; // quarantined after a decode / runtime failure
 			u64 failures = 0;
@@ -1599,7 +1613,18 @@ namespace remix_ps2::materials
 
 		// A render-to-texture has no stable content identity by construction, so there is
 		// nothing a modder could key a replacement on. Counted, not silently dropped.
-		if (source->m_target || source->m_from_target)
+		//
+		// That is right for REPLACEMENT and wrong as a blanket rule, and it cost SOCOM its sky.
+		// Winterblade draws the sky as draws 12-13: a 620x264 blended quad sampling a 128x128
+		// target with UVs at [-0.417,3.229] -- tiled scrolling clouds. Rejecting it here gave the
+		// quad no material at all, so the sky rendered as an untextured null surface and Remix had
+		// no environment to light the scene from. 79,084 draws a session hit this path.
+		//
+		// PCSX2_REMIX_RTTEX = frames between refreshes, 0 = off (the old behaviour).
+		const bool is_render_target = (source->m_target || source->m_from_target);
+		const u32 rt_interval = rt_texture_interval();
+
+		if (is_render_target && (rt_interval == 0 || !source->m_texture || !g_texture_cache))
 		{
 			++s_stats.skip_target;
 			return out;
@@ -1627,6 +1652,21 @@ namespace remix_ps2::materials
 			const u64* words = reinterpret_cast<const u64*>(&key);
 			for (u32 i = 0; i < (sizeof(GSTextureCache::HashCacheKey) / sizeof(u64)); ++i)
 				content_hash = fnv_mix(content_hash, words[i]);
+		}
+
+		// A render target's pixels change every frame -- scrolling clouds, by definition -- so a
+		// CONTENT hash would mint a fresh texture and material every single frame. That is exactly
+		// the per-frame churn that correlates monotonically with the device-lost hang, so it must
+		// not be reintroduced here. Key on the target's IDENTITY instead (where it lives, how big
+		// it is) and refresh the pixels of that one entry on an interval.
+		if (is_render_target)
+		{
+			content_hash = fnv_mix(fnv_seed, 0x52545845'52545845ull); // "RTXERTXE" domain separator
+			content_hash = fnv_mix(content_hash, TEX0.TBP0);
+			content_hash = fnv_mix(content_hash, TEX0.TBW);
+			content_hash = fnv_mix(content_hash, TEX0.PSM);
+			content_hash = fnv_mix(content_hash, TEX0.TW);
+			content_hash = fnv_mix(content_hash, TEX0.TH);
 		}
 
 		if (content_hash == 0)
@@ -1662,6 +1702,40 @@ namespace remix_ps2::materials
 			it->second.created_frame = frame;
 			material_entry& entry = it->second;
 			entry.last_used_frame = frame;
+
+			// Pull the render target's pixels down into GS local memory so the ordinary decode()
+			// inside create() can see them. Under the hardware renderer the content lives in a GPU
+			// texture and local memory is stale -- that is the real reason this path was closed.
+			// GSTextureCache::Read(Source*, r) downloads and WritePixel32s it back at the source's
+			// own TBP0, so nothing downstream needs to know a readback happened.
+			//
+			// ONLY on the miss. A GPU download is expensive and there are ~190 render-target draws
+			// a frame on SOCOM; doing it per bind would pay for all of them every frame.
+			//
+			// Consequence, and it is deliberate: the sky is a ONE-OFF SNAPSHOT, so the clouds do
+			// not scroll. Refreshing would mean rebuilding the material, and rebuild_material swaps
+			// the material handle WITHOUT bumping generation() -- with stable mesh identity on, the
+			// mesh keeps the old handle, reap() destroys it, and the surface goes white on a timer
+			// (see the long comment on material_late_rebuild below, which is defaulted off for
+			// exactly this reason). A static sky that lights the scene beats an animated one that
+			// disappears.
+			if (is_render_target)
+			{
+				const int rt_w = 1 << TEX0.TW;
+				const int rt_h = 1 << TEX0.TH;
+
+				if (rt_w > 0 && rt_h > 0 && rt_w <= 2048 && rt_h <= 2048)
+				{
+					// Read() takes a non-const Source* because it is the general readback entry
+					// point, but it only reads m_texture and m_TEX0 off the source -- what it
+					// mutates is GS local memory, not the Source. bind() takes its source const by
+					// this backend's convention, so cast rather than widen the signature through
+					// every caller.
+					g_texture_cache->Read(
+						const_cast<GSTextureCache::Source*>(source), GSVector4i(0, 0, rt_w, rt_h));
+					++s_stats.rt_snapshots;
+				}
+			}
 
 			if (!create(rt, content_hash, *source, key, entry))
 			{
@@ -1902,13 +1976,13 @@ namespace remix_ps2::materials
 
 		return fmt::format(
 			"Remix: mat live {} | bind {} hit {} miss {} created {} destroyed {} deferred {} | "
-			"skip: nosrc {} target {} unsup {} failed {} | fail {} | "
+			"skip: nosrc {} target {} unsup {} failed {} | fail {} | rt snapshots {} | "
 			"unique content {} tex0 {} (clut variants {}) | replacement dds {} skipped-nondds {} probe {} "
 			"packmap {} | tags {} hits {} | "
 			"hash {:.0f} ms ({:.2f} us/bind) decode {:.0f} ms",
 			s_entries.size(), s_stats.binds, s_stats.hits, s_stats.misses, s_stats.created,
 			s_stats.destroyed, s_stats.deferred, s_stats.skip_no_source, s_stats.skip_target,
-			s_stats.skip_unsupported, s_stats.skip_failed, s_stats.failures,
+			s_stats.skip_unsupported, s_stats.skip_failed, s_stats.failures, s_stats.rt_snapshots,
 			s_stats.unique_content, s_stats.unique_tex0,
 			(s_stats.unique_content > s_stats.unique_tex0) ? (s_stats.unique_content - s_stats.unique_tex0) : 0,
 			s_stats.replacement_albedo, s_stats.replacement_not_dds, s_stats.replacement_probe,
