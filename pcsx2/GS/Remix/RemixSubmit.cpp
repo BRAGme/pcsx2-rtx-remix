@@ -2767,8 +2767,22 @@ namespace RemixSubmit
 
 		int alpha_state_mode()
 		{
-			static const int value =
-				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_ALPHASTATE", 2), 0, 2));
+			// Logged on first use because this knob is invisible in every counter: mode 2 is the
+			// only thing that chains remixapi_InstanceInfoBlendEXT onto the instance at all
+			// (instance.pNext below), so at 0 every blended draw reaches Remix as opaque and the
+			// untextured material's 4x4 WHITE albedo composites as a solid white shard. There is no
+			// stat that moves when this is wrong -- only the picture -- which is exactly the kind of
+			// silent setting that has cost this project whole sessions. Say what it resolved to.
+			static const int value = []() {
+				const int v =
+					static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_ALPHASTATE", 2), 0, 2));
+				INFO_LOG("Remix: ALPHASTATE = {} -- {}", v,
+					(v == 2) ? "InstanceInfoBlendEXT attached per draw (blend, alpha test, "
+							   "vertex-colour baked-lighting flag all live)" :
+							   "NO blend state sent; blended draws composite opaque and "
+							   "untextured ones render as white shards");
+				return v;
+			}();
 			return value;
 		}
 
