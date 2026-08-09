@@ -2941,7 +2941,7 @@ namespace RemixSubmit
 		//                       Narrows mode 1; REQUIRED by mode 2.
 		int sky_mode()
 		{
-			static live_int value(L"PCSX2_REMIX_SKY", 1, 0, 3);
+			static live_int value(L"PCSX2_REMIX_SKY", 1, 0, 4);
 			return value.get();
 		}
 
@@ -2989,6 +2989,23 @@ namespace RemixSubmit
 			// from behind" already described at the sky_solver comment.
 			if (mode == 3)
 				return !depth_write && samples_target && ((limit == 0) || (draw_ordinal < limit));
+
+			// Mode 4: the whole backdrop BAND -- no depth WRITE, within the first SKYORDER draws,
+			// with no requirement on the texture. Mode 1 is this minus depth READ, which SOCOM's
+			// backdrop uses, and mode 3 additionally demands a render-target texture, which catches
+			// the cloud quad but not the sun sprite beside it (a plain 8x8 texture).
+			//
+			// Needed because a by-hash tag CANNOT do this job. rtx.skyBoxTextures sets the Remix
+			// instance CATEGORY, but the thing that actually anchors a backdrop is the sky_solver's
+            // zeroed bias, chosen at RemixSubmit.cpp:4274 -- and materials::bind() does not run until
+			// :4656, so no material hash exists yet at the point the solver is picked. Geometry has
+			// to be classified by geometry.
+			//
+			// SKYORDER is the whole safety margin here: it is the only thing stopping this from
+			// tagging every depth-write-off draw in the frame, so tune it down until the horizon
+			// stops moving and nothing in the world joins it.
+			if (mode == 4)
+				return !depth_write && ((limit == 0) || (draw_ordinal < limit));
 
 			if (mode == 2)
 			{
