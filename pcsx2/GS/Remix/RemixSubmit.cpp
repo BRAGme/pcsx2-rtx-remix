@@ -188,6 +188,16 @@ namespace RemixSubmit
 			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
 			u64 cam_fallback = 0;
+			// SetupCamera calls that came back non-SUCCESS (or faulted through the SEH guard).
+			//
+			// cam_world/cam_fallback/cam_sky/cam_viewmodel count *attempts*: they are incremented
+			// unconditionally next to a guarded_setup_camera() whose return value used to be
+			// discarded. So "cam world 366 / fallback 0" said only that we called SetupCamera 366
+			// times, never that Remix accepted one -- and Remix's own developer menu was reporting
+			// an empty MAIN camera on roughly two frames in three while that counter looked clean.
+			// A rejected camera leaves the runtime on its previous one, which is what a scene that
+			// teleports between two viewpoints looks like. Count the failures separately.
+			u64 cam_failed = 0;
 			// World-anchor (step 9) accounting. Every one of these has to be readable in a
 			// null result: "no candidate" and "candidates that never split" and "splits that
 			// scored zero" are three completely different findings.
@@ -1582,6 +1592,36 @@ namespace RemixSubmit
 		// The parameterized-camera fallback: a fixed camera at the origin looking down +Z, in
 		// Remix's left-handed +Y-up convention. Every position the view-space tier submits is
 		// expressed in exactly this camera's space, so the two agree by construction.
+		// Submit a camera and actually look at what the runtime said.
+		//
+		// Every call site used to discard this return code, so a camera Remix refused was
+		// indistinguishable from one it accepted. Remix keeps the *previous* camera of that type
+		// when a call fails, so the frame renders from wherever the eye last was -- the scene
+		// appears to snap back and forth between two viewpoints. Name the first failure of each
+		// camera type once; the counter carries the rate.
+		void setup_camera_checked(const remixapi_CameraInfo* info, const char* what, bool& logged)
+		{
+			const u32 code = remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, info);
+			if (code == REMIXAPI_ERROR_CODE_SUCCESS)
+				return;
+
+			++s_stats.cam_failed;
+
+			if (!logged)
+			{
+				logged = true;
+				ERROR_LOG("Remix: SetupCamera({}) refused with {} -- the runtime keeps its previous "
+						  "camera of this type, so the scene renders from a stale eye. This is what "
+						  "geometry 'teleporting' between two viewpoints looks like.",
+					what, remix_ps2::error_name(code));
+			}
+		}
+
+		bool s_logged_camera_fail_world = false;
+		bool s_logged_camera_fail_fallback = false;
+		bool s_logged_camera_fail_sky = false;
+		bool s_logged_camera_fail_viewmodel = false;
+
 		void submit_fallback_camera()
 		{
 			const remixapi_Interface& api = s_remix.api();
@@ -1602,7 +1642,7 @@ namespace RemixSubmit
 			camera_info.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
 			camera_info.pNext = &camera_ext;
 
-			remix_ps2::guarded_setup_camera(api.SetupCamera, &camera_info);
+			setup_camera_checked(&camera_info, "fallback", s_logged_camera_fail_fallback);
 		}
 
 		// --- the world-anchored camera ----------------------------------------------------
@@ -1773,7 +1813,7 @@ namespace RemixSubmit
 			remix_ps2::to_camera_matrix(s_active_camera.view, camera_info.view);
 			remix_ps2::to_camera_matrix(s_active_camera.projection, camera_info.projection);
 
-			remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &camera_info);
+			setup_camera_checked(&camera_info, "world", s_logged_camera_fail_world);
 			++s_stats.cam_world;
 
 			if (sky_camera_enabled())
@@ -1788,7 +1828,7 @@ namespace RemixSubmit
 				sky_info.view[3][1] = 0.f;
 				sky_info.view[3][2] = 0.f;
 
-				remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &sky_info);
+				setup_camera_checked(&sky_info, "sky", s_logged_camera_fail_sky);
 				++s_stats.cam_sky;
 
 				if (!s_logged_sky_camera)
@@ -1810,7 +1850,7 @@ namespace RemixSubmit
 				remixapi_CameraInfo vm_info = camera_info;
 				vm_info.type = REMIXAPI_CAMERA_TYPE_VIEW_MODEL;
 
-				remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, &vm_info);
+				setup_camera_checked(&vm_info, "viewmodel", s_logged_camera_fail_viewmodel);
 				++s_stats.cam_viewmodel;
 
 				if (!s_logged_view_model_camera)
@@ -3492,7 +3532,7 @@ namespace RemixSubmit
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} | "
-					 "warn stq {} | cam world {} fallback {} skycam {} vmcam {} | "
+					 "warn stq {} | cam world {} fallback {} skycam {} vmcam {} REFUSED {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
 					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
@@ -3505,6 +3545,7 @@ namespace RemixSubmit
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
 				s_stats.skip_minw, s_stats.skip_min_vertex_w,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_sky, s_stats.cam_viewmodel,
+				s_stats.cam_failed,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
 				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
 				s_stats.skip_all_degenerate, s_stats.meshes_created_peak,
