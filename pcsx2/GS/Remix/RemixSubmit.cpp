@@ -2941,7 +2941,7 @@ namespace RemixSubmit
 		//                       Narrows mode 1; REQUIRED by mode 2.
 		int sky_mode()
 		{
-			static live_int value(L"PCSX2_REMIX_SKY", 1, 0, 2);
+			static live_int value(L"PCSX2_REMIX_SKY", 1, 0, 3);
 			return value.get();
 		}
 
@@ -2951,17 +2951,44 @@ namespace RemixSubmit
 			return static_cast<u32>(value.get());
 		}
 
+		// Whether a draw's texture source is a render target. Same test RemixMaterials uses, kept
+		// here rather than duplicated inline so the two cannot drift into disagreeing.
+		bool draw_samples_render_target(const void* tex_source)
+		{
+			const GSTextureCache::Source* const src =
+				static_cast<const GSTextureCache::Source*>(tex_source);
+			return src != nullptr && (src->m_target || src->m_from_target);
+		}
+
 		// 'depth_read'/'depth_write' come from GSRendererHW's own DepthRead()/DepthWrite()
 		// (GSRendererHW.h:62-79), evaluated by the caller because only OnDrawPrims is a friend
 		// of GSRendererHW. Reading the registers here instead would be a second, drifting
 		// interpretation of the same state.
-		bool classify_sky(bool depth_read, bool depth_write, u64 draw_ordinal)
+		bool classify_sky(bool depth_read, bool depth_write, u64 draw_ordinal, bool samples_target)
 		{
 			const int mode = sky_mode();
 			if (mode == 0)
 				return false;
 
 			const u32 limit = sky_order_limit();
+
+			// Mode 3: no depth WRITE and the draw samples a render target. Depth READ is allowed,
+			// which is the whole point -- mode 1 demands neither read nor write, and SOCOM's sky is
+			// depth(r=1 w=0), so mode 1 can never match it and never has.
+			//
+			// MEASURED on Winterblade: the sky is draws 12-13 of the frame -- a 620x264 blended
+			// quad, ZTST=2 ZMSK=1, ABE=1, sampling a 128x128 target=1 texture with UVs at
+			// [-0.417,3.229], i.e. tiled scrolling clouds. Nothing else on the main framebuffer
+			// combines "samples a render target" with "writes no depth" once PCSX2_REMIX_MINRT has
+			// gated the off-screen pass that produces that target.
+			//
+			// Why it matters beyond tagging: the un-projection above adds the eye translation to
+			// every vertex, which is right for world geometry and wrong for a backdrop the guest
+			// drew with a translation-free matrix. The bias-zeroing that corrects it is gated on
+			// this function, so an unclassified sky rides the camera -- the "sun/moon follows me
+			// from behind" already described at the sky_solver comment.
+			if (mode == 3)
+				return !depth_write && samples_target && ((limit == 0) || (draw_ordinal < limit));
 
 			if (mode == 2)
 			{
@@ -3242,6 +3269,9 @@ namespace RemixSubmit
 			u32 aref = 0;
 			u32 abe = 0;
 			u32 tfx = 0;
+			// Whether this draw's texture is a render target. Sky mode 3 keys on it; see
+			// classify_sky.
+			bool samples_target = false;
 			GIFRegALPHA alpha{};
 		};
 
@@ -3262,7 +3292,7 @@ namespace RemixSubmit
 		{
 			const bool depth_read = regs.depth_read;
 			const bool depth_write = regs.depth_write;
-			const bool is_sky = classify_sky(depth_read, depth_write, draw_ordinal);
+			const bool is_sky = classify_sky(depth_read, depth_write, draw_ordinal, regs.samples_target);
 
 			// The user's own tags, from the Remix conf layers. dxvk-remix only applies its hash
 			// lists on the native D3D9 path (setupCategoriesForTexture, rtx_types.cpp:348, whose one
@@ -4238,7 +4268,8 @@ namespace RemixSubmit
 		// depth bits and s_submitted_this_frame, neither of which moves between here and there,
 		// so the two agree by construction.
 		const bool sky_draw = sky_camera_enabled() &&
-			classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(), s_submitted_this_frame);
+			classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(), s_submitted_this_frame,
+				draw_samples_render_target(tex_source));
 
 		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : s_active_camera.solver;
 
@@ -4827,6 +4858,7 @@ namespace RemixSubmit
 		regs.aref = r.m_cached_ctx.TEST.AREF;
 		regs.abe = r.PRIM->ABE;
 		regs.tfx = r.m_cached_ctx.TEX0.TFX;
+		regs.samples_target = draw_samples_render_target(tex_source);
 		regs.alpha = r.m_context->ALPHA;
 
 		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame, untex_draw);
