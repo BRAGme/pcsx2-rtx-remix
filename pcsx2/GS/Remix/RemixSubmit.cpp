@@ -3001,14 +3001,12 @@ namespace RemixSubmit
 
 		u32 s_fardump_written = 0;
 
-		// Largest render-target side seen this session. The main framebuffer is by definition the
-		// biggest thing the title draws into, so this converges on it within the first frame and
-		// gives the off-screen gate below something title-independent to compare against.
-		int s_largest_rt_side = 0;
-
-		// Percentage of the largest render target's side below which a target is treated as
-		// off-screen. 0 disables the gate. Latched -- it is read once per draw.
-		int offscreen_rt_min_percent()
+		// Minimum render-target AREA in pixels for a target to count as on-screen; anything below it
+		// is an off-screen scratch target. 0 disables the gate. Latched -- read once per draw.
+		//
+		// Absolute, NOT relative to the largest target seen: see the gate itself for why the
+		// relative version culled the whole world.
+		int offscreen_rt_min_area()
 		{
 			static const int value =
 				static_cast<int>(remix_ps2::read_env_int(L"PCSX2_REMIX_MINRT", 0));
@@ -4124,16 +4122,22 @@ namespace RemixSubmit
 		// 115,012 units and a w range spanning 0.0156 to 72,812 within one draw. Two or three of
 		// those per frame put gigantic geometry through the path tracer.
 		//
-		// The rule is deliberately "much smaller than the largest target seen", not a fixed size:
-		// PS2 titles pick their own framebuffer dimensions, so any constant would be wrong
-		// somewhere. Threshold in PCSX2_REMIX_MINRT as a percentage of the largest target's
-		// smaller side; 0 disables the gate entirely.
-		s_largest_rt_side = std::max({s_largest_rt_side, rt_unscaled_width, rt_unscaled_height});
-
-		if (const int min_rt_pct = offscreen_rt_min_percent(); min_rt_pct > 0 && s_largest_rt_side > 0)
+		// The threshold is an ABSOLUTE pixel AREA, and the first version of this gate got that
+		// wrong in a way worth recording.
+		//
+		// It originally compared each target's smaller side against a percentage of the largest
+		// side seen so far. That is fragile by construction: the reference only ever grows, so a
+		// single larger target anywhere in the session moves it permanently. At MINRT=50 a 1024-wide
+		// target makes the cutoff 512, which is above the main framebuffer's 448 height -- so the
+		// ENTIRE 640x448 world gets culled from that point on, and the level appears to lose its
+		// geometry. Reported as "geometry exploding/disappearing again".
+		//
+		// An absolute area has none of that ordering dependence: 128x128 = 16,384 is rejected at any
+		// threshold that keeps 640x448 = 286,720, and a title with an unusual framebuffer (512x224 =
+		// 114,688) still clears a 65,536 setting comfortably. 0 disables the gate.
+		if (const int min_rt_area = offscreen_rt_min_area(); min_rt_area > 0)
 		{
-			const int side = std::min(rt_unscaled_width, rt_unscaled_height);
-			if ((side * 100) < (s_largest_rt_side * min_rt_pct))
+			if ((rt_unscaled_width * rt_unscaled_height) < min_rt_area)
 			{
 				++s_stats.skip_offscreen_rt;
 				return;
