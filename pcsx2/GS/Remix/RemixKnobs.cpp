@@ -59,14 +59,35 @@ namespace remix_ps2
 				nullptr, "Frames to wait after the camera solves before submitting geometry.", false},
 
 			// ------------------------------------------------------------------------ Sky
-			{"SKY", "Sky", "Sky classification", knob_type::Choice, 1, 0, 2, 1,
-				"Off|Depth-neutral draws|First N draws (needs Sky draw order)",
+			// This bound was 2 while the live knob accepts 0..4 (RemixSubmit.cpp:3002,
+			// live_int(L"PCSX2_REMIX_SKY", 1, 0, 4)), and the mismatch is not cosmetic. A Choice is
+			// rendered as a combo box over `choices` whose INDEX is the stored value
+			// (RemixSettingsWidget.cpp:131-141), so a page offering three entries can only ever
+			// serialise 0, 1 or 2 -- modes 3 and 4 were unreachable from the GUI, and any visit to
+			// the Remix settings tab wrote a value <= 2 into gamesettings\<serial>.ini over whatever
+			// the per-game .conf asked for. That overlay reaches the backend through the process
+			// environment BEFORE the conf is read, so the conf's own line then logs
+			// `SKIPPED (already set in the environment)` and the drift is invisible.
+			//
+			// MEASURED 2026-08-15 on SOCOM CA (SCUS-97545): the overlay held `SKY = 1`, the conf had
+			// no SKY line at all, and the run counted `sky 0` across 900 in-mission frames. Mode 1
+			// demands a draw that neither tests nor writes depth; that title's backdrop is
+			// depth(r=1 w=0), so mode 1 could never match it and no SKYORDER would have helped. The
+			// fix is a conf line asking for mode 4 -- and with this bound left at 2 the settings page
+			// would have silently undone it the next time it was opened.
+			{"SKY", "Sky", "Sky classification", knob_type::Choice, 1, 0, 4, 1,
+				"Off|Depth-neutral draws|First N draws (needs Sky draw order)|"
+				"Render-target draws that do not write depth|"
+				"Any draw that does not write depth (set Sky draw order)",
 				"Tags the skybox so Remix renders it at infinity instead of as geometry a few feet "
 				"in front of the camera. \"Depth-neutral\" catches a sky drawn with Z testing and Z "
 				"writing both off. If the title's sky tests Z, that test can never match it -- use "
 				"\"First N draws\" and set Sky draw order, which is how dxvk-remix does it natively. "
-				"Neither test is needed if you tag the sky texture by hand in the Remix developer "
-				"menu; that is exact, and it applies without a restart.",
+				"The last two entries relax only the depth-WRITE half, which is the common case: a "
+				"backdrop drawn with the depth test on and depth writes off. Tagging the sky texture "
+				"by hand in the Remix developer menu is not a substitute -- a by-hash tag sets the "
+				"instance category, but the un-projection chooses its solver before any material "
+				"hash exists, so a hand-tagged sky lights up and still rides the camera.",
 				false},
 			{"SKYCAM", "Sky", "Sky camera", knob_type::Boolean, 1, 0, 1, 1, nullptr,
 				"Submits a second camera to Remix as the sky camera -- the world camera's "

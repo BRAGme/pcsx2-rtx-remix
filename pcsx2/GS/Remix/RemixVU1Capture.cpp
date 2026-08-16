@@ -88,6 +88,36 @@ namespace RemixVU1Capture
 		constexpr u32 s_no_pin = 0xFFFFFFFFu;
 		std::atomic<u32> s_pinned_offset{s_no_pin};
 
+		// Set when PCSX2_REMIX_PINOFFSET named an address by hand. The election calls
+		// SetPinnedOffset on EVERY accepted camera (RemixSubmit.cpp), so without this a
+		// hand-seeded pin is overwritten by the winner before it is ever read -- which made
+		// PINOFFSET useless as an investigative tool exactly when it is most wanted.
+		//
+		// MEASURED 2026-08-16, why this matters here: SOCOM CA's setup microprogram stores the
+		// composed view-projection to VU1 qwords 0..3 (SQ vf01..vf04, 0..3(vi00) at 0x0260..0x0278),
+		// and across a full CAMTEST session with 49 distinct matrices at 46 distinct VU1 addresses,
+		// offset 0x0000 was scored ZERO times -- the lowest address ever read was 0x0020. The one
+		// place the ucode says the camera is written has never been looked at.
+		std::atomic<bool> s_pin_user_seeded{false};
+
+		// Re-read PCSX2_REMIX_PINOFFSET from the environment. Called once per frame from
+		// publish(), NOT cached and NOT latched: the per-game .conf reaches the environment
+		// after this file's arm path has already run, so anything evaluated once at arm time
+		// reads the pre-conf value forever. That single mistake has now cost four separate
+		// measurements on this project (FRAMETRACE, SLICEVF, UCODEDUMP, and this).
+		void refresh_user_pin()
+		{
+			const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_PINOFFSET", -1);
+			const bool valid = (env >= 0) && ((env + s_matrix_bytes) <= VU1_MEMSIZE);
+
+			if (valid)
+				s_pinned_offset.store(static_cast<u32>(env), std::memory_order_relaxed);
+			else if (s_pin_user_seeded.load(std::memory_order_relaxed))
+				s_pinned_offset.store(s_no_pin, std::memory_order_relaxed); // knob withdrawn
+
+			s_pin_user_seeded.store(valid, std::memory_order_relaxed);
+		}
+
 		struct scan_guard
 		{
 			~scan_guard() { s_scanning.store(false, std::memory_order_release); }
@@ -434,7 +464,25 @@ namespace RemixVU1Capture
 			return slice_rank_enabled() ? (base + slice_rank_bonus(m)) : base;
 		}
 
-		void insert_candidate(const float* m, float score, u32 offset, u32 start_pc, u64 ucode, u8 source = 0)
+		// Knobs read on the kick path.
+		//
+		// NOT a `static const` local and NOT a namespace-scope `const`: the renderer goes live
+		// before the per-game <SERIAL>.conf is applied, so anything latched at first call -- or,
+		// worse, at static-init -- is the pre-conf value for the whole session. The per-game conf
+		// also calls SetEnvironmentVariableW directly and bumps no generation counter, so a
+		// generation-cached reader never re-reads it either. Both of those have already shipped
+		// here as silent no-ops (see s_scan_windows above, which still has the defect).
+		//
+		// The cost is one GetEnvironmentVariableW per scanned kick -- the scan budget is 16 kicks
+		// per frame by default -- so these are read ONCE per kick into locals, never per candidate
+		// and never per window.
+		bool env_flag_live(const wchar_t* name)
+		{
+			return remix_ps2::read_env_int(name, 0) != 0;
+		}
+
+		void insert_candidate(const float* m, float score, u32 offset, u32 start_pc, u64 ucode,
+			u8 source = 0, u8 flags = 0)
 		{
 			const u64 content = hash_bits(m, 16);
 
@@ -478,6 +526,7 @@ namespace RemixVU1Capture
 			out.start_pc = start_pc;
 			out.ucode_hash = ucode;
 			out.source = source;
+			out.flags = flags;
 			s_frame_hashes[slot] = content;
 		}
 
@@ -486,7 +535,30 @@ namespace RemixVU1Capture
 		// This is the primary camera source. The heuristic window scan above stays as the
 		// fallback, exactly where it was, because a program whose transform this cannot
 		// decode still deserves a chance.
-		constexpr u32 s_max_programs = 8;
+		// THE CEILING THAT LOST THE CAMERA, and it is worth stating exactly because nothing in any
+		// log said it was happening.
+		//
+		// This cache is keyed on (ucode hash, start_pc). One VU1 microprogram has MANY entry
+		// points -- SOCOM: Combined Assault's mission ucode 0xd74d4042a48b1ba8 is entered at at
+		// least seven distinct PCs -- and each entry point is a separate slice, because Analyze()
+		// walks forward from start_pc. The cache filled first-come-first-served at 8, never
+		// rotated, and program_for() then returned nullptr for every later entry point FOR THE
+		// REST OF THE SESSION. That skips the whole `if (program)` block in OnXGKick: the
+		// back-slice, the register-resident source 7, AND the title-specific fixed block.
+		//
+		// MEASURED on the 2026-08-16 09:32 session log. Six entry points on that one ucode were
+		// granted slots (0x0000, 0x16b8, 0x18c8, 0x1978, 0x1988, 0x1a18) -- five of them proven by
+		// a `src=socom-fixed` candidate, which is emitted unconditionally inside that block. The
+		// seventh, start_pc 0x2040, produced a `src=pinned` row (inserted AFTER and outside the
+		// block, so the kick was certainly scanned) and NOT ONE candidate from inside it -- no
+		// socom-fixed, no slice, no slice-vf. The only way that happens is program_for() returning
+		// nullptr. 0x2040 is the entry point whose register-resident vf01..vf04 chains are the
+		// only camera-tracking matrix this project has found; two sessions earlier it happened to
+		// arrive within the first eight and published 133 rows.
+		//
+		// So which entry points get sliced has been decided by a race between the first few kicks
+		// of a session, silently, and the camera's discoverability rode on it.
+		constexpr u32 s_max_programs_cap = 64;
 
 		struct ProgramEntry
 		{
@@ -496,15 +568,39 @@ namespace RemixVU1Capture
 			RemixVU1Slice::Program program;
 		};
 
-		ProgramEntry s_programs[s_max_programs];
+		ProgramEntry s_programs[s_max_programs_cap];
 		u32 s_program_count = 0;
 
-		bool s_ucode_dump_enabled = false;
+		// PCSX2_REMIX_MAXPROGRAMS -- how many (ucode, start_pc) pairs may be sliced per session.
+		//
+		// DEFAULT 8, i.e. exactly what shipped, so this build changes nothing on its own. Raising
+		// it CHANGES THE PICTURE and the mechanism is named rather than hedged: a newly-sliced
+		// entry point contributes candidates to the 32-slot per-frame set, which changes which
+		// candidates survive, and any of them can in principle be elected.
+		//
+		// What bounds that on THIS title, stated as a bound and not as a guarantee: the elected
+		// camera is the source-4 fixed block at score 105 (5.00 shape + the 100 source bonus), and
+		// every candidate a new entry point can add enters at most 6 + 10 = 16, while sources 6
+		// and 7 cannot be elected at all while PCSX2_REMIX_DIVCAM = 0. The 3000/2000-scored fixed
+		// and pinned entries are never the eviction victim, because insert_candidate evicts the
+		// LOWEST score. On another title, or with SOCOMFIXED = 0 or DIVCAM > 0, none of that
+		// holds. It is not invisible; it is bounded, and only here.
+		//
+		// Read LIVE and only on a cache MISS -- a handful of times per session, never on the hot
+		// path -- so a value that arrives with the per-game .conf after the arm still takes
+		// effect. This file's own note on env_flag_live records why nothing here may be latched.
+		u32 program_cache_limit()
+		{
+			const s64 value = remix_ps2::read_env_int(L"PCSX2_REMIX_MAXPROGRAMS", 8);
+			return static_cast<u32>(std::clamp<s64>(value, 1, s_max_programs_cap));
+		}
 
 		void dump_ucode(const ProgramEntry& entry, const u8* micro)
 		{
 			const std::string& dir = EmuFolders::Logs.empty() ? EmuFolders::AppRoot : EmuFolders::Logs;
 
+			// The raw image is a property of the ucode alone, so it keeps its old name and is
+			// simply rewritten with identical bytes by each entry point.
 			const std::string bin_path =
 				Path::Combine(dir, fmt::format("remix_ucode_{:016x}.bin", entry.ucode_hash));
 			if (std::FILE* f = FileSystem::OpenCFile(bin_path.c_str(), "wb"))
@@ -513,8 +609,14 @@ namespace RemixVU1Capture
 				std::fclose(f);
 			}
 
-			const std::string txt_path =
-				Path::Combine(dir, fmt::format("remix_ucode_{:016x}.txt", entry.ucode_hash));
+			// THE DISASSEMBLY IS NOT. Describe() walks forward from THIS entry's start_pc, so one
+			// ucode produces a different listing per entry point -- and the old name keyed on the
+			// ucode alone meant all of them wrote to one file and clobbered each other. The
+			// survivor was whichever entry point happened to be analysed last, so the listing for
+			// the entry point actually under investigation (0x2040 here) was routinely destroyed
+			// by an unrelated one. One file per (ucode, start_pc).
+			const std::string txt_path = Path::Combine(dir,
+				fmt::format("remix_ucode_{:016x}_pc{:04x}.txt", entry.ucode_hash, entry.start_pc));
 			if (std::FILE* f = FileSystem::OpenCFile(txt_path.c_str(), "w"))
 			{
 				const std::string text = RemixVU1Slice::Describe(micro, entry.start_pc, entry.program);
@@ -523,16 +625,40 @@ namespace RemixVU1Capture
 			}
 		}
 
+		// Last value program_cache_limit() returned, so the stats line can report the limit on
+		// frames that had no cache miss to read it on. Not the knob's authority -- the miss path
+		// below re-reads it every time -- just what to print.
+		u32 s_program_limit_seen = 8;
+
 		const RemixVU1Slice::Program* program_for(const u8* micro, u64 ucode_hash, u32 start_pc)
 		{
+			// Free, and set on every kick so the occupancy reported is this frame's truth rather
+			// than only that of frames which happened to add an entry.
+			s_frame.programs_used = s_program_count;
+			s_frame.programs_limit = s_program_limit_seen;
+
 			for (u32 i = 0; i < s_program_count; ++i)
 			{
 				if (s_programs[i].ucode_hash == ucode_hash && s_programs[i].start_pc == start_pc)
 					return &s_programs[i].program;
 			}
 
-			if (s_program_count >= s_max_programs)
+			// MISS. Everything below runs at most once per distinct entry point per session, so
+			// the two environment reads here cost nothing measurable and both are live.
+			const u32 limit = program_cache_limit();
+			s_program_limit_seen = limit;
+			s_frame.programs_limit = limit;
+
+			if (s_program_count >= limit)
+			{
+				// Refusals were silent. They are the reason a camera can be present in VU1 and
+				// unreachable, so they are counted and the offending identity is carried to the
+				// GS side, which prints it on the vu stats line.
+				++s_frame.programs_refused;
+				s_frame.refused_start_pc = start_pc;
+				s_frame.refused_ucode = ucode_hash;
 				return nullptr;
+			}
 
 			ProgramEntry& entry = s_programs[s_program_count++];
 			entry.used = true;
@@ -540,26 +666,65 @@ namespace RemixVU1Capture
 			entry.start_pc = start_pc;
 			RemixVU1Slice::Analyze(micro, start_pc, entry.program);
 
-			if (s_ucode_dump_enabled)
+			s_frame.programs_used = s_program_count;
+
+			// PCSX2_REMIX_UCODEDUMP, read HERE and not latched at arm.
+			//
+			// It was `s_ucode_dump_enabled`, assigned once in SetArmed(true) from the environment.
+			// SetArmed runs with the renderer -- t = 6.39 s on the session that motivated this --
+			// and the per-game settings reach the environment after it, t = 6.50 s. So the flag
+			// latched the pre-config value and the dump never fired, which is why the newest
+			// listing for this title's mission ucode on disk is dated 2026-08-02. That is the same
+            // latching defect that has now cost this project six separate measurements. Reading it
+			// on the miss path costs one GetEnvironmentVariableW per distinct entry point.
+			if (remix_ps2::read_env_int(L"PCSX2_REMIX_UCODEDUMP", 0) != 0)
 				dump_ucode(entry, micro);
 
 			return &entry.program;
 		}
 
-		// Reads one back-sliced matrix out of VU1 data memory. 'base_override' is used for
-		// the TOPS hypothesis; otherwise the live VI register the program itself computed is
-		// the base, which already carries whatever double-buffer bank is current.
+		// Reads one back-sliced matrix out of VU1 data memory. 'use_tops' selects the TOPS
+		// hypothesis; otherwise the live VI register the program itself computed is the base,
+		// which already carries whatever double-buffer bank is current.
+		//
+		// The address of a row is
+		//
+		//     VI[vi_base] as it reads AT THIS KICK  +  vi_delta  +  imm
+		//
+		// and vi_delta is what makes an auto-incrementing load readable at all. Before it, an
+		// LQI/LQD row was rejected outright, because reading VI at the kick for a program that
+		// streams its matrix with LQI lands wherever the stream has since advanced to -- SOCOM
+		// Combined Assault's mission program is four qwords past row 0 by the time it kicks. The
+		// slicer now counts those four increments out of the instruction stream, so the base is
+		// recovered rather than guessed. vi_delta is 0 for the classic LQ+immediate case, which
+		// is bit-for-bit the behaviour this function has always had.
 		bool read_sliced_matrix(const u8* mem, const RemixVU1Slice::Matrix& matrix,
 			bool use_tops, u32 tops, float (&out)[16], u32& out_offset)
 		{
+			if (matrix.register_rows)
+				return false;
+
 			for (u32 row = 0; row < 4; ++row)
 			{
 				const RemixVU1Slice::RowLoad& load = matrix.rows[row];
-				if (load.kind != RemixVU1Slice::LoadKind::LQ)
-					return false;
+
+				switch (load.kind)
+				{
+					case RemixVU1Slice::LoadKind::LQ:
+						break;
+					case RemixVU1Slice::LoadKind::LQI:
+					case RemixVU1Slice::LoadKind::LQD:
+						// Only readable once the slicer tied the register back to a kick.
+						if (load.kick_dir == RemixVU1Slice::KickDir::None)
+							return false;
+						break;
+					default:
+						return false;
+				}
 
 				const u32 base = use_tops ? tops : static_cast<u32>(vuRegs[1].VI[load.vi_base].US[0]);
-				const u32 qword = (base + static_cast<u32>(static_cast<s32>(load.imm))) & 0x3FFu;
+				const s32 displacement = static_cast<s32>(load.vi_delta) + static_cast<s32>(load.imm);
+				const u32 qword = (base + static_cast<u32>(displacement)) & 0x3FFu;
 				const u32 offset = qword * 16u;
 
 				if ((offset + 16u) > VU1_MEMSIZE)
@@ -574,8 +739,66 @@ namespace RemixVU1Capture
 			return true;
 		}
 
+		// Reads a matrix that never touches VU1 data memory, because its four rows are live VF
+		// registers a different microprogram left behind.
+		//
+		// This is the case the address-based back-slice is structurally blind to, and on SOCOM
+		// Combined Assault it is the one that matters: seven separate chains in the mission
+		// program transform with vf01..vf04, five of them feeding the perspective divide
+		// directly, and not one instruction in the whole 16 KB of microcode loads those four
+		// registers. Nothing about this is title-specific -- a chain whose rows have no writer is
+		// register-resident by definition, whatever the program.
+		bool read_register_matrix(const RemixVU1Slice::Matrix& matrix, float (&out)[16])
+		{
+			if (!matrix.register_rows)
+				return false;
+
+			for (u32 row = 0; row < 4; ++row)
+			{
+				const u32 reg = matrix.rows[row].vf_reg;
+				if (reg >= 32)
+					return false;
+
+				// vf00 is the hardwired constant (0, 0, 0, 1). A "matrix" row that is really the
+				// constant means the chain was not a 4x4 transform at all.
+				if (reg == 0)
+					return false;
+
+				std::memcpy(&out[row * 4], vuRegs[1].VF[reg].F, 16);
+			}
+
+			return true;
+		}
+
+		void capture_transform_probe(const u8* mem, u32 matrix_offset, u64 ucode)
+		{
+			if (s_frame.transform_probe_valid)
+				return;
+
+			constexpr u32 qwords = 64;
+			constexpr u32 half = qwords / 2;
+			const u32 matrix_qword = matrix_offset / s_qword;
+			const u32 base_qword = (matrix_qword + 1024u - half) & 0x3FFu;
+
+			for (u32 i = 0; i < qwords; ++i)
+			{
+				const u32 qword = (base_qword + i) & 0x3FFu;
+				std::memcpy(&s_frame.transform_probe[i * 4], mem + (qword * s_qword), s_qword);
+			}
+
+			s_frame.transform_probe_base = base_qword;
+			s_frame.transform_probe_matrix = matrix_qword;
+			s_frame.transform_probe_ucode = ucode;
+			s_frame.transform_probe_valid = true;
+		}
+
 		void publish()
 		{
+			// Pick up a PINOFFSET that arrived with the per-game .conf, which lands after the
+			// arm path has already run. Once per frame inside the scan guard -- not per kick,
+			// not per candidate.
+			refresh_user_pin();
+
 			// Stamped here rather than per kick: publish() runs inside the scan guard, so this is
 			// the last point at which s_frame is provably owned by one thread.
 			s_frame.kick_seq_end = g_kick_seq.load(std::memory_order_relaxed);
@@ -621,12 +844,16 @@ namespace RemixVU1Capture
 			s_scan_budget = read_scan_budget();
 
 			// The back-slice cache is per session: a new game means new microprograms.
-			for (u32 i = 0; i < s_max_programs; ++i)
+			for (u32 i = 0; i < s_max_programs_cap; ++i)
 				s_programs[i] = ProgramEntry{};
 			s_program_count = 0;
+			s_program_limit_seen = 8;
 
-			const std::wstring ucode_env = remix_ps2::read_env(L"PCSX2_REMIX_UCODEDUMP");
-			s_ucode_dump_enabled = !ucode_env.empty() && ucode_env[0] != L'0';
+			// PCSX2_REMIX_UCODEDUMP is NOT read here any more. It used to latch into
+			// s_ucode_dump_enabled at this point, which is before the per-game settings reach the
+			// environment, so it was the pre-config value for the whole session and the dump
+			// silently never fired. It is now read live on the program-cache miss path, which is
+			// the only place it is acted on. See program_for().
 
 			const std::wstring env = remix_ps2::read_env(L"PCSX2_REMIX_SCANTRACE");
 			s_trace_enabled = !env.empty() && env[0] != L'0';
@@ -641,9 +868,12 @@ namespace RemixVU1Capture
 		{
 			// PCSX2_REMIX_PINOFFSET seeds the pin by hand, so a title whose camera address is
 			// already known does not have to win the shape ranking once before it locks.
-			const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_PINOFFSET", -1);
-			const bool valid = (env >= 0) && ((env + s_matrix_bytes) <= VU1_MEMSIZE);
-			s_pinned_offset.store(valid ? static_cast<u32>(env) : s_no_pin, std::memory_order_relaxed);
+			// Seeded here only so a value already in the ENVIRONMENT at launch takes effect on
+			// frame one. The authoritative read is refresh_user_pin() below, called per frame,
+			// because a per-game .conf is applied AFTER this arm runs -- measured at t=7.08 s
+			// against an arm that precedes it. Seeding only here is what made PINOFFSET = 0
+			// silently no-op: the seed read -1, and the election then overwrote the pin.
+			refresh_user_pin();
 		}
 
 		g_armed.store(enabled, std::memory_order_relaxed);
@@ -651,6 +881,12 @@ namespace RemixVU1Capture
 
 	void SetPinnedOffset(u32 offset)
 	{
+		// A hand-seeded pin outranks the election's. See s_pin_user_seeded: the election calls
+		// this on every accepted camera, so honouring it here would clobber PINOFFSET within a
+		// frame of arming and the address under investigation would never be read.
+		if (s_pin_user_seeded.load(std::memory_order_relaxed))
+			return;
+
 		s_pinned_offset.store(offset, std::memory_order_relaxed);
 	}
 
@@ -745,6 +981,38 @@ namespace RemixVU1Capture
 		{
 			s_frame.sliced_matrices += program->count;
 
+			// PCSX2_REMIX_SLICEAUTO -- publish matrices whose data-memory base had to be
+			// recovered through an auto-increment chain (an LQI/LQD row, or an LQ whose base
+			// register moves between the load and the kick). CHANGES THE PICTURE when on: these
+			// are extra entries in a 32-slot candidate set, so which of the existing candidates
+			// survives the frame can change even before one of them is elected. Default off.
+			const bool slice_auto = env_flag_live(L"PCSX2_REMIX_SLICEAUTO");
+
+			// PCSX2_REMIX_SLICEVF -- publish matrices whose four rows are live VF registers.
+			// Same warning: extra candidates, so it can change the picture. Default off.
+			const bool slice_vf = env_flag_live(L"PCSX2_REMIX_SLICEVF");
+
+			// PCSX2_REMIX_DIVSCORE -- see the use site below. Default off; read live per kick.
+			const bool div_score_enabled = env_flag_live(L"PCSX2_REMIX_DIVSCORE");
+
+			// PCSX2_REMIX_SOCOMFIXED -- the hand-picked qword 8..11 block below. Default 1, i.e.
+			// exactly what shipped; setting it to 0 removes a candidate that currently enters at
+			// 3000 and wins the election outright, so 0 CHANGES THE PICTURE. It exists so the
+			// CAMTEST audit can be run without this shortcut drowning the table.
+			const bool socom_fixed = remix_ps2::read_env_int(L"PCSX2_REMIX_SOCOMFIXED", 1) != 0;
+
+			// A title-specific fixed address, kept only because removing it is itself a picture
+			// change that nothing has yet measured. It is the hand-picked-address hack the
+			// back-slice exists to replace; the generic replacements are the two knobs above.
+			if (socom_fixed && ucode == 0xd74d4042a48b1ba8ULL)
+			{
+				constexpr u32 socom_camera_offset = 8u * s_qword;
+				float m[16];
+				std::memcpy(m, mem + socom_camera_offset, sizeof(m));
+				if (finite_window(m))
+					insert_candidate(m, ranked(3000.f, m), socom_camera_offset, start_pc, ucode, 4);
+			}
+
 			// VU.h's own accessor, so this file never has to know about vif0/vif1 selection.
 			// Under MTVU the authoritative copy is vu1Thread.vifRegs; this is the secondary
 			// hypothesis only, and the live-VI path above already covers the normal case.
@@ -753,15 +1021,88 @@ namespace RemixVU1Capture
 			for (u32 i = 0; i < program->count; ++i)
 			{
 				const RemixVU1Slice::Matrix& matrix = program->items[i];
-				if (!matrix.resolvable)
-					continue;
+
+				u8 flags = 0;
+				if (matrix.feeds_div)
+					flags |= candidate_flag_feeds_div;
+				if (matrix.feeds_clip)
+					flags |= candidate_flag_feeds_clip;
 
 				float m[16];
 				u32 offset = 0;
 
+				if (matrix.register_rows)
+				{
+					// Only the ones the microprogram actually divides or clips by. A chain whose
+					// rows happen to be registers is not evidence of anything; a chain whose
+					// result becomes the perspective divide's denominator is a projection by
+					// definition, and that is the whole discriminator.
+					if (!slice_vf || !(matrix.feeds_div || matrix.feeds_clip))
+						continue;
+
+					if (read_register_matrix(matrix, m) && finite_window(m))
+					{
+						// PCSX2_REMIX_DIVSCORE -- lift a register-resident matrix the MICROCODE
+						// ITSELF marked as feeding the perspective divide above an undistinguished
+						// slice, so a flood of generic 1000s cannot crowd it out of the 32-slot set.
+						// A matrix whose result becomes the divide's denominator is a projection by
+						// definition; a matrix that merely sits at a decodable address is not.
+						//
+						// 1500 sits deliberately between the generic slice band (1000/999) and the
+						// pinned re-read (2000) and the title-specific fixed block (3000), so it
+						// wins the eviction race against generic slices and loses it to the two
+						// candidates that carry stronger evidence. It does NOT make the matrix
+						// electable -- PCSX2_REMIX_DIVCAM = 0 still bars sources 6 and 7 from the
+						// election outright. It only gets it measured.
+						//
+						// DEFAULT 0, i.e. the flat 1000 that shipped, and this is honest about its
+						// own value: MEASURED on the 2026-08-16 10:19 session with SLICEAUTO = 0,
+						// the per-frame candidate set peaked at 20 of 32 occupied and never once
+						// filled, so insert_candidate's `score <= worst -> return` rule never fired
+						// and this knob would have changed NOTHING. It matters only when the set
+						// saturates, which is what SLICEAUTO = 1 does -- that session carried 778
+						// slice-auto rows beside 738 slice. Turning it on CHANGES THE PICTURE by
+						// the usual route: a different candidate set reaches the GS side, and
+						// sources 1/2/3 that get displaced are electable even though 7 is not.
+						//
+						// Read live per kick, alongside slice_auto/slice_vf above, never latched.
+						const bool div_evidence = (flags & candidate_flag_feeds_div) != 0;
+						const float base = (div_evidence && div_score_enabled) ? 1500.f : 1000.f;
+
+						// No data-memory address exists for this one. 0xFFFFFFFF is the module's
+						// own "no pin" value, so nothing downstream can mistake it for an offset
+						// and try to re-read 64 bytes from it.
+						insert_candidate(m, ranked(base, m), s_no_pin, start_pc, ucode, 7, flags);
+						++s_frame.sliced_published;
+					}
+
+					continue;
+				}
+
+				if (!matrix.resolvable)
+					continue;
+
+				if (matrix.base_auto)
+				{
+					if (!slice_auto)
+						continue;
+
+					if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && finite_window(m))
+					{
+						insert_candidate(m, ranked(1000.f, m), offset, start_pc, ucode, 6, flags);
+						++s_frame.sliced_published;
+					}
+
+					// No TOPS hypothesis: the delta is measured against the live register, so
+					// substituting a different base for it is not a hypothesis, it is nonsense.
+					continue;
+				}
+
 				if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && finite_window(m))
 				{
-					insert_candidate(m, ranked(1000.f, m), offset, start_pc, ucode, 1);
+					insert_candidate(m, ranked(1000.f, m), offset, start_pc, ucode, 1, flags);
+					if (ucode == 0xd74d4042a48b1ba8ULL)
+						capture_transform_probe(mem, offset, ucode);
 					++s_frame.sliced_published;
 				}
 
@@ -772,7 +1113,7 @@ namespace RemixVU1Capture
 				if (matrix.rows[0].vi_base != 0 &&
 					read_sliced_matrix(mem, matrix, true, tops, m, offset) && finite_window(m))
 				{
-					insert_candidate(m, ranked(999.f, m), offset, start_pc, ucode, 2);
+					insert_candidate(m, ranked(999.f, m), offset, start_pc, ucode, 2, flags);
 					++s_frame.sliced_published;
 				}
 			}

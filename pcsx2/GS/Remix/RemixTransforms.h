@@ -131,6 +131,41 @@ namespace remix_ps2
 	// The z column is deliberately left alone -- see make_clip_solver.
 	mat4 normalize_screen_clip(const mat4& fused, float scale_x, float offset_x, float scale_y, float offset_y);
 
+	// The OTHER half of the normalisation, and the half the hypothesis set structurally could
+	// not reach.
+	//
+	// normalize_screen_clip rescales columns 0 and 1 only. It cannot change the recovered
+	// world's UNIT, and the reason is exact rather than empirical: make_clip_solver builds B
+	// from columns {0, 1, 3}, so world-per-unit-of-clip-w is fixed by column 3 alone -- for
+	// mutually orthogonal rows it is exactly 1 / |column 3 xyz| -- and column 3 is precisely
+	// what normalize_screen_clip leaves alone. A guest whose w is not eye-space depth in its
+	// own units therefore lands outside PCSX2_REMIX_CAMSCALE with no hypothesis able to bring
+	// it back. SOCOM: Combined Assault's register-resident candidate measures 7.232e-08, i.e.
+	// a column 3 of magnitude 1.38e7.
+	//
+	//   scale_w  divides ALL SIXTEEN terms, not column 3 alone. Dividing column 3 by itself
+	//            would multiply every post-divide NDC by the same factor and undo the screen
+	//            normalisation composed before it. Scaling the whole matrix is projectively
+	//            invariant -- the NDC it emits is bit-identical -- and moves exactly one thing:
+	//            the recovered world is scaled about the recovered eye, which is the free
+	//            parameter being fixed. It is therefore a GAUGE change for any scale-free
+	//            reading (CAMTEST's alpha divides drift by range, and both carry it), and a
+	//            REAL change for anything that reads absolute recovered coordinates -- the
+	//            depth-scale gate, scene radius, light placement, the picture.
+	//   swap_zw  exchanges columns 2 and 3: the assertion that the value the guest divided by
+	//            is the one this code has been calling depth. NOT a gauge change -- it feeds a
+	//            different third equation into make_clip_solver and recovers a different world.
+	mat4 normalize_clip_depth(const mat4& fused, float scale_w, bool swap_zw);
+
+	// |column 3 xyz| of a fused matrix: the factor normalize_clip_depth has to divide by for the
+	// recovered world unit to become the guest's own. 1 when the column is degenerate.
+	float clip_w_scale(const mat4& fused);
+
+	// The nearest power of two when `value` is within `tolerance` (relative) of one, `value`
+	// otherwise. Both are reported by the caller, so "this convention IS 2^-24" can be told
+	// apart from "this convention is merely near 2^-24".
+	float snap_power_of_two(float value, float tolerance);
+
 	// Recovers world positions from a normalised fused matrix using clip x, y and w ONLY.
 	// A PS2 vertex's GS Z is a raw integer in a per-title convention (usually reversed, and
 	// scaled by the ZBUF format's max depth), so the fused matrix's z column cannot be

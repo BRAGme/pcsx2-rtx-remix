@@ -51,10 +51,24 @@ namespace RemixVU1Capture
 		u64 ucode_hash; // FNV-1a over vuRegs[1].Micro -- the ucode fingerprint
 
 		// 0 = heuristic scan, 1 = ucode back-slice (live VI base), 2 = back-slice against
-		// the VIF1 TOPS double-buffer base. Anything but 0 is deterministic: the microcode
-		// itself said where the matrix is, so it does not compete on shape score.
+		// the VIF1 TOPS double-buffer base, 4 = title-specific fixed VU block,
+		// 6 = back-slice whose base was recovered through an auto-increment chain (LQI/LQD),
+		// 7 = a matrix living in the VF register file, read from vuRegs[1].VF.
+		// (5 is the GS-side synthetic probe candidate and never appears here.)
+		// Anything but 0 is deterministic: the microcode itself said where the matrix is, so it
+		// does not compete on shape score.
 		u8 source;
+
+		// What the microprogram does with this matrix's result, straight out of the back-slice.
+		// bit 0 = the result feeds a DIV, i.e. it produced the perspective divide's denominator,
+		//         which is the definition of a projection.
+		// bit 1 = the result is CLIPped, i.e. it is clip space.
+		// Zero for anything the slice did not produce.
+		u8 flags;
 	};
+
+	inline constexpr u8 candidate_flag_feeds_div = 1u << 0;
+	inline constexpr u8 candidate_flag_feeds_clip = 1u << 1;
 
 	struct Frame
 	{
@@ -70,6 +84,32 @@ namespace RemixVU1Capture
 		u32 kicks_reentrant; // kicks dropped because another thread was already scanning
 		u32 sliced_matrices; // matrices the ucode back-slice located this frame
 		u32 sliced_published; // of those, how many were read out and published
+
+		// --- the ucode back-slice's program cache -------------------------------------------
+		//
+		// The cache is keyed on (ucode hash, start_pc), fills first-come-first-served and NEVER
+		// rotates. When it is full, program_for() returns nullptr and the ENTIRE deterministic
+		// path is skipped for that entry point for the rest of the session -- the back-slice, the
+		// register-resident source 7, and the title-specific fixed block alike. It said nothing
+		// when it did this, which is how SOCOM: Combined Assault's mission program lost the one
+		// entry point (start_pc 0x2040) holding its register-resident vf01..vf04 chains: the same
+		// ucode is entered at more than eight PCs, the first eight to be kicked won the slots, and
+		// which eight those are depends on where the session resumed. These make it visible.
+		u32 programs_used; // cache slots occupied
+		u32 programs_limit; // PCSX2_REMIX_MAXPROGRAMS in force
+		u32 programs_refused; // lookups refused this frame because the cache was full
+		u32 refused_start_pc; // the most recent refused entry point, so it can be named
+		u64 refused_ucode;
+
+		// One contiguous 64-qword neighbourhood around the first deterministic matrix
+		// read this frame.  The SOCOM CA back-slice currently resolves an object MVP at
+		// VI05+7..10; its neighbouring constants are needed to identify the shared camera
+		// factor rather than promote that object matrix as the camera.
+		float transform_probe[64 * 4];
+		u32 transform_probe_base; // qword index of transform_probe[0]
+		u32 transform_probe_matrix; // qword index of the back-sliced matrix row 0
+		u64 transform_probe_ucode;
+		bool transform_probe_valid;
 		Candidate items[max_candidates];
 	};
 
@@ -106,10 +146,9 @@ namespace RemixVU1Capture
 	// this is where the camera that was live at that kick is kept, so the draw can be placed with
 	// its own camera rather than the one frame-latched at VSync.
 	//
-	// Depth follows the measured lag: a draw arrives up to 2106 kicks after its packet was queued
-	// -- two frames at ~1053 kicks/frame on Rainbow Six 3 -- so a shorter ring would have the entry
-	// overwritten before the draw asks for it. 4096 is the next power of two, ~360 KB.
-	inline constexpr u32 kick_ring_size = 4096;
+	// SOCOM Combined Assault's GS thread can trail VU1 by roughly 28,000 kicks, so 4,096 slots
+	// overwrite its draw's camera before the GS packet arrives. 65,536 retains that observed lag.
+	inline constexpr u32 kick_ring_size = 65536;
 
 	// GS thread. Fills `m` with the camera live at `seq`, or at the most recent earlier kick that
 	// had one, and reports the VU1 offset it was read from.

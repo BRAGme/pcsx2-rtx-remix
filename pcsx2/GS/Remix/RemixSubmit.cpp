@@ -184,6 +184,37 @@ namespace RemixSubmit
 			u64 batch_surfaces_peak = 0;
 			u64 batch_meshes_created = 0;
 			u64 batch_vertices_peak = 0;
+			// Hold-previous-window (PCSX2_REMIX_HOLDEMPTY, step 4B). See hold_empty_mode() for what
+			// this is for and what it is INFERRED rather than measured to fix.
+			//
+			// 'empty' is the measurement the whole branch rests on and is counted whether the knob
+			// is on or off: presented windows that submitted no geometry at all. On SOCOM CA it
+			// should read almost exactly a third of the frame count.
+			//
+			// 'offcadence' is the misdetection tell named in the plan's risk register. This title's
+			// empty windows arrive every third window without exception (56 of 56 measured gaps),
+			// so a hold whose gap from the previous hold is anything other than 3 is either a
+			// legitimate drought (load, cinematic, menu) being repeated or the detection firing on
+			// something it should not. Watch it against 'gap3'.
+			u64 hold_empty_windows = 0;
+			u64 hold_windows = 0; // empty windows that re-presented the previous window's batch
+			// ...and of those, the ones that also re-submitted the previous window's CAMERA
+			// (HOLDEMPTY = 2). Separate from hold_windows because the difference between them is
+			// exactly the difference between "the eye moved over stale geometry" and "the frame was
+			// repeated": under mode 2 these two must track each other, and under mode 1 this is 0.
+			u64 hold_cameras = 0;
+			// HOLDEMPTY = 3: empty windows whose Present was SKIPPED outright, so the display keeps
+			// showing the previous frame and the present rate becomes the game's own 40 Hz. These
+			// are mutually exclusive with hold_windows -- a skipped window draws nothing at all.
+			u64 hold_skipped_presents = 0;
+			u64 hold_instances = 0; // instances re-presented, summed over those windows
+			u64 hold_gap3 = 0; // holds exactly 3 windows after the previous hold -- the cadence
+			u64 hold_offcadence = 0; // holds at any other spacing -- THE TELL
+			u64 hold_gap_last = 0;
+			u64 hold_skip_consecutive = 0; // refused: the previous window was itself a hold
+			u64 hold_skip_nocam = 0; // refused: no live world camera, or a space mismatch
+			u64 hold_skip_stale = 0; // refused: the retained handles had aged out (BATCHRETAIN)
+			u64 hold_failed = 0; // DrawInstance refused a re-presented instance
 			u64 degenerate_triangles = 0; // zero-area triangles dropped before CreateMesh
 			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
@@ -210,6 +241,18 @@ namespace RemixSubmit
 			u64 vu_reentrant = 0; // kicks dropped because two threads executed VU1 at once
 			u64 vu_sliced = 0; // matrices the ucode back-slice located
 			u64 vu_sliced_published = 0; // of those, read out of VU1 memory and offered
+
+			// The back-slice program cache. A refusal here is not a rejected candidate, it is an
+			// entry point that was never sliced at all -- the deterministic path, source 7 and the
+			// title-specific fixed block are all inside the block program_for() gates. It was
+			// silent, and it is what removed SOCOM's one camera-tracking matrix (start_pc 0x2040)
+			// from an entire session's table. Anything non-zero here means matrices exist in VU1
+			// that this backend has never looked at.
+			u32 vu_programs_used = 0;
+			u32 vu_programs_limit = 0;
+			u64 vu_programs_refused = 0;
+			u32 vu_refused_start_pc = 0;
+			u64 vu_refused_ucode = 0;
 			u64 cam_accept_sliced = 0; // accepted cameras that came from the back-slice
 			u64 cam_candidates = 0; // offered to the GS side, summed over frames
 			u64 cam_reject_split = 0; // split_view_projection_direct refused
@@ -221,6 +264,32 @@ namespace RemixSubmit
 			u64 cam_reject_scale = 0; // the un-projection's unit disagrees with the guest's w
 			u64 cam_reject_extent = 0; // world space changed the scene's size, so it is not rigid
 			u32 cam_last_candidates = 0;
+			// Per-draw camera placement (PCSX2_REMIX_PERDRAWCAM). Every stage separately visible,
+			// same reason as the block above: "no draw was placed per-draw" has four completely
+			// different causes -- the knob is off, the ring held nothing, the ring camera already
+			// WAS the frame camera, or the acceptance pipeline refused it -- and one opaque count
+			// could not tell them apart. See per_draw_solver() for what these are measuring.
+			//
+			// perdraw_match + perdraw_placed + perdraw_fallback == world-mode draws while the knob
+			// is on; anything left over is the knob being off for part of the run.
+			u64 perdraw_match = 0; // ring camera hash == the frame camera's; nothing to place
+			u64 perdraw_same_solver = 0; // ring hash differed but NORMALISED to the frame solver
+			u64 perdraw_distinct = 0; // ring camera solved to a genuinely different solver
+			u64 perdraw_solved = 0; // cache misses that ran the acceptance pipeline
+			u64 perdraw_refused = 0; // of those, refused by it -- the risk-register tell for 4A
+			u64 perdraw_fallback = 0; // ring miss / refuted / refused -> frame solver ("never guess")
+			// The decisive per-WINDOW census, and the reason it counts normalised solvers rather
+			// than ring hashes: a ring hash is the raw VU1 matrix, and this title emits the same
+			// camera at two different column scales, so a raw-hash count overstates how many
+			// cameras a window really used. 'solvers 1' would mean every draw in the window shares
+			// one camera and per-draw placement is a dead end; 'solvers >= 2' means it is not.
+			u32 perdraw_solvers_last = 0;
+			u32 perdraw_solvers_peak = 0;
+			u32 perdraw_rings_last = 0; // distinct RAW ring hashes in the same window, for contrast
+			u32 perdraw_rings_peak = 0;
+			u64 perdraw_windows = 0; // windows with at least one world-mode draw
+			u64 perdraw_multi_windows = 0; // ...of which had 2 or more distinct normalised solvers
+			u64 perdraw_census_overflow = 0; // windows that exceeded the census's slot count
 		};
 
 		struct mesh_entry
@@ -308,6 +377,10 @@ namespace RemixSubmit
 		// is distinct from generation 0 and keeps the first frame from flushing an empty cache.
 		u64 s_knob_generation_seen = ~0ull;
 		u64 s_submitted_this_frame = 0;
+		u64 s_drawdump_frames_left = 0;
+		u64 s_drawdump_skipped = 0; // qualifying frames passed over while DRAWDUMPAFTER counts down
+		bool s_drawdump_started = false;
+		bool s_drawdump_world_armed = false;
 
 		// Consecutive frames that submitted nothing, and how many of them the beacon waits for.
 		// ~2 seconds at 60Hz: long enough that a load or an all-2D stretch never triggers it.
@@ -386,6 +459,41 @@ namespace RemixSubmit
 		std::vector<batch_mesh> s_batch_meshes;
 		std::vector<remixapi_MeshInfoSurfaceTriangles> s_batch_surface_scratch;
 
+		// What one flush actually instanced, kept so an empty window can re-present it instead of
+		// presenting nothing (PCSX2_REMIX_HOLDEMPTY -- see hold_empty_mode()).
+		//
+		// Everything DrawInstance needs and nothing else: the mesh handle (which stays alive on its
+		// own under BATCHRETAIN, so this holds no ownership and destroys nothing), the blend struct
+		// by value because instance.pNext has to point at storage that outlives the call, the
+		// category flags, and the transform. The batch path's transform is always the identity --
+		// batched vertices are already in the submitted camera's space -- but it is stored rather
+		// than assumed so this cannot silently rot if that ever changes.
+		struct held_instance
+		{
+			remixapi_MeshHandle handle = nullptr;
+			remixapi_InstanceInfoBlendEXT blend{};
+			remixapi_InstanceCategoryFlags categories = 0;
+			remixapi_Transform transform{};
+			u64 mesh_hash = 0;
+		};
+
+		std::vector<held_instance> s_held_instances;
+		u64 s_held_frame = 0; // the window whose flush built them
+		bool s_held_world = false; // that window submitted in world space
+		bool s_held_used = false; // already re-presented once -- never twice in a row
+		u64 s_last_hold_window = 0;
+		bool s_have_held_before = false;
+
+		// The camera that window submitted, which is also the camera its geometry was un-projected
+		// with -- submit_camera() runs at the top of OnVSync and resolve_world_camera() at the
+		// bottom, so s_active_camera is that one matrix for the whole window. Mode 2 re-submits it
+		// so a held window is a true duplicate of the window it repeats. See hold_empty_mode().
+		world_camera s_held_camera{};
+
+		// Decided ONCE per window, at the top of OnVSync, BEFORE submit_camera() -- which is the
+		// only place it can be decided, because mode 2 has to change what that call submits.
+		bool s_hold_pending = false;
+
 		// Distinct (blend state, category) groups seen this frame, counted even when batching is
 		// off so the feasibility question can be answered without turning it on.
 		std::unordered_set<u64> s_frame_group_keys;
@@ -426,6 +534,10 @@ namespace RemixSubmit
 		constexpr u64 s_camera_hold_frames = 3;
 		u64 s_camera_last_accept_frame = 0;
 		bool s_logged_world_camera = false;
+		// One-shot WORLDFIX projection-sign line. Declared here rather than beside the rest of the
+		// worldfix state further down because resolve_world_camera(), which writes it, is defined
+		// above that block.
+		bool s_worldfix_logged_projection = false;
 
 		float s_light_position[3] = {0.f, -1.f, 0.f};
 		float s_light_radius = 0.1f;
@@ -496,8 +608,14 @@ namespace RemixSubmit
 			int m_value = 0;
 		};
 
-		// The float twin of live_int, for the lighting knobs. Same contract: parse once, re-parse
-		// only when the settings page has actually moved the value.
+		// The float twin of live_int. Same contract: parse once, re-parse only when the settings
+		// page has actually moved the value.
+		//
+		// CURRENTLY UNUSED, and left here on purpose as the documented idiom for a float knob that
+		// really does sit on a hot path. The lighting knobs it was written for have moved to
+		// env_float_signed(): "when the settings page moves it" is not the same as "when the value
+		// moves", because the per-game .conf writes the environment without touching
+		// knob_generation() -- see the note there.
 		class live_float
 		{
 		public:
@@ -534,6 +652,137 @@ namespace RemixSubmit
 			return value.get();
 		}
 
+		bool socom_winterblade_lighting()
+		{
+			static live_int value(L"PCSX2_REMIX_SOCOM_WINTERBLADE_LIGHTING", 0, 0, 1);
+			return value.get() != 0;
+		}
+
+		// Signed live read, for the lighting knobs only.
+		//
+		// env_float() CANNOT be used for these. Its last line is
+		// `return (std::isfinite(parsed) && parsed > 0.f) ? parsed : fallback;`
+		// -- anything <= 0 is treated as "unset" and silently replaced by the default. That is the
+		// right rule for a near plane and the wrong one for every knob whose zero and whose
+		// negatives are meaningful:
+		//
+		//   * `PCSX2_REMIX_KEY = 0` did not turn the key light off, it re-read 100. That is one
+		//     half of why the light bisect that believed it was running with the key off was in
+		//     fact running at full strength; the other half is the create-once problem documented
+		//     on refresh_fill_lights() below.
+		//   * elevation 0 (sun on the horizon) and negative elevation (lit from underneath) are
+		//     values a user will legitimately ask for, and azimuth 0 is the documented compass
+		//     zero -- all three would have been swallowed.
+		//
+		// READ LIVE ON EVERY CALL. Not `static const`, and deliberately NOT live_float either.
+		// live_float re-parses only when paths::knob_generation() moves, and that counter is bumped
+		// in exactly one place: apply_knob() (RemixPaths.cpp:150), which pushes the PCSX2 settings
+		// .ini into the environment. The per-game <SERIAL>.conf does NOT go through it -- it calls
+		// SetEnvironmentVariableW directly (RemixMaterials.cpp, refresh_game_config) and bumps
+		// nothing -- so a conf-delivered value moves no generation and a live_float cache never
+		// re-reads it. A latched knob is a silent no-op that looks like a broken feature; see
+		// frametrace_frames() for the run that cost. These are read once per presented frame, from
+		// refresh_fill_lights(), never per draw, so a GetEnvironmentVariableW each is free.
+		float env_float_signed(const wchar_t* name, float fallback)
+		{
+			const std::wstring env = remix_ps2::read_env(name);
+			if (env.empty())
+				return fallback;
+
+			const float parsed = static_cast<float>(::_wtof(env.c_str()));
+			return std::isfinite(parsed) ? parsed : fallback;
+		}
+
+		// Integer twin of env_float_signed, and read live for exactly the same two reasons.
+		//
+		// NOT `static const`: the renderer goes live well before the per-game .conf is applied
+		// (t = 9.774 vs t = 10.008 on the 2026-08-15 session), so a value latched at first call is
+		// the pre-conf value forever. NOT live_int either: that re-parses only when
+		// paths::knob_generation() moves, and the per-game .conf never moves it -- it calls
+		// SetEnvironmentVariableW directly. Both of those were real, separately-diagnosed silent
+		// no-ops. Callers below are once per camera resolve and once per presented window.
+		int env_int_live(const wchar_t* name, int fallback)
+		{
+			const std::wstring env = remix_ps2::read_env(name);
+			if (env.empty())
+				return fallback;
+
+			return static_cast<int>(::_wtoi(env.c_str()));
+		}
+
+		// PCSX2_REMIX_WORLDFIX -- the world-space un-projection audit, plus the one correction the
+		// hypothesis set structurally cannot express. See the worldfix_ block further down for what
+		// is measured and why WORLDPROBE cannot answer it.
+		//
+		//   0 = OFF. The default, and nothing in this file behaves differently.
+		//   1 = AUDIT ONLY. No behaviour change; logs alpha = d(bearing)/d(yaw) for tracked static
+		//       geometry, and the sign/aspect terms of the recovered projection.
+		//   2 = audit, and force the recovered world to the handedness with projection m[0][0] > 0.
+		//   3 = audit, and force the OPPOSITE handedness (m[0][0] < 0).
+		//
+		// 2 and 3 are the same one-bit change in opposite directions; exactly one of them is a
+		// no-op on any given camera. Neither can alter the rendered image -- see the correction
+		// site in resolve_world_camera() for why that is structural rather than hopeful.
+		int worldfix_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_WORLDFIX", 0), 0, 3);
+		}
+
+		// Where a candidate came from. Kept in one place because it is printed from two, and the
+		// two had already drifted -- camtest_report knew about the probe source and the per-frame
+		// dump did not, so the same candidate was labelled differently in the two logs.
+		const char* candidate_source_name(u8 source)
+		{
+			switch (source)
+			{
+				case 0:
+					return "scan"; // heuristic 16 KB window sweep
+				case 1:
+					return "slice"; // back-slice, live VI base, plain LQ + immediate
+				case 2:
+					return "slice-tops"; // back-slice against the VIF1 TOPS bank
+				case 3:
+					return "pinned"; // re-read of an address a camera was recovered from
+				case 4:
+					return "socom-fixed"; // title-specific fixed VU block
+				case 5:
+					return "probe"; // GS-side synthetic, from the VU1 neighbourhood probe
+				case 6:
+					return "slice-auto"; // back-slice whose base came from an LQI/LQD chain
+				case 7:
+					return "slice-vf"; // matrix living in the VF register file
+				default:
+					return "?";
+			}
+		}
+
+		// PCSX2_REMIX_DIVCAM -- what to do with the back-slice's own statement about which matrix
+		// is the projection.
+		//
+		// A matrix whose result feeds the perspective divide produced the divide's denominator.
+		// That is what a projection IS, and no amount of shape scoring is equivalent to it. The
+		// slicer records it per matrix (RemixVU1Slice::Matrix::feeds_div) and the capture side now
+		// carries it through on every candidate.
+		//
+		//   0 = OFF, the default. Candidates from the two new back-slice sources (slice-auto and
+		//       slice-vf) are scored, split, logged and measured by CAMTEST exactly like any
+		//       other, but they can never become the elected camera. Nothing about the rendered
+		//       image depends on this mode. NOTE that merely PUBLISHING those candidates is a
+		//       separate decision made on the VU side (PCSX2_REMIX_SLICEAUTO, PCSX2_REMIX_SLICEVF)
+		//       and that one CAN change the picture -- see the note at their read site.
+		//   1 = the new sources may be elected, and a feeds_div candidate gets the same +100 the
+		//       title-specific fixed block gets. CHANGES THE PICTURE.
+		//   2 = as 1, and every candidate that does NOT feed a divide is pushed below every one
+		//       that does. CHANGES THE PICTURE, and hard: on a title whose projection the slicer
+		//       cannot see, this elects nothing at all rather than the best available guess.
+		//
+		// Read live, and NOT through live_int, for the reasons on env_int_live. Called once per
+		// presented window's camera resolve, never per draw.
+		int divcam_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_DIVCAM", 0), 0, 2);
+		}
+
 		// Uniform ambient from every direction.
 		//
 		// DEFAULTED OFF, and by measurement rather than preference: a dome light with no
@@ -545,8 +794,7 @@ namespace RemixSubmit
 		// cost this project two rounds of "captures too dark to judge".
 		float ambient_radiance()
 		{
-			static live_float value(L"PCSX2_REMIX_AMBIENT", 0.f);
-			return value.get();
+			return std::max(0.f, env_float_signed(L"PCSX2_REMIX_AMBIENT", 0.f));
 		}
 
 		// Directional key, and the light that actually carries the scene. Fixed in world space
@@ -562,14 +810,94 @@ namespace RemixSubmit
 		// with no lights of its own.
 		float key_radiance()
 		{
-			static live_float value(L"PCSX2_REMIX_KEY", 100.f);
-			return value.get();
+			return std::max(0.f, env_float_signed(L"PCSX2_REMIX_KEY", 100.f));
 		}
 
 		float key_angle_degrees()
 		{
-			static live_float value(L"PCSX2_REMIX_KEYANGLE", 8.f);
-			return value.get();
+			// Clamped low rather than allowed to reach 0: a distant light of angular diameter 0 is
+			// a degenerate delta and the runtime is handed it verbatim. 180 is the whole sky.
+			return std::clamp(env_float_signed(L"PCSX2_REMIX_KEYANGLE", 8.f), 0.01f, 180.f);
+		}
+
+		// --- where the key light is ---------------------------------------------------------
+		//
+		// The direction the key light TRAVELS, as shipped, kept verbatim as the default:
+		//
+		//     {0.35f, -0.86f, 0.37f}
+		//
+		// Its comment said it was "deliberately off-axis on all three so no wall, floor or ceiling
+		// is lit flat-on", and nobody ever worked out the elevation that implied. MEASURED
+		// 2026-08-15, and it is the whole reason these two knobs exist:
+		//
+		//   |d|     = sqrt(0.35^2 + 0.86^2 + 0.37^2) = sqrt(0.999) = 0.999500
+		//   d/|d|   = { 0.350175, -0.860430,  0.370185}
+		//   sun     = -d/|d|                            = {-0.350175, 0.860430, -0.370185}
+		//   ELEV    = asin(0.860430)                    = 59.365 degrees above the horizon
+		//   AZIM    = atan2(-0.350175, -0.370185)       = 223.409 degrees from +Z toward +X
+		//
+		// 59.4 degrees up is nearly overhead, and at that elevation a fixed light CANNOT swing in
+		// front of or behind the player when they turn. Over a real 360-degree capture (1046 camera
+		// samples, pitch dead constant at -9.2 to -9.1 degrees) the angle between camera forward and
+		// this direction only ever moved between 50.2 and 111.5 degrees: it circles high overhead
+		// and sits up-and-behind whichever way you face. Combined with angularDiameterDegrees 8
+		// (sixteen times the real sun's ~0.5) and no distance falloff at all, that reads to the user
+		// as "a light that follows the camera" -- the same appearance WORLDPROBE was built to
+		// attribute to a rotating world, and this is the simpler explanation for it. It does not
+		// refute the un-projection question WORLDPROBE asks; it removes the light from the list of
+		// things that question has to explain.
+		//
+		// So the sun is placed in degrees, not as a normalized triple, because elevation and azimuth
+		// are what a person can actually reason about ("lower, and behind me").
+		//
+		// THE CONVENTION, stated once so nothing has to guess:
+		//   ELEV -- degrees the sun SITS ABOVE THE HORIZON. +90 is straight overhead (light travels
+		//           straight down), 0 is on the horizon, negative is below it. Clamped to [-90, 90].
+		//   AZIM -- degrees around the horizon, measured FROM THE +Z AXIS and turning TOWARD +X.
+		//           So 0 = the sun is on +Z, 90 = on +X, 180 = on -Z, 270 = on -X. Wraps freely;
+		//           360 and -0.0 are the same place.
+		//
+		//   sun_dir = { cos(ELEV)*sin(AZIM), sin(ELEV), cos(ELEV)*cos(AZIM) }, and the value handed
+		//   to Remix is its negation, because remixapi_LightInfoDistantEXT::direction is the
+		//   direction the light travels, not the direction it comes from.
+		//
+		// Both default to the numbers derived above, so an install that sets neither renders exactly
+		// as it did before this existed -- and when both are at their defaults the shipped literal
+		// vector is used directly rather than reconstructed, so it is bit-exact and not
+		// almost-exact. (Reconstructing 59.365/223.409 lands within 3e-6 per component, which is
+		// invisible, but "invisible" is not the promise being made here.)
+		constexpr float s_key_shipped_direction[3] = {0.35f, -0.86f, 0.37f};
+
+		// SOCOM Winterblade's authored key, for reference: elevation 30.2, azimuth 119.1.
+		constexpr float s_key_winterblade_direction[3] = {-0.9f, -0.6f, 0.5f};
+
+		constexpr float s_key_elevation_default = 59.365f;
+		constexpr float s_key_azimuth_default = 223.409f;
+
+		float key_elevation_degrees()
+		{
+			return std::clamp(
+				env_float_signed(L"PCSX2_REMIX_KEYELEV", s_key_elevation_default), -90.f, 90.f);
+		}
+
+		float key_azimuth_degrees()
+		{
+			return env_float_signed(L"PCSX2_REMIX_KEYAZIM", s_key_azimuth_default);
+		}
+
+		// Elevation/azimuth -> the direction the light travels. See the block above for the
+		// convention and for why the sign is flipped.
+		void key_direction_from_angles(float elevation_deg, float azimuth_deg, float (&out)[3])
+		{
+			constexpr float to_radians = 3.14159265358979323846f / 180.f;
+
+			const float elevation = elevation_deg * to_radians;
+			const float azimuth = azimuth_deg * to_radians;
+			const float cos_elevation = std::cos(elevation);
+
+			out[0] = -(cos_elevation * std::sin(azimuth));
+			out[1] = -std::sin(elevation);
+			out[2] = -(cos_elevation * std::cos(azimuth));
 		}
 
 		// The world-space (or view-space, whichever is being submitted) bounding box of the
@@ -1442,17 +1770,185 @@ namespace RemixSubmit
 			}
 		}
 
-		// The distance-independent fill. Created once, never moved, never rescaled: a dome and a
-		// distant light have no position and no falloff, so there is nothing about them that
-		// depends on the scene's size or on where the camera is.
-		void place_fill_lights()
+		// Everything that decides what the two fill lights ARE. Anything in here changing means the
+		// lights have to be destroyed and rebuilt, because the Remix API has no "modify a light":
+		// remixapi_LightInfo is consumed by CreateLight and the handle is immutable thereafter.
+		struct fill_light_params
 		{
+			bool key_wanted = false;
+			bool dome_wanted = false;
+			bool winterblade = false;
+			float key_radiance[3] = {0.f, 0.f, 0.f};
+			float key_angle = 0.f;
+			float key_direction[3] = {0.f, 0.f, 0.f};
+			float key_elevation = 0.f;
+			float key_azimuth = 0.f;
+			float dome_radiance[3] = {0.f, 0.f, 0.f};
+
+			bool operator==(const fill_light_params& o) const
+			{
+				return key_wanted == o.key_wanted && dome_wanted == o.dome_wanted &&
+					   winterblade == o.winterblade && key_radiance[0] == o.key_radiance[0] &&
+					   key_radiance[1] == o.key_radiance[1] && key_radiance[2] == o.key_radiance[2] &&
+					   key_angle == o.key_angle && key_direction[0] == o.key_direction[0] &&
+					   key_direction[1] == o.key_direction[1] && key_direction[2] == o.key_direction[2] &&
+					   key_elevation == o.key_elevation && key_azimuth == o.key_azimuth &&
+					   dome_radiance[0] == o.dome_radiance[0] && dome_radiance[1] == o.dome_radiance[1] &&
+					   dome_radiance[2] == o.dome_radiance[2];
+			}
+
+			bool operator!=(const fill_light_params& o) const { return !(*this == o); }
+		};
+
+		// What the lights that currently EXIST were built from. `resolved` is separate from the
+		// values because "no lights, because LIGHTMODE=0" is a legitimate resolved state that
+		// compares equal to the default-constructed struct, and the first pass must not mistake
+		// itself for a no-op.
+		fill_light_params s_fill_params{};
+		bool s_fill_params_resolved = false;
+
+		fill_light_params resolve_fill_light_params()
+		{
+			fill_light_params want{};
+
+			// Everything off. Returned as a normal parameter set rather than as an early exit from
+			// the caller, so that turning LIGHTMODE to 0 (or 2) while the game runs actually
+			// destroys the fill instead of leaving it burning -- which is what it did before, and
+			// is exactly how a bisect arm that "ran with the key light off" ran at full strength.
 			if (no_debug_scene() || light_mode() != 1)
+				return want;
+
+			want.winterblade = socom_winterblade_lighting();
+
+			const float ambient = ambient_radiance();
+			want.dome_wanted = (ambient > 0.f) || want.winterblade;
+			if (want.winterblade)
+			{
+				want.dome_radiance[0] = 0.0980392f;
+				want.dome_radiance[1] = 0.0980392f;
+				want.dome_radiance[2] = 0.1176471f;
+			}
+			else
+			{
+				want.dome_radiance[0] = want.dome_radiance[1] = want.dome_radiance[2] = ambient;
+			}
+
+			const float key = key_radiance();
+			want.key_wanted = key > 0.f;
+			want.key_angle = key_angle_degrees();
+			want.key_elevation = key_elevation_degrees();
+			want.key_azimuth = key_azimuth_degrees();
+
+			// At the defaults, the shipped literal is used rather than reconstructed from the
+			// angles, so "no knobs set" is bit-exact and not merely indistinguishable. Off the
+			// defaults the knobs win over the Winterblade authored direction too: asking for a
+			// specific sun and being given someone else's is the worse surprise.
+			float direction[3];
+			if (want.key_elevation == s_key_elevation_default && want.key_azimuth == s_key_azimuth_default)
+			{
+				const float* shipped =
+					want.winterblade ? s_key_winterblade_direction : s_key_shipped_direction;
+				direction[0] = shipped[0];
+				direction[1] = shipped[1];
+				direction[2] = shipped[2];
+			}
+			else
+			{
+				key_direction_from_angles(want.key_elevation, want.key_azimuth, direction);
+			}
+
+			// Normalised with the same expression the shipped code used, so the default path
+			// reproduces the same floats rather than merely the same angle. The angle path is
+			// already unit length to float precision; dividing it by ~1.0 costs nothing and keeps
+			// one code path.
+			const float direction_length = std::sqrt((direction[0] * direction[0]) +
+				(direction[1] * direction[1]) + (direction[2] * direction[2]));
+
+			if (!std::isfinite(direction_length) || direction_length < 1e-6f)
+			{
+				// Unreachable from either source above -- both produce unit-ish vectors -- but a
+				// zero-length direction handed to the runtime is not a failure mode worth finding
+				// out about on screen.
+				want.key_direction[0] = s_key_shipped_direction[0];
+				want.key_direction[1] = s_key_shipped_direction[1];
+				want.key_direction[2] = s_key_shipped_direction[2];
+			}
+			else
+			{
+				want.key_direction[0] = direction[0] / direction_length;
+				want.key_direction[1] = direction[1] / direction_length;
+				want.key_direction[2] = direction[2] / direction_length;
+			}
+
+			if (want.winterblade)
+			{
+				want.key_radiance[0] = key * 0.5647059f;
+				want.key_radiance[1] = key * 0.5529412f;
+				want.key_radiance[2] = key * 0.3960784f;
+			}
+			else
+			{
+				want.key_radiance[0] = want.key_radiance[1] = want.key_radiance[2] = key;
+			}
+
+			return want;
+		}
+
+		// The distance-independent fill: never moved, never rescaled -- a dome and a distant light
+		// have no position and no falloff, so nothing about them depends on the scene's size or on
+		// where the camera is -- but REBUILT whenever a knob behind them moves.
+		//
+		// THE REBUILD IS THE POINT, and this is what it fixes. This function used to create each
+		// light only `if (!s_dome_light)` / `if (!s_sun_light)`, i.e. exactly once, from
+		// create_debug_scene(). The run log puts that call at t=9.774 s ("renderer is live") and the
+		// per-game <SERIAL>.conf at t=10.008 s (refresh_game_config, which runs at the END of
+		// OnVSync). So every KEY, KEYANGLE, AMBIENT, LIGHTMODE -- and now KEYELEV/KEYAZIM -- value a
+		// conf ever delivered arrived 234 ms after the only light that would ever exist had already
+		// been built from the defaults. The knobs were not weak, they were UNREACHABLE. That is what
+		// invalidated the light bisect: an arm believed to be running with the key light off was
+		// running at 100.
+		//
+		// WHERE IT RUNS, and why that point is safe: the top of OnVSync, before decide_hold_window()
+		// and therefore before submit_camera(), batch_flush(), DrawLightInstance and Present. The
+		// only place either handle is ever submitted is the DrawLightInstance pair ~40 lines further
+		// down that same function, immediately before Present -- so at the moment this runs, the
+		// previous window's use of the handle has already been consumed by that Present (the two are
+		// in the same `if (!skip_present)` block and cannot separate), and this window has not
+		// referenced it yet. Nothing else in the frame touches a light handle: draws reference
+		// meshes and materials only. The handle created here is therefore the one this very window
+		// draws, so a knob takes effect in the frame that noticed it rather than the one after.
+		// The precedent is already in the file: place_debug_light() destroys and recreates its
+		// sphere from submit_camera(), which is LATER in the same window than this point, and does
+		// it on any frame the camera moved.
+		//
+		// GS thread only, like every other light call and every knob read in this file.
+		void refresh_fill_lights()
+		{
+			const fill_light_params want = resolve_fill_light_params();
+			if (s_fill_params_resolved && want == s_fill_params)
 				return;
 
 			const remixapi_Interface& api = s_remix.api();
 
-			if (!s_dome_light && ambient_radiance() > 0.f)
+			// Both are torn down whichever one moved. They are two lights, not two independent
+			// features, and a partial rebuild is how you end up with a dome from one conf and a key
+			// from another.
+			if (s_dome_light)
+			{
+				remix_ps2::guarded_destroy_light(api.DestroyLight, s_dome_light);
+				s_dome_light = nullptr;
+			}
+
+			if (s_sun_light)
+			{
+				remix_ps2::guarded_destroy_light(api.DestroyLight, s_sun_light);
+				s_sun_light = nullptr;
+			}
+
+			s_fill_params = want;
+			s_fill_params_resolved = true;
+
+			if (want.dome_wanted)
 			{
 				remixapi_LightInfoDomeEXT dome{};
 				dome.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DOME_EXT;
@@ -1460,12 +1956,11 @@ namespace RemixSubmit
 				dome.transform = s_identity_transform;
 				dome.colorTexture = nullptr; // flat radiance rather than an environment map
 
-				const float radiance = ambient_radiance();
 				remixapi_LightInfo light_info{};
 				light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 				light_info.pNext = &dome;
 				light_info.hash = 0x5;
-				light_info.radiance = {radiance, radiance, radiance};
+				light_info.radiance = {want.dome_radiance[0], want.dome_radiance[1], want.dome_radiance[2]};
 
 				const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_dome_light);
 				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_dome_light)
@@ -1475,25 +1970,20 @@ namespace RemixSubmit
 				}
 			}
 
-			if (!s_sun_light && key_radiance() > 0.f)
+			if (want.key_wanted)
 			{
-				// Fixed direction, deliberately off-axis on all three so no wall, floor or
-				// ceiling is lit flat-on and surface orientation stays readable.
-				const float direction[3] = {0.35f, -0.86f, 0.37f};
-
 				remixapi_LightInfoDistantEXT distant{};
 				distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
 				distant.pNext = nullptr;
-				distant.direction = {direction[0], direction[1], direction[2]};
-				distant.angularDiameterDegrees = key_angle_degrees();
+				distant.direction = {want.key_direction[0], want.key_direction[1], want.key_direction[2]};
+				distant.angularDiameterDegrees = want.key_angle;
 				distant.volumetricRadianceScale = 1.f;
 
-				const float radiance = key_radiance();
 				remixapi_LightInfo light_info{};
 				light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 				light_info.pNext = &distant;
 				light_info.hash = 0x6;
-				light_info.radiance = {radiance, radiance, radiance};
+				light_info.radiance = {want.key_radiance[0], want.key_radiance[1], want.key_radiance[2]};
 
 				const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_sun_light);
 				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_sun_light)
@@ -1501,17 +1991,31 @@ namespace RemixSubmit
 					ERROR_LOG("Remix: CreateLight failed for the key light ({})", remix_ps2::error_name(status));
 					s_sun_light = nullptr;
 				}
-				else
+				else if (want.winterblade)
 				{
-					s_sun_placed = true; // stop place_sun_light from replacing it
+					INFO_LOG("Remix: SOCOM Winterblade authored key light submitted.");
 				}
 			}
 
-			INFO_LOG("Remix: scene lighting -- distance-independent fill (key {:g} at {:g} deg, dome {:g}). "
-					 "No 1/d^2 falloff, so it is scale-free: the same numbers work at scene radius 4 and "
-					 "11,785. PCSX2_REMIX_KEY / KEYANGLE / AMBIENT tune it, LIGHTMODE=2 restores the "
-					 "camera-attached sphere.",
-				key_radiance(), key_angle_degrees(), ambient_radiance());
+			// Tracks whether the fill OWNS the handle, so a LIGHTMODE 1 -> 2 change hands
+			// place_sun_light() a clean slate instead of leaving it convinced a light it did not
+			// build is already placed.
+			s_sun_placed = (s_sun_light != nullptr);
+
+			// LOGGED ON EVERY CHANGE, never once at startup. A one-shot line here prints the
+			// pre-conf defaults and then lies for the rest of the session -- the same trap that cost
+			// a FRAMETRACE run today -- and this line is the user's only proof a conf value took.
+			// hold_empty_mode() logs on change for the identical reason.
+			INFO_LOG("Remix: scene lighting -- distance-independent fill (key {:g} at {:g} deg, "
+					 "elev {:g} deg, azim {:g} deg, dir {:.4f} {:.4f} {:.4f}, dome {:g}){}. "
+					 "No 1/d^2 falloff, so it is scale-free: the same numbers work at scene radius 4 "
+					 "and 11,785. PCSX2_REMIX_KEY / KEYANGLE / AMBIENT tune it, KEYELEV / KEYAZIM "
+					 "aim it (elevation above the horizon; azimuth from +Z toward +X), LIGHTMODE=2 "
+					 "restores the camera-attached sphere.",
+				want.key_wanted ? want.key_radiance[0] : 0.f, want.key_angle, want.key_elevation,
+				want.key_azimuth, want.key_direction[0], want.key_direction[1], want.key_direction[2],
+				want.dome_wanted ? want.dome_radiance[0] : 0.f,
+				(want.key_wanted || want.dome_wanted) ? "" : " -- no fill lights exist");
 		}
 
 		bool create_debug_scene()
@@ -1521,7 +2025,11 @@ namespace RemixSubmit
 			// Scene lighting. The default is the fill above; mode 2 is the old camera-attached
 			// sphere light, straight from the official remixapi_example_c.c, whose scene radius
 			// is a placeholder until the first frame measures one.
-			place_fill_lights();
+			//
+			// This first pass necessarily runs on the pre-conf defaults -- it is t=9.774 s and the
+			// conf lands at t=10.008 s -- which is precisely why OnVSync calls the same function
+			// every window and rebuilds when the resolved parameters move.
+			refresh_fill_lights();
 
 			if (light_mode() == 2)
 			{
@@ -1539,7 +2047,18 @@ namespace RemixSubmit
 			// no-op. That mattered far more than it looks: a no-op renderer submits nothing, and
 			// an arm that submits nothing survives 20/20 for reasons that have nothing to do with
 			// what it was testing. See the "arms that survive by not rendering" note in notes.md.
-			const bool lights_requested = !no_debug_scene() && light_mode() != 0;
+			//
+			// THIRD correction, and it is the same shape as the first two: LIGHTMODE=0 is no longer
+			// the only way to ask for no lights. `PCSX2_REMIX_KEY = 0` now genuinely means off --
+			// it used to be swallowed by env_float()'s "<= 0 means unset" rule and silently re-read
+			// as 100 -- so mode 1 with KEY=0 and AMBIENT=0 is a deliberate, reachable request for
+			// an empty fill, and answering it by degrading the whole renderer to a no-op would
+			// reproduce exactly the failure this comment already warns about. The resolved fill is
+			// therefore what decides whether a light was asked for; refresh_fill_lights() above has
+			// just run, so s_fill_params describes this frame.
+			const bool fill_wanted_a_light = s_fill_params.key_wanted || s_fill_params.dome_wanted;
+			const bool lights_requested = !no_debug_scene() && light_mode() != 0 &&
+										  (light_mode() != 1 || fill_wanted_a_light);
 			if (lights_requested && !s_debug_light && !s_dome_light && !s_sun_light)
 				return false;
 
@@ -1778,14 +2297,20 @@ namespace RemixSubmit
 
 		bool s_logged_view_model_camera = false;
 
-		void submit_camera()
+		// `cam` is the frame-latched s_active_camera on every ordinary window. On a HELD window under
+		// PCSX2_REMIX_HOLDEMPTY = 2 it is instead the PREVIOUS window's camera, so that the repeated
+		// geometry is repeated from the eye it was built for -- a true duplicate frame rather than a
+		// new viewpoint onto stale geometry. Passed rather than read from the global so there is
+		// exactly one SetupCamera per present and no ordering question against DrawInstance; see
+		// hold_empty_mode() for the measurement that made this necessary.
+		void submit_camera(const world_camera& cam)
 		{
 			// The extent the previous frame actually submitted, in whichever space is in use.
 			// Both tiers get the same treatment: view-space positions are in guest eye-depth
 			// units, which are just as far from "near 0.1" as world-space ones are.
 			const float scene_radius = s_last_bounds.radius();
 
-			if (!s_active_camera.valid)
+			if (!cam.valid)
 			{
 				submit_fallback_camera();
 				++s_stats.cam_fallback;
@@ -1812,8 +2337,8 @@ namespace RemixSubmit
 			// Straight copies: remixapi_CameraInfo's matrices are row-vector, the same
 			// convention as everything in RemixTransforms. remixapi_Transform is the one
 			// exception and is not involved here.
-			remix_ps2::to_camera_matrix(s_active_camera.view, camera_info.view);
-			remix_ps2::to_camera_matrix(s_active_camera.projection, camera_info.projection);
+			remix_ps2::to_camera_matrix(cam.view, camera_info.view);
+			remix_ps2::to_camera_matrix(cam.projection, camera_info.projection);
 
 			setup_camera_checked(&camera_info, "world", s_logged_camera_fail_world);
 			++s_stats.cam_world;
@@ -1870,12 +2395,12 @@ namespace RemixSubmit
 				// The sphere light rides the camera, as in RPCS3: a world-space scene lit from
 				// wherever the origin happens to be is usually a black scene. This is also what
 				// blows out the first-person weapon, which is why it is no longer the default.
-				place_debug_light(s_active_camera.position, scene_radius);
+				place_debug_light(cam.position, scene_radius);
 
 				// Camera forward in world space. p_view = p_world * V (row-vector), so the
 				// gradient of view z with respect to world position is V's third column.
 				const float forward[3] = {
-					s_active_camera.view.m[0][2], s_active_camera.view.m[1][2], s_active_camera.view.m[2][2]};
+					cam.view.m[0][2], cam.view.m[1][2], cam.view.m[2][2]};
 				place_sun_light(forward);
 			}
 		}
@@ -1889,12 +2414,2417 @@ namespace RemixSubmit
 			}
 		}
 
+		// --- camera hypothesis enumeration ---------------------------------------------------
+		//
+		// One candidate matrix, one majorness, and every post-divide output space the matrix might
+		// be emitting into. Lifted OUT of resolve_world_camera 2026-08-15 so the per-draw solver
+		// below runs literally the same enumeration rather than a second copy of it that can drift:
+		// the derived-offset derivation is the subtle part, and a per-draw camera solved through a
+		// slightly different hypothesis set would place its draws in a slightly different world
+		// than the frame camera places the rest -- which is the disease, not the cure.
+		//
+		// Order is load-bearing: the four fixed hypotheses first, then the derived ones, because
+		// every caller ranks with a strict `>` and therefore keeps the FIRST hypothesis that
+		// achieves the best score.
+		struct camera_hypothesis
+		{
+			const char* name;
+			float scale_x;
+			float offset_x;
+			float scale_y;
+			float offset_y;
+
+			// --- the depth/w half, added 2026-08-16 -------------------------------------------
+			// Applied BEFORE the x/y normalisation above (apply_camera_hypothesis composes them
+			// in that order, and every call site goes through it). Both default to the identity,
+			// so a hypothesis written with the old five-field initialiser is unchanged.
+			float scale_w = 1.f; // divides all sixteen terms; see normalize_clip_depth
+			bool swap_zw = false; // exchanges columns 2 and 3 before anything else
+		};
+
+		// Four fixed, plus at most three derived.
+		constexpr u32 hypothesis_slots = 7;
+
+		// Two depth families at most, never more (see build_camera_hypotheses).
+		inline constexpr u32 max_camera_hypotheses = 2 * hypothesis_slots;
+
+		// One name per (depth family, slot). The name IS part of the CAMTEST identity --
+		// camtest_identity folds the string in -- so these must be distinct per family and
+		// STABLE across runs. Family 0's entries are the exact literals that shipped, which is
+		// what makes PCSX2_REMIX_CAMDEPTH = 0 bit-identical to the behaviour before this
+		// existed, accumulated drift histories included.
+		constexpr const char* hypothesis_names[3][hypothesis_slots] = {
+			{"gs", "px", "ndc", "ndcY", "auto", "autoY", "r6"},
+			{"gs:w", "px:w", "ndc:w", "ndcY:w", "auto:w", "autoY:w", "r6:w"},
+			{"gs:zw", "px:zw", "ndc:zw", "ndcY:zw", "auto:zw", "autoY:zw", "r6:zw"},
+		};
+
+		// PCSX2_REMIX_CAMDEPTH -- the w-column half of the hypothesis set
+		//
+		// WHY THIS EXISTS, and it is a measurement rather than a hunch. CAMTEST's one candidate
+		// whose own rotation tracks the player's view is `src=slice-vf pc=0x2040 hyp=auto/C`
+		// (own-turn 19.70 deg against a 23 deg pair turn -- every other non-frozen row is a
+		// matrix that does not turn with the eye). It is reported INELIGIBLE, at dscale
+		// 7.232e-08. That number is not a screen-space problem and no existing hypothesis can
+		// move it: make_clip_solver reads columns {0, 1, 3}, normalize_screen_clip rewrites
+		// columns 0 and 1, and the recovered world's unit is set by column 3 -- exactly the
+		// column nothing touches. 1/7.232e-08 = 1.383e7, so this matrix's w column is ~1.4e7
+		// times longer than a rigid view transform's.
+		//
+		// WHAT IS AND IS NOT EXPECTED TO MOVE, written down before the run so it cannot be
+		// rationalised afterwards:
+		//   * dscale       -- fixed by construction. Family 1 divides the whole matrix by
+		//                     |column 3 xyz|, so the recovered w becomes eye-space depth in the
+		//                     guest's own units and dscale lands at ~1. The row becomes ELIGIBLE.
+		//   * alpha        -- a whole-matrix scale is a scale of the recovered world ABOUT THE
+		//                     RECOVERED EYE, and alpha is drift / (range x turn) with drift and
+		//                     range carrying the same scale. So alpha is GAUGE-INVARIANT under
+		//                     family 1 and should NOT move, with one real exception: the alpha
+		//                     accumulator skips a witness whose recovered range is under 1e-3,
+		//                     and at a world compressed 1.4e7x that gate is currently throwing
+		//                     away every witness closer than ~1.4e4 guest units. Correcting the
+		//                     scale re-admits them, so alpha can move because the SAMPLE moved.
+		//                     If it lands near 0, the scale was the obstacle. If it stays at
+		//                     ~1.48 over a visibly larger witness count, it was not, and the
+		//                     answer is that this matrix is camera-attached but is not the
+		//                     view-projection.
+		//   * family 2     -- the z/w SWAP is the one addition here that is not a gauge change.
+		//                     It asserts the guest divided by the column this code calls depth,
+		//                     which is the reading under which a column 3 of magnitude 1.4e7 (a
+		//                     24-bit-ish depth row: 2^24 = 1.678e7) makes sense in the first
+		//                     place. It feeds a different third equation to make_clip_solver and
+		//                     therefore recovers a genuinely different world, so it CAN move
+		//                     alpha on its own merits.
+		//
+		//   0 = OFF, THE DEFAULT. The family is the seven that shipped, under the seven names
+		//       that shipped. Nothing enumerated, nothing renamed, table size unchanged.
+		//   1 = the seven, PLUS the same seven with the whole matrix divided by |column 3 xyz|
+		//       (names suffixed ":w"). Both are present so the gauge claim above is demonstrated
+		//       by the table rather than asserted by this comment.
+		//   2 = the seven, PLUS the seven z/w-SWAPPED-and-normalised ones (":zw").
+		//   3 = the ":w" seven plus the ":zw" seven, with no baseline -- a clean table once 1
+		//       and 2 have each been read.
+		//
+		// THIS CAN CHANGE THE PICTURE at any non-zero setting, and the mechanism is named rather
+		// than hedged: the added hypotheses go through the SAME election loop as the originals,
+		// so one of them can out-score the incumbent and be installed. A ":w" winner scales the
+		// recovered world by ~1.4e7 about the eye, which moves scene radius, every injected
+		// light's placement and the depth-scale gate's verdict. A ":zw" winner recovers a
+		// different world outright. Do not describe any setting of this knob as invisible.
+		//
+		// Read LIVE, once per camera resolve, and NOT through live_int -- see env_int_live.
+		int camdepth_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMDEPTH", 0), 0, 3);
+		}
+
+		// PCSX2_REMIX_CAMDEPTHSNAP -- snap the derived divisor to the nearest power of two when
+		// it is within 2% of one.
+		//
+		// DEFAULT 0, i.e. do not snap, and that is a judgement about this title's numbers rather
+		// than caution. The leading guess was a 24-bit GS depth convention, 2^-24 = 5.96e-08
+		// against a measured 7.232e-08. But the measured divisor is 1.383e7 = 0.824 x 2^24 =
+		// 1.648 x 2^23, which is not a power of two and not within snapping distance of one, so
+		// snapping would REINTRODUCE a 21% scale error that the derived factor does not have.
+		// The knob exists because a title whose divisor really is 2^24 to within float noise is
+		// worth pinning exactly, and because the claim "it is not a power of two" should be
+		// falsifiable by the same instrument that made it.
+		int camdepth_snap()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMDEPTHSNAP", 0), 0, 1);
+		}
+
+		// The mode in force for the window being resolved, refreshed once per resolve by
+		// resolve_world_camera and read by the per-draw solver. The per-draw path must NOT read
+		// the environment (this title submits ~830 draws a window) and must NOT disagree with the
+		// frame camera about what space the guest emits into -- a draw placed through a different
+		// hypothesis set than the rest of the frame is the disease, not the cure.
+		int s_camdepth_active = 0;
+		int s_camdepth_snap_active = 0;
+		int s_camdepth_logged_mode = -1;
+
+		// PCSX2_REMIX_CAMSCALE, cached the same way and for a second reason.
+		//
+		// It was `static const float value = env_float(...)`, i.e. LATCHED AT FIRST USE -- and the
+		// renderer's first use happens ~0.2 s before the per-game .conf is applied, so a CAMSCALE
+		// line in the .conf has never once taken effect. That is the exact trap that has cost four
+		// separate measurements on this project, sitting on the one gate that decides whether the
+		// candidate this whole change is aimed at is reported ELIGIBLE. Widening the gate to look
+		// at it would have been a silent no-op.
+		//
+		// It cannot be read per call: camera_scale_limit() is called once per scored triple (up to
+		// 2604 a window) and once per draw from the per-draw solver. So it is refreshed once per
+		// resolve, beside s_camdepth_active, and every call site reads the cached float.
+		//
+		// SAY WHAT THIS CHANGES: nothing today, because no .conf on this title sets CAMSCALE. From
+		// now on, adding that line will actually move the gate -- and the gate decides which
+		// cameras are accepted, so it can change the picture. That is the knob working as it is
+		// documented to, not a new behaviour, but it is a difference from what shipped.
+		float s_camera_scale_limit = 8.f;
+
+		// The seven screen-space hypotheses, built against whatever matrix will actually be
+		// normalised -- which under a z/w swap is the SWAPPED matrix, because the derived
+		// offsets below read its column 3. `variant` selects only the naming.
+		u32 build_screen_hypotheses(const remix_ps2::mat4& oriented, const viewport_constants& vp,
+			float reference_aspect, bool column_major, u8 source, u64 ucode_hash, u32 variant,
+			camera_hypothesis (&out)[hypothesis_slots])
+		{
+			const char* const* const names = hypothesis_names[std::min(variant, 2u)];
+			const float width = static_cast<float>(vp.width);
+			const float height = static_cast<float>(vp.height);
+
+			u32 count = 0;
+
+			// The guest's post-divide output space is not knowable in advance: the fused
+			// matrix may already carry the full 12.4 viewport fold, or emit pixels, or emit
+			// plain NDC and leave the viewport to a post-divide multiply-add in the VU. Try
+			// each, both majorness ways round, and let score_perspective decide. That is a
+			// handful of 4x4 inversions per frame.
+			//
+			// The slot index is fixed per hypothesis KIND, not derived from `count`, so the name
+			// table above stays aligned no matter which entries a given matrix qualifies for --
+			// and so the name lookup is never sequenced against `count++`, which is unspecified.
+			//
+			// GS 12.4 subpixels: the exact inverse of the per-vertex un-projection.
+			out[count++] = {names[0], width * 8.f, vp.ofx + (width * 8.f) - 8.f + 0.05f,
+				-(height * 8.f), vp.ofy + (height * 8.f) - 8.f + 0.05f};
+			// Pixels, origin top-left. XYOFFSET cancels: it is added after this stage.
+			out[count++] = {names[1], width * 0.5f, (width * 0.5f) - 0.5f, -(height * 0.5f), (height * 0.5f) - 0.5f};
+			// Already NDC, +Y up like Remix.
+			out[count++] = {names[2], 1.f, 0.f, 1.f, 0.f};
+			// Already NDC, +Y down like the GS.
+			out[count++] = {names[3], 1.f, 0.f, -1.f, 0.f};
+
+			// The four fixed hypotheses above assume the guest's post-divide space is
+			// one of the obvious ones. Rainbow Six 3's is not: it emits a [0,1]-style
+			// normalised space and keeps the aspect correction in a separate
+			// post-divide scale vector, so its offsets are 0.5 and nothing in the
+			// table matches.
+			//
+			// The offsets do not have to be guessed. For a fused matrix the viewport
+			// offset is *determined*: u = col0 - ox*col3 must be the view rotation's
+			// column 0 times a scalar, and that is only orthogonal to col3 for
+			// ox = dot(col0, col3) / |col3|^2. Same for oy. Any output range of the
+			// form NDC[-1,1] -> [0, R] additionally has scale == offset, which is
+			// what fixes sx.
+			//
+			// sy is then the one genuinely free parameter, and it is chosen so the
+			// recovered aspect equals the display's. Be clear about what that costs:
+			// score_perspective's aspect test is constructed rather than measured for
+			// these two hypotheses, so it no longer discriminates. Its fovY window
+			// still does, and the split itself -- which is what actually decides
+			// whether the matrix is a camera -- is untouched.
+			const float c3[3] = {oriented.m[0][3], oriented.m[1][3], oriented.m[2][3]};
+			const float len_sq = (c3[0] * c3[0]) + (c3[1] * c3[1]) + (c3[2] * c3[2]);
+
+			if (len_sq > 1e-8f && std::isfinite(len_sq))
+			{
+				const float c0[3] = {oriented.m[0][0], oriented.m[1][0], oriented.m[2][0]};
+				const float c1[3] = {oriented.m[0][1], oriented.m[1][1], oriented.m[2][1]};
+
+				const float ox = ((c0[0] * c3[0]) + (c0[1] * c3[1]) + (c0[2] * c3[2])) / len_sq;
+				const float oy = ((c1[0] * c3[0]) + (c1[1] * c3[1]) + (c1[2] * c3[2])) / len_sq;
+
+				const float u[3] = {c0[0] - (ox * c3[0]), c0[1] - (ox * c3[1]), c0[2] - (ox * c3[2])};
+				const float v[3] = {c1[0] - (oy * c3[0]), c1[1] - (oy * c3[1]), c1[2] - (oy * c3[2])};
+
+				const float len_u = std::sqrt((u[0] * u[0]) + (u[1] * u[1]) + (u[2] * u[2]));
+				const float len_v = std::sqrt((v[0] * v[0]) + (v[1] * v[1]) + (v[2] * v[2]));
+
+				if (len_u > 1e-6f && len_v > 1e-6f && std::abs(ox) > 1e-6f && std::abs(oy) > 1e-6f)
+				{
+					const float sy_mag = std::abs(oy) * (len_v / len_u) / reference_aspect;
+
+					out[count++] = {names[4], ox, ox, -sy_mag, oy};
+					out[count++] = {names[5], ox, ox, sy_mag, oy};
+
+					// Rainbow Six 3 keeps its 4:3-to-display aspect correction outside this
+					// VU1 clip matrix. vi06 selects the matrix address dynamically, so the
+					// offset is not stable across loading and gameplay; use its exact ucode.
+					if (!column_major && (source == 1 || source == 3) &&
+						ucode_hash == 0x86d066e65a57ece2ULL)
+						out[count++] = {names[6], reference_aspect, ox, -1.f, oy};
+				}
+			}
+
+			return count;
+		}
+
+		// The full family: up to two depth treatments of the seven screen hypotheses above.
+		//
+		// ORDER IS STILL LOAD-BEARING for exactly the reason recorded above -- every caller ranks
+		// with a strict `>` and therefore keeps the FIRST hypothesis achieving the best score --
+		// so the baseline family, when present, is emitted first and the depth-corrected family
+		// after it. At PCSX2_REMIX_CAMDEPTH = 0 the emitted list is byte-for-byte what it was
+		// before this parameter existed.
+		u32 build_camera_hypotheses(const remix_ps2::mat4& oriented, const viewport_constants& vp,
+			float reference_aspect, bool column_major, u8 source, u64 ucode_hash, int depth_mode,
+			int snap_mode, camera_hypothesis (&out)[max_camera_hypotheses])
+		{
+			const int mode = std::clamp(depth_mode, 0, 3);
+			u32 count = 0;
+
+			// Family 0: the columns exactly as published. Present at modes 0, 1 and 2.
+			if (mode != 3)
+			{
+				camera_hypothesis base[hypothesis_slots];
+				const u32 n = build_screen_hypotheses(oriented, vp, reference_aspect, column_major,
+					source, ucode_hash, 0, base);
+
+				for (u32 i = 0; i < n; ++i)
+					out[count++] = base[i];
+			}
+
+			if (mode == 0)
+				return count;
+
+			// Family 1 (":w"), at modes 1 and 3: same columns, whole matrix divided by the
+			// MEASURED |column 3 xyz| so the recovered w is eye-space depth in guest units.
+			// Derived, not enumerated, and deliberately: the quantity is directly measurable from
+			// the matrix in front of us, an enumerated 2^24 would leave whatever residual the
+			// title's real convention has (0.824x on this one), and a derived factor needs no new
+			// table entry the next time a title emits w in some third unit.
+			//
+			// Family 2 (":zw"), at modes 2 and 3: columns 2 and 3 exchanged FIRST, then the same
+			// derived normalisation of the new column 3. The swap has to precede the screen
+			// hypotheses, not follow them, because the derived ox/oy read column 3.
+			const bool want_plain_scaled = (mode == 1) || (mode == 3);
+			const bool want_swapped = (mode == 2) || (mode == 3);
+			const float snap_tolerance = (snap_mode > 0) ? 0.02f : 0.f;
+
+			const auto emit = [&](bool swap, u32 variant) {
+				const remix_ps2::mat4 swapped =
+					swap ? remix_ps2::normalize_clip_depth(oriented, 1.f, true) : oriented;
+
+				const float measured = remix_ps2::clip_w_scale(swapped);
+				const float divisor = (snap_tolerance > 0.f)
+										  ? remix_ps2::snap_power_of_two(measured, snap_tolerance)
+										  : measured;
+
+				if (!std::isfinite(divisor) || !(divisor > 0.f))
+					return;
+
+				const remix_ps2::mat4 corrected = remix_ps2::normalize_clip_depth(swapped, divisor, false);
+
+				camera_hypothesis base[hypothesis_slots];
+				const u32 n = build_screen_hypotheses(corrected, vp, reference_aspect, column_major,
+					source, ucode_hash, variant, base);
+
+				for (u32 i = 0; i < n && count < max_camera_hypotheses; ++i)
+				{
+					out[count] = base[i];
+					out[count].scale_w = divisor;
+					out[count].swap_zw = swap;
+					++count;
+				}
+			};
+
+			if (want_plain_scaled)
+				emit(false, 1);
+
+			if (want_swapped)
+				emit(true, 2);
+
+			return count;
+		}
+
+		// The one place a hypothesis is turned into a matrix. Three call sites compose these two
+		// normalisations -- the frame election, the per-draw solver and the CAMTESTALL probe
+		// sweep -- and the file's own note on build_camera_hypotheses says why they must not each
+		// keep their own copy: a per-draw camera solved through a slightly different hypothesis
+		// set places its draws in a slightly different world than the frame camera places the
+		// rest. The depth correction runs FIRST; normalize_screen_clip's offsets are expressed
+		// against the column 3 that normalize_clip_depth has already settled.
+		remix_ps2::mat4 apply_camera_hypothesis(const remix_ps2::mat4& oriented, const camera_hypothesis& hyp)
+		{
+			return remix_ps2::normalize_screen_clip(
+				remix_ps2::normalize_clip_depth(oriented, hyp.scale_w, hyp.swap_zw),
+				hyp.scale_x, hyp.offset_x, hyp.scale_y, hyp.offset_y);
+		}
+
+		// -----------------------------------------------------------------------------------------
+		// PCSX2_REMIX_CAMTEST -- the falsification test the camera election has never had
+		// -----------------------------------------------------------------------------------------
+		//
+		// WHAT IS UNTESTED, stated precisely because no counter in this file shows it.
+		// try_split_once DEFINES the projection as viewToWorld * fused (RemixTransforms.cpp:184) and
+		// the view as that matrix's inverse (:180). So view * projection == fused identically and the
+		// l1_error it reports (:191) is STRUCTURALLY ZERO -- it measures nothing. Geometry is then
+		// un-projected through the same fused matrix (solve_world_position in OnDrawPrims). World ->
+		// NDC therefore round-trips exactly for ANY invertible matrix, which means a correct picture
+		// is zero evidence that the elected matrix is the camera. score_perspective only asks whether
+		// the recovered projection is SHAPED like a projection. Nothing on any path has ever tested an
+		// elected matrix against the geometry it un-projects.
+		//
+		// THE ONE THING THAT MUST BE TRUE: static world geometry has a STABLE RECOVERED WORLD
+		// POSITION while the camera moves. That is what this measures, for EVERY candidate rather
+		// than only the elected one -- the useful output is "candidate X drifts 4 units, the elected
+		// candidate drifts 900".
+		//
+		// WHY IT IS IMMUNE TO THE CLIPPING CONFOUND, which wrecked the centroid test, the AABB-extent
+		// test and the bearing test in turn. The PS2 clips geometry to its frustum, so a partly
+		// visible object presents a DIFFERENT vertex set frame to frame and every positional summary
+		// of it moves for a reason that has nothing to do with the camera. Two independent defences,
+		// both required:
+		//   1. The witness key is (material content hash, vertex count, index count). It has NO
+		//      positional term, so the quantity being measured cannot move the key, and a draw whose
+		//      set changed simply fails to pair instead of being compared. The material content hash
+		//      comes from guest TEX0/TEXA/CLUT state and is untouched by any camera.
+		//   2. The draw's screen-space bounding box must lie STRICTLY INSIDE the viewport, touching
+		//      no edge, so the geometry provably was not clipped. Same px/rt values the per-draw dump
+		//      prints, from the same locals.
+		//
+		// WHAT IT IS BLIND TO, said plainly so a zero is not over-read: an error that is CONSTANT IN
+		// WORLD SPACE. If the recovered world is a fixed rotation or offset of the true one, every
+		// static point holds still and the drift is zero -- which is the right answer, because a
+		// global gauge is unobservable and harmless to lighting. What it does see is a CAMERA-ATTACHED
+		// error (the world riding the view, or mirrored about a plane that turns with it), and that is
+		// exactly the reported symptom: a parked vehicle's shadow swinging under a fixed light.
+		//
+		// It also survives the pipeline's known one-frame camera staleness. Un-projecting window k
+		// with the matrix of window k-1 rotates the recovered world by one window of camera motion;
+		// doing the same to window k+1 rotates it by ~the same amount, so the DIFFERENCE is second
+		// order in the camera's motion while a camera-attached error is first order in it.
+
+		// PCSX2_REMIX_CAMTEST
+		//   0 = OFF, the default. Nothing in this file behaves differently and nothing is sampled.
+		//   1 = AUDIT ONLY. No behaviour change of any kind; logs a ranked drift table per round.
+		//   2 = ELECT BY DRIFT. resolve_world_camera picks the lowest-drift candidate instead of the
+		//       highest shape score, and falls back to the shape election when no candidate has
+		//       enough evidence. This CAN change the picture -- see camtest_rank_base.
+		//
+		// READ LIVE ON EVERY CALL, never latched and deliberately not through live_int. Two separate
+		// caching bugs were paid for on this project: a `static const` caches the pre-conf value
+		// forever (the renderer goes live at t = 9.774 s, the per-game .conf applies at t = 10.008 s),
+		// and live_int/live_float only re-parse when paths::knob_generation() moves, which the
+		// per-game .conf never bumps because it calls SetEnvironmentVariableW directly. Called once
+		// per presented window, never per draw -- the draw path reads the cached s_camtest_active.
+		int camtest_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMTEST", 0), 0, 2);
+		}
+
+		// PCSX2_REMIX_CAMTESTALL -- score EVERY sliced matrix, not just the shape-filter survivors
+		//
+		// WHY. The drift test above scores only triples that already cleared
+		// split_view_projection_direct AND score_perspective, and those two filters decide what
+		// "looks like a camera" by SHAPE. On SOCOM: Combined Assault they reject 47,838 triples
+		// (39,403 of them at `notpersp`) and CAMTEST is left with TWO rows -- the same matrix under
+		// two hypotheses, alpha 1.7-3.0, nothing anywhere near 0. A shape filter cannot be the
+		// arbiter of a question the drift test answers directly: whether the matrix makes static
+		// geometry hold still. So let the measurement do the electing.
+		//
+		//   0 = OFF, the default. The table is exactly what it is today.
+		//   1 = score every published candidate x majorness x hypothesis whose clip solver inverts,
+		//       whether or not it splits and whether or not it scores as a perspective.
+		//   2 = as 1, plus the 61 sliding 4-qword windows of the VU1 transform probe (the 64-qword
+		//       neighbourhood RemixVU1Capture snapshots around the back-sliced object MVP). This is
+		//       the "the true VP is at an address the slicer never reads" hypothesis, measured.
+		//
+		// WHAT IT CANNOT DO, stated because a "structurally invisible" claim was wrong once on this
+		// project and will not be repeated loosely:
+		//   * A matrix that fails the split has no vp_split to install, and the election loop's
+		//     `continue` on split failure is upstream of every rank computation. So no matrix this
+		//     mode adds can ever become the camera, under any CAMTEST mode. That is a control-flow
+		//     fact, not an argument about matrix algebra.
+		//   * Under CAMTEST = 1 nothing but the log changes.
+		//   * Under CAMTEST = 2 the ELECTION reads measured drift, and the enlarged candidate table
+		//     below changes which histories survive eviction. That CAN change the picture. It is
+		//     also true that CAMTEST = 2 is already a mode in which a measurement picks the camera.
+		//   * It costs GS-thread time on every window that pairs (see camtest_candidate_slots). It
+		//     changes no pixel, but it can change frame PACING, which changes how fast the eye turns
+		//     between two windows. Read the round header's "mean turn" before comparing runs.
+		//
+		// Read live for the same two reasons camtest_mode() is, and cached into
+		// s_camtest_all_active once per window because the resolve loop below runs per candidate.
+		int camtest_all_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTALL", 0), 0, 2);
+		}
+
+		// Qualifying windows to let pass before the test arms. Default 0 = arm immediately.
+		//
+		// Mirrors drawdump_after_frames()/frametrace_after_frames()/worldprobe_after_frames(), and
+		// for the reason recorded there: a diagnostic that arms on "the first frame that qualifies"
+		// measures the LOADING phase, which on this title is mission start. That mistake cost three
+		// separate measurements in one session. The symptom this test is aimed at is something the
+		// player sees while turning in-mission, so the measurement has to be delayed to in-mission.
+		u64 camtest_after_frames()
+		{
+			return static_cast<u64>(std::max(0, env_int_live(L"PCSX2_REMIX_CAMTESTAFTER", 0)));
+		}
+
+		// Witness draws followed at once. Wider than WORLDFIX's 16 because the strictly-inside-the-
+		// viewport rule is a hard filter -- most of a frame's draws touch an edge -- and a median is
+		// only worth taking over a handful of survivors.
+		//
+		// RAISED 32 -> 128, and this is a suspect in the silence rather than a comfort margin. The
+		// one session that ever produced a table reported 17-20 witnesses per pair against 32 slots.
+		// This title submits ~830 draws a window; the moment the number clearing the strictly-inside
+		// rule exceeds the slot count, the table cannot hold a window's own draws, let alone hold
+		// them into the NEXT window -- and pairing requires exactly that. A witness evicted before it
+		// draws again pairs with nothing, silently. 128 slots cost ~30 KB and remove the ceiling.
+		constexpr u32 camtest_witness_slots = 128;
+
+		// Clip samples kept per witness. Taken at a fixed stride over a vertex count the key has
+		// already pinned, so sample i is the same vertex in both windows of a pair.
+		constexpr u32 camtest_samples = 8;
+
+		// (candidate x majorness x hypothesis) identities tracked at once. An eviction resets a
+		// slot's history, and a table that thrashes measures nothing -- so this is sized from the
+		// worst case rather than from what today's filters happen to let through.
+		//
+		//   published candidates            32   (RemixVU1Capture::max_candidates)
+		//   x majorness                      2
+		//   x hypotheses                    14   (max_camera_hypotheses)
+		//                                = 896   triples per window under CAMTESTALL = 1
+		//   + probe windows                 61   (64-qword snapshot, 4-qword sliding window)
+		//     x 2 x 14                  = 1708   additional triples under CAMTESTALL = 2
+		//                                = 2604  worst case
+		//
+		// RAISED 2048 -> 8192 alongside PCSX2_REMIX_CAMDEPTH, and not merely to clear 2604. The
+		// last session's own heartbeat read "Candidates 2048 of 2048, 5721 evicted with history"
+		// -- the table was ALREADY full and thrashing at the old capacity, because the identity
+		// folds mem_offset and start_pc and the scan/slice sources churn both. Every one of those
+		// 5721 evictions reset a drift history, which is the measurement that is supposed to be
+		// judging the hypotheses. Doubling the family on top of a table that was already
+		// overflowing would have corrupted the very reading this change exists to take. 8192 is
+		// 3.1x the new worst case and 4x the old capacity, so the churn has somewhere to go.
+		//
+		// ~4 MB of zero-initialised BSS; pages are only touched by the slots actually used.
+		constexpr u32 camtest_candidate_slots = 8192;
+
+		// Per-pair medians retained per candidate; the reported score is the median of these, so one
+		// bad pair cannot decide a ranking.
+		constexpr u32 camtest_history = 64;
+
+		// Qualifying window pairs before the FIRST report. Was a flat 60, and 60 was too high a bar:
+		// four sessions produced one table between them, and three produced complete silence over
+		// hundreds of armed windows. A noisy early answer that sharpens is worth far more than
+		// nothing, and nothing is what 60 delivered.
+		//
+		// The per-candidate drift history is a 64-deep ring that is NEVER reset by a report, so
+		// every later table is computed over strictly more evidence than the one before it. The
+		// target therefore doubles after each report -- 8, 16, 32, 60, 60, ... -- which gives a
+		// first reading almost immediately and settles back to the original cadence.
+		//
+		// Read live, and NOT through live_int: see env_int_live's note.
+		u32 camtest_first_round_pairs()
+		{
+			return static_cast<u32>(std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTPAIRS", 8), 1, 600));
+		}
+
+		constexpr u32 camtest_round_pairs_max = 60;
+
+		// PCSX2_REMIX_CAMTESTROWS -- how many ranked rows the table prints.
+		//
+		// WHY THIS IS NOT COSMETIC. The table is sorted by drift ASCENDING and printed top-down,
+		// and a FROZEN candidate has low drift for free -- that is the entire reason the FROZEN tag
+		// exists. So frozen rows monopolise the printed window and the rows worth reading are
+		// pushed below it. MEASURED on the 2026-08-16 10:19 session: 4,569 ranked rows, 32 printed,
+		// and the best non-frozen eligible row was at rank #238 and #281 on the two rounds. Every
+		// non-frozen slice-vf row was in the table and none of them was ever printed, which read
+		// from the outside as "source 7 publishes only frozen matrices".
+		//
+		// Default 32, i.e. exactly what the CAMTESTALL table printed before. Log-only: this cannot
+		// change what is measured, ranked or elected.
+		u32 camtest_row_limit()
+		{
+			return static_cast<u32>(std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTROWS", 32), 1, 512));
+		}
+
+		// PCSX2_REMIX_CAMTESTSRC -- print only rows from one source (see candidate_source_name).
+		//
+		// -1 (default) prints every source, which is today's behaviour. 7 prints only the
+		// register-resident slice-vf rows, 1 only the plain back-slice, and so on. The RANKING is
+		// untouched -- a filtered row keeps the rank number it holds in the full table, so "#238"
+		// still means 238th of 4,569 -- only which rows reach the log changes. Log-only.
+		int camtest_source_filter()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTSRC", -1), -1, 7);
+		}
+
+		// --- THE LEVER ARM -----------------------------------------------------------------------
+		//
+		// A pair is only informative if the eye actually TURNED, and alpha divides the measured
+		// drift by (range x turn in radians) -- so the turn is the denominator and a small one
+		// amplifies every source of noise in the numerator. The first round this instrument ever
+		// produced made that concrete:
+		//
+		//   the user turned a full 360 in ~30 s at FULL STICK  = 12 deg/s, the game's maximum
+		//   at 60 windows/s                                    = 0.2 deg per window
+		//   pairs were formed against the PREVIOUS window, 2-3 back (1 window in 3 draws nothing)
+		//                                                      = 0.4-0.6 deg of turn per pair
+		//   measured own-turn on the elected row               = 0.44 deg  <-- exact match
+		//
+		// 0.44 deg is 0.0077 rad. Every row came back with an alpha between 0.07 and 0.18 and the
+		// ranking was noise: matrices that had frozen entirely scored the lowest drift of all, for
+		// free. The instrument was correct and the signal was too small to read.
+		//
+		// THE USER CANNOT TURN FASTER. So the pair is no longer formed against the most recent
+		// window: an ANCHOR window is held and the current window is paired against it, letting the
+		// turn ACCUMULATE across the span. At 0.2 deg/window a 30-window anchor yields ~6 deg -- a
+		// 14x better lever arm for half a second of separation, which is far too short for real
+		// scene change to contaminate a witness whose vertex and index counts must match exactly.
+		//
+		// All three halves of the pair re-anchor on the SAME window or the measurement is
+		// incoherent: the witness clip samples (camtest_sample), the candidate solvers
+		// (camtest_roll) and the window's eye/forward. s_camtest_anchor_arm is the single flag.
+		//
+		// Windows an anchor may be held for. Bounded because a span is also a window in which the
+		// scene may genuinely change, and because an anchor held forever measures nothing.
+		u32 camtest_span_windows()
+		{
+			return static_cast<u32>(std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTSPAN", 30), 1, 600));
+		}
+
+		// Minimum ACCUMULATED turn, anchor to now, for a pair to count. In MILLI-DEGREES, because
+		// env_int_live parses integers.
+		//
+		// RAISED 0.25 -> 2.0 deg, and this is the whole point of the span. A pair with 0.4 deg of
+		// turn is measuring mostly noise no matter how many witnesses it has, so admitting it was
+		// never doing any good. 2.0 deg is 4.5x the 0.44 that failed, and at the default 30-window
+		// span it is reached in ~10 windows at full stick and ~20 at half stick -- so pairs still
+		// arrive at 2-4 per second rather than being rationed. The round line now reports the turn
+		// actually achieved, so this can be raised on evidence instead of guessed at.
+		float camtest_min_turn_degrees()
+		{
+			return 0.001f * static_cast<float>(std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTTURNMIN", 2000), 1, 90000));
+		}
+
+		// Upper bound: a camera CUT is not a turn, and averaging one in only adds noise.
+		//
+		// Left at 45 deg deliberately, now that the span makes it a real question. It is not close
+		// to binding: the span is bounded at 30 windows and the game's own maximum is 12 deg/s, so
+		// the most a legitimate pair can accumulate is 30/60 * 12 = 6 deg -- 7.5x of headroom. And
+		// a pair that does exceed it is no longer merely discarded: it re-anchors immediately, so
+		// an actual cut costs one anchor cycle instead of jamming the instrument until the span
+		// runs out. Raising it further would start admitting real cuts, which is the one thing it
+		// exists to exclude.
+		float camtest_max_turn_degrees()
+		{
+			return 0.001f * static_cast<float>(std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTTURNMAX", 45000), 1, 180000));
+		}
+
+		// Windows between heartbeats. THE INSTRUMENT'S FAILURE MODE WAS SILENCE, and its one hint
+		// ("the eye never turned by X between two windows that shared a witness") conflated two
+		// opposite causes that need opposite responses. 0 disables it.
+		u32 camtest_heartbeat_windows()
+		{
+			return static_cast<u32>(std::clamp(env_int_live(L"PCSX2_REMIX_CAMTESTHEARTBEAT", 120), 0, 100000));
+		}
+
+		// Mode 2 will not elect on less evidence than this.
+		constexpr u32 camtest_min_pairs = 8;
+		constexpr u32 camtest_min_witnesses = 3;
+
+		// Mode 2's rank for a candidate with a drift measurement is camtest_rank_base / (1 + drift),
+		// which is strictly decreasing in drift and always far above any shape score (the maximum
+		// score_perspective can return is 6, plus the +100 source bonus). So the rule is: any
+		// candidate with enough evidence outranks any candidate without, lowest drift wins among
+		// those that have it, and with no measurements at all the shape election stands unchanged.
+		constexpr float camtest_rank_base = 1e6f;
+
+		struct camtest_witness
+		{
+			u64 key = 0;
+			u64 frame = 0; // window this slot's `now` came from
+			u32 count = 0;
+			float now[camtest_samples][3] = {}; // clip (x, y, w) -- camera-independent guest output
+			u64 prev_frame = 0;
+			u32 prev_count = 0;
+			float prev[camtest_samples][3] = {};
+			bool prev_valid = false;
+
+			// Has this witness ever contributed to a pair? A slot that is evicted having never
+			// paired is an ORPHAN -- it drew once, was followed, and never came back. A high orphan
+			// count with a healthy turn is the signature of "witnesses do not survive", which is one
+			// of the two causes the old log could not distinguish from "the user did not turn".
+			bool ever_paired = false;
+		};
+
+		struct camtest_candidate
+		{
+			u64 key = 0;
+
+			// Identity, printed so a row can be matched to the candidate lines in the matrix dump.
+			u8 source = 0;
+			u32 mem_offset = 0;
+			u32 start_pc = 0;
+			u64 ucode_hash = 0;
+			const char* hypothesis = "";
+			bool column_major = false;
+			float fov_y = 0.f;
+
+			// The depth treatment the hypothesis carried (PCSX2_REMIX_CAMDEPTH). `w_divisor` is
+			// the factor the WHOLE matrix was divided by before the screen normalisation, i.e.
+			// the measured |column 3 xyz| -- 1 at the default. Printed beside depth_scale
+			// because the two answer different questions: depth_scale is what the recovered
+			// world's unit came out as AFTER the correction (which is what CAMSCALE judges),
+			// w_divisor is how big the correction had to be, and a divisor of 1.4e7 is itself
+			// the finding.
+			float w_divisor = 1.f;
+			bool swap_zw = false;
+
+			// Content hash of the RAW 16 floats, before any hypothesis was composed in. This is the
+			// degeneracy detector: if every row of the table shares one content hash, the whole
+			// ranked table is one matrix wearing several hats and no amount of re-ranking it will
+			// produce a camera. Reported as a distinct-count in the round header.
+			u64 content_hash = 0;
+
+			// This triple never cleared split_view_projection_direct + score_perspective, so it
+			// exists in the table only because CAMTESTALL put it there. Printed, because a low-drift
+			// row that cannot split is a different finding from a low-drift row that can.
+			bool raw_only = false;
+
+			// The window each solver un-projected, and the solver itself. Stamped at resolve time
+			// with s_frame_counter + 1, because a camera resolved at the bottom of window k is the
+			// one window k+1's draws are un-projected with.
+			u64 now_frame = 0;
+			u64 prev_frame = 0;
+			bool prev_valid = false;
+			remix_ps2::clip_solver now_solver{};
+			remix_ps2::clip_solver prev_solver{};
+			float now_eye[3] = {};
+			float prev_eye[3] = {};
+			float now_forward[3] = {};
+			float prev_forward[3] = {};
+
+			// |un-projected NDC centre at w = 1, minus the eye|. It is 1 for a camera whose recovered
+			// unit is the guest's own, which is what resolve's depth-scale gate already demands. The
+			// drift is divided by it so one camera emitted at two column scales ranks the same, and a
+			// candidate outside that gate's window is reported but is not electable.
+			float depth_scale = 0.f;
+			bool eligible = false;
+
+			float history[camtest_history] = {};
+			u32 history_count = 0;
+			u32 history_next = 0;
+			u64 pairs = 0;
+			u32 last_witnesses = 0;
+
+			// How many of those witnesses actually reached the ALPHA median. The accumulator
+			// skips any witness whose recovered range is under 1e-3, and that threshold is
+			// ABSOLUTE while the recovered space is not: at this title's dscale of 7.232e-08 a
+			// witness has to be ~1.4e4 guest units from the eye to clear it, so alpha may be
+			// being computed over the handful of most distant draws in the frame rather than
+			// over all of them. Printed beside `wit` because "alpha 1.477 over 40 witnesses" and
+			// "alpha 1.477 over 2" are not the same claim, and nothing said which it was.
+			u32 last_alpha_witnesses = 0;
+			float last_drift = 0.f;
+			float last_centroid_drift = 0.f;
+
+			// drift / (range from the eye x the eye's rotation in radians). Dimensionless, and its
+			// value under each hypothesis is known BEFORE any data exists: ~0 if this matrix is the
+			// camera, ~1 if the recovered world rides the eye, ~2 if it is mirrored about a
+			// camera-fixed plane. Those are WORLDFIX's three alphas, read off absolute recovered
+			// positions instead of bearings -- which is why eye translation does not have to be
+			// rejected here, and why the number is comparable between titles and world scales.
+			float last_alpha = 0.f;
+		};
+
+		// The constants that turn a guest vertex back into the clip triple the vertex loop
+		// un-projected. Passed rather than recomputed so the two can never disagree.
+		struct camtest_clip_map
+		{
+			float scale_x = 0.f;
+			float scale_y = 0.f;
+			float offset_x = 0.f;
+			float offset_y = 0.f;
+			double z_scale = 0.0;
+			double z_a = 0.0;
+			double z_b = 0.0;
+			bool screen_ui = false;
+			bool z_depth = false;
+		};
+
+		struct camtest_screen_box
+		{
+			float min_x = 0.f;
+			float max_x = 0.f;
+			float min_y = 0.f;
+			float max_y = 0.f;
+			int width = 0;
+			int height = 0;
+		};
+
+		camtest_witness s_camtest_witnesses[camtest_witness_slots];
+		camtest_candidate s_camtest_candidates[camtest_candidate_slots];
+
+		// The mode the DRAW path tests, refreshed from the environment once per presented window by
+		// camtest_evaluate(). The draw path must not read the environment itself: this title submits
+		// ~830 draws a window.
+		int s_camtest_active = 0;
+
+		// PCSX2_REMIX_CAMTESTALL, refreshed beside s_camtest_active and read by the resolve loop.
+		// Never read from the draw path -- CAMTESTALL changes nothing about how a draw is sampled.
+		int s_camtest_all_active = 0;
+		int s_camtest_all_logged_mode = -1;
+
+		// How many triples were actually handed to the drift test in the window that just ended,
+		// so the round header can answer "how many matrices per window got scored?" with a number
+		// instead of a capacity. Split three ways because the three populations answer different
+		// questions: `split` is what the shape filters would have allowed, `raw` is what they were
+		// rejecting, and `probe` is the neighbourhood the slicer never reads at all.
+		u32 s_camtest_noted_split = 0;
+		u32 s_camtest_noted_raw = 0;
+		u32 s_camtest_noted_probe = 0;
+
+		int s_camtest_logged_mode = -1;
+		bool s_camtest_started = false;
+		u64 s_camtest_skipped = 0;
+		u64 s_camtest_elected_key = 0;
+
+		// The ANCHOR: the older window every later window is paired against, held for up to
+		// camtest_span_windows() so the turn can accumulate into a usable lever arm. Named `prev`
+		// throughout for continuity with the fields it moves in lockstep with (witness.prev_*,
+		// candidate.prev_*), all of which are now anchor state rather than last-window state.
+		u64 s_camtest_prev_window = 0;
+		bool s_camtest_prev_valid = false;
+		float s_camtest_prev_eye[3] = {};
+		float s_camtest_prev_forward[3] = {};
+
+		// Up = the next window that carries geometry becomes the new anchor. Read by camtest_sample
+		// on the DRAW path (so witnesses capture during that window) and consumed by
+		// camtest_evaluate at the resolve that ends it (so the solvers and the eye capture with
+		// them). One flag for all three halves, because an anchor that is not simultaneous is not
+		// an anchor.
+		bool s_camtest_anchor_arm = true;
+		bool s_camtest_cycle_paired = false; // this anchor cycle has produced at least one pair
+		u64 s_camtest_anchor_cycles = 0;
+		u64 s_camtest_reanchor_harvest = 0; // cycles that ran their full span having produced pairs
+		u64 s_camtest_reanchor_span = 0; // re-anchored because the span ran out (turn too slow)
+		u64 s_camtest_reanchor_jump = 0; // re-anchored on an over-cap turn: a cut, not a turn
+
+		u32 s_camtest_inside_draws = 0; // draws this window that cleared the strictly-inside rule
+		u64 s_camtest_clipped_draws = 0; // draws rejected for touching a viewport edge
+		u64 s_camtest_pairs = 0;
+		u64 s_camtest_reject_turn = 0; // the eye did not turn enough for the pair to mean anything
+		u64 s_camtest_reject_jump = 0; // the eye "turned" further than any real turn: a cut or glitch
+		u64 s_camtest_witness_overflow = 0; // draws dropped: every witness slot already used this window
+		u64 s_camtest_orphans = 0; // witnesses evicted having never once paired
+		u64 s_camtest_evictions = 0; // candidate identities evicted WITH a drift history attached
+		u32 s_camtest_rounds_done = 0;
+
+		// ---- heartbeat ---------------------------------------------------------------------
+		// Everything here exists to answer ONE question that the old log could not: when no round
+		// fires, is it because the eye never turned, or because no witness ever survived into a
+		// second window? Those need opposite responses -- "turn more" versus "the sampler is
+		// broken" -- and they were reported by the same sentence.
+		u64 s_camtest_hb_window = 0; // window the last heartbeat was emitted at
+		u32 s_camtest_hb_windows = 0; // windows observed since then
+		double s_camtest_hb_inside_sum = 0.0;
+		u32 s_camtest_hb_inside_max = 0;
+		u32 s_camtest_hb_survivors_last = 0; // witnesses that paired into the most recent window
+		u32 s_camtest_hb_survivors_max = 0;
+		double s_camtest_hb_turn_sum = 0.0;
+		double s_camtest_hb_turn_max = 0.0; // THE number that separates the two causes
+		u32 s_camtest_hb_turn_count = 0;
+		u64 s_camtest_hb_pairs_at = 0;
+		u64 s_camtest_hb_noturn_at = 0;
+		u64 s_camtest_hb_jump_at = 0;
+		u64 s_camtest_hb_clipped_at = 0;
+		u64 s_camtest_hb_overflow_at = 0;
+		u64 s_camtest_hb_orphans_at = 0;
+
+		u32 s_camtest_round = 0;
+		double s_camtest_round_turn = 0.0;
+		double s_camtest_round_move = 0.0;
+		double s_camtest_round_witnesses = 0.0;
+		double s_camtest_round_inside = 0.0;
+		u32 s_camtest_round_witness_min = 0;
+		double s_camtest_round_scored = 0.0;
+		double s_camtest_round_scored_split = 0.0;
+		double s_camtest_round_scored_probe = 0.0;
+
+		// The lever arm actually achieved, reported on the round line and the heartbeat. Without it
+		// there is no way to tell a readable table from an unreadable one until the alphas are
+		// already nonsense.
+		double s_camtest_round_turn_min = 0.0;
+		double s_camtest_round_turn_max = 0.0;
+		double s_camtest_round_span = 0.0;
+		u32 s_camtest_round_span_max = 0;
+		double s_camtest_hb_pair_turn_sum = 0.0;
+		double s_camtest_hb_pair_turn_max = 0.0;
+		double s_camtest_hb_pair_span_sum = 0.0;
+		u32 s_camtest_hb_pair_count = 0;
+
+		float camtest_median(float* values, u32 count)
+		{
+			if (count == 0)
+				return 0.f;
+
+			std::sort(values, values + count);
+			return (count & 1u) ? values[count / 2]
+							    : (0.5f * (values[(count / 2) - 1] + values[count / 2]));
+		}
+
+		// One (candidate, majorness, hypothesis) triple -- i.e. exactly how a candidate would be
+		// USED if it won, which is what has to be scored. The address the matrix came from and the
+		// microprogram that wrote it are both in the key: a different ucode at the same offset is a
+		// different quantity, not the same camera.
+		u64 camtest_identity(const RemixVU1Capture::Candidate& candidate, bool column_major,
+			const char* hypothesis)
+		{
+			u64 key = fnv_mix(fnv_seed, candidate.source);
+			key = fnv_mix(key, candidate.mem_offset);
+			key = fnv_mix(key, candidate.start_pc);
+			key = fnv_mix(key, candidate.ucode_hash);
+			key = fnv_mix(key, column_major ? 1u : 0u);
+
+			for (const char* c = hypothesis; c && *c; ++c)
+				key = fnv_mix(key, static_cast<u64>(static_cast<unsigned char>(*c)));
+
+			return (key == 0) ? 1 : key;
+		}
+
+		// Draw-side sampler. Same call site and same gating as worldfix_sample -- accepted,
+		// world-mode, non-sky draws -- plus the clipping defence this test depends on.
+		//
+		// It stores CLIP samples, not world positions, precisely because clip is the guest's own
+		// output and carries no camera in it: the same stored samples can then be un-projected with
+		// every candidate, which is the whole point of the test.
+		void camtest_sample(u64 content_hash, u32 vertex_count, u32 index_count,
+			const GSVertex* verts, const camtest_clip_map& map, const camtest_screen_box& box)
+		{
+			if (!verts || vertex_count == 0 || box.width <= 0 || box.height <= 0)
+				return;
+
+			// DEFENCE 2. A draw whose screen box reaches an edge may have been clipped, so its
+			// vertex set is not provably the same set next window even when the counts match. One
+			// pixel of margin rather than zero: the box is built from 12.4 fixed-point coordinates
+			// and a shape resting exactly on the boundary must not qualify.
+			constexpr float margin = 1.f;
+			if (!(box.min_x > margin) || !(box.max_x < (static_cast<float>(box.width) - margin)) ||
+				!(box.min_y > margin) || !(box.max_y < (static_cast<float>(box.height) - margin)))
+			{
+				++s_camtest_clipped_draws;
+				return;
+			}
+
+			// DEFENCE 1. No positional term anywhere in the key, so the thing being measured cannot
+			// move it, and the counts change the instant the drawn set does.
+			const u64 key = fnv_mix(fnv_mix(content_hash, vertex_count), index_count);
+
+			camtest_witness* slot = nullptr;
+			camtest_witness* oldest = nullptr;
+
+			for (camtest_witness& candidate : s_camtest_witnesses)
+			{
+				if (candidate.key == key)
+					slot = &candidate;
+
+				// A SLOT ALREADY REFRESHED IN THIS WINDOW IS NOT EVICTABLE. The old rule kept the
+				// first slot holding the minimum `frame`, and once every slot had been written this
+				// window they all held the same maximum -- so `candidate.frame < oldest->frame` was
+				// never true, `oldest` stayed pinned at slot 0, and every further draw in the window
+				// clobbered it. Worse, the slots it did evict were this window's own witnesses,
+				// destroying the `now` half of a pair that was already half-formed. A draw that
+				// finds no evictable slot is now DROPPED and counted, which is a visible ceiling
+				// instead of a silent one.
+				if (candidate.frame != s_frame_counter &&
+					(!oldest || candidate.frame < oldest->frame))
+					oldest = &candidate;
+			}
+
+			if (!slot)
+			{
+				if (!oldest)
+				{
+					++s_camtest_witness_overflow;
+					return;
+				}
+
+				// Evicted having never paired: it drew once and never came back, or the table is
+				// churning faster than the geometry repeats. Either way it is the number that says
+				// "witnesses do not survive" independently of whether the eye turned.
+				if (oldest->key != 0 && !oldest->ever_paired)
+					++s_camtest_orphans;
+
+				slot = oldest;
+				*slot = camtest_witness{};
+				slot->key = key;
+			}
+			else if (slot->frame == s_frame_counter)
+			{
+				// Two draws in one window with an identical fingerprint are two instances of one
+				// shape, not one object seen twice. Keep the first, so which one is kept cannot
+				// depend on submission order.
+				return;
+			}
+
+			++s_camtest_inside_draws;
+
+			slot->frame = s_frame_counter;
+
+			// Fixed stride over a vertex count the key has pinned, so sample i is the same vertex in
+			// both windows. Reproduces the vertex loop's own arithmetic verbatim rather than
+			// approximating it -- these are the exact values that were un-projected.
+			const u32 stride = std::max(1u, vertex_count / camtest_samples);
+			u32 count = 0;
+
+			for (u32 i = 0; i < vertex_count && count < camtest_samples; i += stride)
+			{
+				const GSVertex& v = verts[i];
+
+				const float q = map.screen_ui ? 1.f : (map.z_depth ?
+					static_cast<float>((static_cast<double>(v.XYZ.Z) * map.z_scale * map.z_a) + map.z_b) :
+					v.RGBAQ.Q);
+				const float w = 1.0f / q;
+
+				if (!std::isfinite(w) || !(w > 0.f))
+				{
+					count = 0;
+					break;
+				}
+
+				const float ndc_x = ((static_cast<float>(v.XYZ.X) - 0.05f) * map.scale_x) - map.offset_x;
+				const float ndc_y = -(((static_cast<float>(v.XYZ.Y) - 0.05f) * map.scale_y) - map.offset_y);
+
+				slot->now[count][0] = ndc_x * w;
+				slot->now[count][1] = ndc_y * w;
+				slot->now[count][2] = w;
+				++count;
+			}
+
+			slot->count = count;
+
+			// ANCHOR CAPTURE. `prev` is no longer "the last window this witness drew in" -- it is
+			// the ANCHOR, and it only moves on a window the anchor arm is up for. Done AFTER the
+			// samples are written, not before, because the anchor has to be THIS window's geometry:
+			// the old shift copied the PREVIOUS window's samples, which is the right thing to do
+			// only when every window is an anchor.
+			//
+			// camtest_evaluate consumes the arm at the resolve that ends this same window, so the
+			// witness samples, the candidate solvers and the window's eye all anchor together. A
+			// witness that draws in several armed windows before the arm is consumed simply
+			// re-captures, which keeps it in step rather than stranding it.
+			if (s_camtest_anchor_arm)
+			{
+				slot->prev_frame = slot->frame;
+				slot->prev_count = count;
+				std::memcpy(slot->prev, slot->now, sizeof(slot->now));
+				slot->prev_valid = (count != 0);
+			}
+		}
+
+		// Find-or-allocate, shared by both note paths so one key can never occupy two slots with
+		// two histories.
+		//
+		// WAS A LINEAR SCAN of the used prefix, and that had to go before the table could grow.
+		// The scan is O(used) per call and is called once per (candidate x majorness x
+		// hypothesis) triple, i.e. O(triples x used) per window -- quadratic in exactly the two
+		// numbers this change increases. At the old 2048 slots and ~1300 triples it was already
+		// touching ~170 KB per call; at 8192 slots and 2604 triples it would have been ~3.5 GB of
+		// pointer-chasing per window, tens of milliseconds on the GS thread. That is not merely
+		// slow: CAMTESTALL's own note says GS-thread cost moves frame pacing, frame pacing moves
+		// how far the eye turns between two windows, and the turn is alpha's denominator. The
+		// instrument would have been perturbing its own input.
+		//
+		// So: an open-addressed index, 4x the slot count (power of two, load factor <= 0.25,
+		// linear probing stays a step or two). Two sentinels -- EMPTY, which terminates a probe,
+		// and DEAD, which does not, so a key evicted out of the middle of a cluster cannot hide
+		// the keys behind it. Insert only ever runs after a miss, so reusing a DEAD entry can
+		// never duplicate a live key.
+		u32 s_camtest_used = 0;
+
+		constexpr u32 camtest_index_slots = 4 * camtest_candidate_slots;
+		constexpr u32 camtest_index_empty = 0xFFFFFFFFu;
+		constexpr u32 camtest_index_dead = 0xFFFFFFFEu;
+
+		u32 s_camtest_index[camtest_index_slots];
+		bool s_camtest_index_ready = false;
+
+		// LRU replaced by a CLOCK HAND, for the same reason: finding the globally-oldest slot is
+		// another O(used) scan. The hand advances one slot per allocation and takes the first slot
+		// it lands on that was not written during the window being resolved, which is the property
+		// that actually matters (evicting a slot this window already noted would destroy the `now`
+		// half of a pair that is half-formed). At 8192 slots against 2604 triples the hand cannot
+		// lap a window, so that guard never has to fire more than a few steps.
+		u32 s_camtest_hand = 0;
+
+		void camtest_index_reset()
+		{
+			for (u32& entry : s_camtest_index)
+				entry = camtest_index_empty;
+
+			s_camtest_index_ready = true;
+			s_camtest_hand = 0;
+		}
+
+		u32 camtest_index_home(u64 key)
+		{
+			return static_cast<u32>(key ^ (key >> 32)) & (camtest_index_slots - 1);
+		}
+
+		camtest_candidate* camtest_index_find(u64 key)
+		{
+			u32 i = camtest_index_home(key);
+
+			for (u32 probe = 0; probe < camtest_index_slots; ++probe)
+			{
+				const u32 entry = s_camtest_index[i];
+
+				if (entry == camtest_index_empty)
+					return nullptr;
+
+				if (entry != camtest_index_dead && s_camtest_candidates[entry].key == key)
+					return &s_camtest_candidates[entry];
+
+				i = (i + 1) & (camtest_index_slots - 1);
+			}
+
+			return nullptr;
+		}
+
+		void camtest_index_insert(u64 key, u32 slot)
+		{
+			u32 i = camtest_index_home(key);
+
+			for (u32 probe = 0; probe < camtest_index_slots; ++probe)
+			{
+				const u32 entry = s_camtest_index[i];
+
+				if (entry == camtest_index_empty || entry == camtest_index_dead)
+				{
+					s_camtest_index[i] = slot;
+					return;
+				}
+
+				i = (i + 1) & (camtest_index_slots - 1);
+			}
+		}
+
+		void camtest_index_erase(u64 key)
+		{
+			u32 i = camtest_index_home(key);
+
+			for (u32 probe = 0; probe < camtest_index_slots; ++probe)
+			{
+				const u32 entry = s_camtest_index[i];
+
+				if (entry == camtest_index_empty)
+					return;
+
+				if (entry != camtest_index_dead && s_camtest_candidates[entry].key == key)
+				{
+					s_camtest_index[i] = camtest_index_dead;
+					return;
+				}
+
+				i = (i + 1) & (camtest_index_slots - 1);
+			}
+		}
+
+		camtest_candidate* camtest_slot_for(u64 key)
+		{
+			if (!s_camtest_index_ready)
+				camtest_index_reset();
+
+			if (camtest_candidate* const found = camtest_index_find(key))
+				return found;
+
+			u32 slot = 0;
+
+			if (s_camtest_used < camtest_candidate_slots)
+			{
+				slot = s_camtest_used++;
+			}
+			else
+			{
+				// Clock. `now_frame` is stamped s_frame_counter + 1 by both note paths, so a slot
+				// written during the window being resolved is exactly the one that must survive.
+				const u64 protect = s_frame_counter + 1;
+
+				for (u32 step = 0; step < camtest_candidate_slots; ++step)
+				{
+					slot = s_camtest_hand;
+					s_camtest_hand = (s_camtest_hand + 1) % camtest_candidate_slots;
+
+					if (s_camtest_candidates[slot].now_frame != protect)
+						break;
+				}
+
+				camtest_candidate& victim = s_camtest_candidates[slot];
+
+				if (victim.key != 0)
+				{
+					camtest_index_erase(victim.key);
+
+					if (victim.history_count > 0)
+						++s_camtest_evictions; // an identity lost measured drift -- the heartbeat reports it
+				}
+			}
+
+			s_camtest_candidates[slot] = camtest_candidate{};
+			s_camtest_candidates[slot].key = key;
+			camtest_index_insert(key, slot);
+			return &s_camtest_candidates[slot];
+		}
+
+		// PCSX2_REMIX_CAMTESTALL's note. Everything the drift test needs, derived from the
+		// NORMALISED FUSED MATRIX ALONE -- no split, no perspective classification, no shape score.
+		//
+		// That is not a shortcut, it is the point. make_clip_solver inverts the 3x3 built from
+		// columns {0, 1, 3} of the fused matrix, and that inverse IS the un-projection the vertex
+		// loop runs; nothing about it needs the matrix to look like a projection. The eye falls out
+		// of the same solve: the camera is by definition the world point whose clip x, y and w all
+		// vanish, i.e. solve_world_position(solver, 0, 0, 0) -- which is literally the system
+		// solve_camera_position() solves inside try_split_once. So a triple that DOES split gets a
+		// bit-identical eye from either path and the two can never disagree.
+		//
+		// The one rejection kept is singularity, and it is not a heuristic: a matrix whose clip
+		// solver does not invert un-projects nothing, so there is no recovered world to measure the
+		// drift of.
+		bool camtest_note_raw(u64 key, u8 source, u32 mem_offset, u32 start_pc, u64 ucode_hash,
+			u64 content_hash, bool column_major, const char* hypothesis, float w_divisor,
+			bool swap_zw, const remix_ps2::mat4& normalized)
+		{
+			remix_ps2::clip_solver solver{};
+			if (!remix_ps2::make_clip_solver(normalized, solver))
+				return false;
+
+			float eye[3];
+			remix_ps2::solve_world_position(solver, 0.f, 0.f, 0.f, eye);
+
+			float probe[3];
+			remix_ps2::solve_world_position(solver, 0.f, 0.f, 1.f, probe);
+
+			float forward[3] = {probe[0] - eye[0], probe[1] - eye[1], probe[2] - eye[2]};
+			const float scale =
+				std::sqrt((forward[0] * forward[0]) + (forward[1] * forward[1]) + (forward[2] * forward[2]));
+
+			if (!std::isfinite(eye[0]) || !std::isfinite(eye[1]) || !std::isfinite(eye[2]) ||
+				!std::isfinite(scale) || !(scale > 1e-12f))
+				return false;
+
+			camtest_candidate* const slot = camtest_slot_for(key);
+
+			slot->source = source;
+			slot->mem_offset = mem_offset;
+			slot->start_pc = start_pc;
+			slot->ucode_hash = ucode_hash;
+			slot->content_hash = content_hash;
+			slot->hypothesis = hypothesis;
+			slot->column_major = column_major;
+			slot->w_divisor = w_divisor;
+			slot->swap_zw = swap_zw;
+
+			// Cleared again by camtest_note_candidate if this same triple also splits and scores.
+			slot->raw_only = true;
+			slot->fov_y = 0.f;
+
+			slot->now_frame = s_frame_counter + 1;
+			slot->now_solver = solver;
+
+			const float inv = 1.f / scale;
+			for (u32 k = 0; k < 3; ++k)
+			{
+				slot->now_eye[k] = eye[k];
+				slot->now_forward[k] = forward[k] * inv;
+			}
+
+			// Same eligibility gate as the split path, and the same quantity: |un-projected NDC
+			// centre at w = 1, minus the eye|. Reported either way; only mode 2's election reads it.
+			//
+			// MEASURED POST-NORMALISATION, and structurally so rather than by remembering to: the
+			// solver above is built from `normalized`, which apply_camera_hypothesis has already
+			// put through normalize_clip_depth. So a hypothesis that divides the matrix by 1.4e7
+			// is judged on the ~1 it recovers, not on the 7e-08 it started from. Getting this
+			// backwards would have hidden precisely the candidate PCSX2_REMIX_CAMDEPTH exists to
+			// bring into range.
+			const float limit = camera_scale_limit();
+			slot->depth_scale = scale;
+			slot->eligible = (scale >= (1.f / limit)) && (scale <= limit);
+
+			if (source == 5)
+				++s_camtest_noted_probe;
+			else
+				++s_camtest_noted_raw;
+
+			return true;
+		}
+
+		// CAMTESTALL = 2. Scores the 64-qword VU1 neighbourhood RemixVU1Capture snapshots around the
+		// back-sliced object MVP, as 61 overlapping 4-qword windows.
+		//
+		// THE HYPOTHESIS. For row-vectors an object's matrix is M_obj * VP, so every object in a
+		// frame shares the right factor VP -- and level geometry conventionally has M_obj = identity,
+		// in which case its MVP *is* VP. The back-slice resolves an object MVP at VI05+7..10
+		// (RemixVU1Capture.h). If the shared VP is uploaded to a VU1 address that no LQ in the
+		// sliced chain reads, the slicer never publishes it and no amount of re-ranking the
+		// published set can reach it. The transform probe exists to hold exactly that
+		// neighbourhood, and until now it was only dumped as text.
+		//
+		// SCORING ONLY, and structurally so: these synthetic candidates are not in frame.items[],
+		// so the election loop never enumerates their keys and camtest_ranked_drift is never asked
+		// about them. They cannot be elected under any mode.
+		void camtest_scan_probe(const RemixVU1Capture::Frame& frame, const viewport_constants& vp,
+			float reference_aspect)
+		{
+			if (!frame.transform_probe_valid)
+				return;
+
+			constexpr u32 probe_qwords = 64;
+			constexpr u32 probe_windows = probe_qwords - 3; // a matrix is 4 consecutive qwords
+
+			// De-duplicated by content within the sweep: long runs of VU1 memory are zeros or
+			// repeats, and a duplicate costs a table slot for nothing.
+			u64 seen[probe_windows];
+			u32 seen_count = 0;
+
+			for (u32 base = 0; base < probe_windows; ++base)
+			{
+				remix_ps2::mat4 raw{};
+				std::memcpy(&raw.m[0][0], &frame.transform_probe[base * 4], sizeof(float) * 16);
+
+				if (!remix_ps2::mat4_is_finite(raw))
+					continue;
+
+				const u64 content = hash_floats(&raw.m[0][0], 16);
+
+				bool duplicate = false;
+				for (u32 i = 0; i < seen_count && !duplicate; ++i)
+					duplicate = (seen[i] == content);
+
+				if (duplicate)
+					continue;
+
+				seen[seen_count++] = content;
+
+				// The address this window really sits at in VU1 data memory, so a winner can be
+				// found again: the probe is a ring-wrapped copy starting at transform_probe_base.
+				const u32 offset = ((frame.transform_probe_base + base) & 0x3FFu) * 16u;
+
+				RemixVU1Capture::Candidate synthetic{};
+				std::memcpy(synthetic.m, &raw.m[0][0], sizeof(synthetic.m));
+				synthetic.mem_offset = offset;
+				synthetic.start_pc = 0;
+				synthetic.ucode_hash = frame.transform_probe_ucode;
+				synthetic.source = 5; // "probe" -- see camtest_report's source names
+
+				for (u32 major = 0; major < 2; ++major)
+				{
+					const remix_ps2::mat4 oriented = (major == 0) ? raw : remix_ps2::mat4_transpose(raw);
+
+					camera_hypothesis hypotheses[max_camera_hypotheses];
+					const u32 hypothesis_count = build_camera_hypotheses(oriented, vp,
+						reference_aspect, major != 0, synthetic.source, synthetic.ucode_hash,
+						s_camdepth_active, s_camdepth_snap_active, hypotheses);
+
+					for (u32 h = 0; h < hypothesis_count; ++h)
+					{
+						const camera_hypothesis& hyp = hypotheses[h];
+						const remix_ps2::mat4 normalized = apply_camera_hypothesis(oriented, hyp);
+
+						camtest_note_raw(camtest_identity(synthetic, major != 0, hyp.name),
+							synthetic.source, offset, synthetic.start_pc, synthetic.ucode_hash,
+							content, major != 0, hyp.name, hyp.scale_w, hyp.swap_zw, normalized);
+					}
+				}
+			}
+		}
+
+		// Candidate-side capture, called from inside resolve_world_camera's own hypothesis loop so
+		// the solver recorded here is built by the SAME machinery, on the same normalised matrix, as
+		// the one the election would install. Nothing is re-implemented and the two cannot drift.
+		void camtest_note_candidate(u64 key, const RemixVU1Capture::Candidate& candidate,
+			bool column_major, const char* hypothesis, float w_divisor, bool swap_zw,
+			u64 content_hash, const remix_ps2::mat4& normalized, const remix_ps2::vp_split& split)
+		{
+			remix_ps2::clip_solver solver{};
+			remix_ps2::mat4 view_to_world{};
+
+			if (!remix_ps2::make_clip_solver(normalized, solver) ||
+				!remix_ps2::mat4_invert(split.view, view_to_world))
+				return;
+
+			camtest_candidate* const slot = camtest_slot_for(key);
+
+			++s_camtest_noted_split;
+			slot->content_hash = content_hash;
+			slot->raw_only = false;
+			slot->source = candidate.source;
+			slot->mem_offset = candidate.mem_offset;
+			slot->start_pc = candidate.start_pc;
+			slot->ucode_hash = candidate.ucode_hash;
+			slot->hypothesis = hypothesis;
+			slot->column_major = column_major;
+			slot->w_divisor = w_divisor;
+			slot->swap_zw = swap_zw;
+
+			remix_ps2::projection_params params{};
+			slot->fov_y = remix_ps2::describe_projection(split.projection, params) ? params.fov_y_degrees : 0.f;
+
+			slot->now_frame = s_frame_counter + 1;
+			slot->now_solver = solver;
+
+			for (u32 k = 0; k < 3; ++k)
+			{
+				slot->now_eye[k] = view_to_world.m[3][k];
+				slot->now_forward[k] = split.view.m[k][2];
+			}
+
+			float probe[3];
+			remix_ps2::solve_world_position(solver, 0.f, 0.f, 1.f, probe);
+
+			const float dx = probe[0] - slot->now_eye[0];
+			const float dy = probe[1] - slot->now_eye[1];
+			const float dz = probe[2] - slot->now_eye[2];
+			const float scale = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+			const float limit = camera_scale_limit();
+
+			slot->depth_scale = scale;
+			slot->eligible = std::isfinite(scale) && (scale >= (1.f / limit)) && (scale <= limit);
+		}
+
+		// Ages every tracked candidate one window. Called once per resolve, after the evaluation has
+		// consumed the current pair and before the loop writes the new solvers.
+		void camtest_roll()
+		{
+			for (camtest_candidate& slot : s_camtest_candidates)
+			{
+				if (slot.key == 0)
+					continue;
+
+				slot.prev_valid = (slot.now_frame != 0);
+				slot.prev_frame = slot.now_frame;
+				slot.prev_solver = slot.now_solver;
+
+				for (u32 k = 0; k < 3; ++k)
+				{
+					slot.prev_eye[k] = slot.now_eye[k];
+					slot.prev_forward[k] = slot.now_forward[k];
+				}
+			}
+		}
+
+		// Mode 2's ranking input. False means "not enough evidence to elect on", which is the
+		// documented fallback to the shape election rather than a refusal to elect at all.
+		bool camtest_ranked_drift(u64 key, float& out)
+		{
+			for (camtest_candidate& slot : s_camtest_candidates)
+			{
+				if (slot.key != key)
+					continue;
+
+				if (!slot.eligible || slot.history_count < camtest_min_pairs ||
+					slot.last_witnesses < camtest_min_witnesses)
+					return false;
+
+				float scratch[camtest_history];
+				std::memcpy(scratch, slot.history, sizeof(float) * slot.history_count);
+				out = camtest_median(scratch, slot.history_count);
+				return std::isfinite(out);
+			}
+
+			return false;
+		}
+
+		void camtest_report(u64 window)
+		{
+			struct camtest_row
+			{
+				const camtest_candidate* entry;
+				float drift;
+
+				// Precomputed in one pass after the sort rather than inside the print loop, because
+				// the per-source summary below needs them for rows the print loop never reaches.
+				double turn;
+				bool frozen;
+			};
+
+			// static, not a local: at camtest_candidate_slots = 8192 this is a 128 KB array and the
+			// GS thread's stack is not the place for it. Called from one thread, once per round.
+			static camtest_row rows[camtest_candidate_slots];
+			u32 count = 0;
+
+			// THE DEGENERACY CHECK. Distinct RAW matrices behind the ranked rows, and distinct VU1
+			// addresses. If the table is 200 rows over ONE content hash, every row is the same
+			// matrix under a different hypothesis and the ranking is decorative -- which is exactly
+			// the shape of the two-row result that motivated CAMTESTALL. Counted with a small
+			// bounded set: 64 is far more variety than a degenerate answer would ever show, and the
+			// count saturates rather than lying.
+			constexpr u32 distinct_cap = 64;
+			u64 distinct_content[distinct_cap];
+			u32 distinct_offsets[distinct_cap];
+			u32 distinct_content_count = 0;
+			u32 distinct_offset_count = 0;
+			bool distinct_content_saturated = false;
+			bool distinct_offset_saturated = false;
+
+			for (const camtest_candidate& slot : s_camtest_candidates)
+			{
+				if (slot.key == 0 || slot.history_count == 0)
+					continue;
+
+				float scratch[camtest_history];
+				std::memcpy(scratch, slot.history, sizeof(float) * slot.history_count);
+				rows[count].entry = &slot;
+				rows[count].drift = camtest_median(scratch, slot.history_count);
+				++count;
+
+				bool seen = false;
+				for (u32 i = 0; i < distinct_content_count && !seen; ++i)
+					seen = (distinct_content[i] == slot.content_hash);
+
+				if (!seen)
+				{
+					if (distinct_content_count < distinct_cap)
+						distinct_content[distinct_content_count++] = slot.content_hash;
+					else
+						distinct_content_saturated = true;
+				}
+
+				seen = false;
+				for (u32 i = 0; i < distinct_offset_count && !seen; ++i)
+					seen = (distinct_offsets[i] == slot.mem_offset);
+
+				if (!seen)
+				{
+					if (distinct_offset_count < distinct_cap)
+						distinct_offsets[distinct_offset_count++] = slot.mem_offset;
+					else
+						distinct_offset_saturated = true;
+				}
+			}
+
+			std::sort(rows, rows + count, [](const camtest_row& a, const camtest_row& b) {
+				return a.drift < b.drift;
+			});
+
+			const double inv_round = (s_camtest_round > 0) ? (1.0 / static_cast<double>(s_camtest_round)) : 0.0;
+
+			INFO_LOG("Remix: CAMTEST round at frame {} -- {} qualifying pairs, {:.1f} witnesses per "
+					 "pair (min {}), {:.1f} witness draws per window, mean eye move {:.1f}. "
+					 "LEVER ARM: turn per pair mean {:.2f} deg, min {:.2f}, max {:.2f}, over a window "
+					 "span of mean {:.1f} max {} (cap {}). Session: {} pairs, rejected {} for no turn "
+					 "and {} as a jump; {} draws dropped for touching a viewport edge. Drift is the "
+					 "median over witnesses of how far a static draw's recovered world position moved "
+					 "between the two windows, per unit of guest depth. ALPHA is the scale-free "
+					 "reading of the same thing: ~0 = this matrix IS the camera, ~1 = the recovered "
+					 "world rides the eye, ~2 = it is mirrored about a camera-fixed plane. READ THE "
+					 "LEVER ARM FIRST: alpha divides by the turn, so under ~1 deg the ranking is "
+					 "noise and a frozen matrix wins it for free.",
+				window, s_camtest_round, s_camtest_round_witnesses * inv_round,
+				s_camtest_round_witness_min, s_camtest_round_inside * inv_round,
+				s_camtest_round_move * inv_round,
+				s_camtest_round_turn * inv_round, s_camtest_round_turn_min, s_camtest_round_turn_max,
+				s_camtest_round_span * inv_round, s_camtest_round_span_max, camtest_span_windows(),
+				s_camtest_pairs, s_camtest_reject_turn, s_camtest_reject_jump,
+				s_camtest_clipped_draws);
+
+			// Second header line: WHAT WAS SCORED, and how much of it is actually different.
+			// Read 'distinct matrices' first. 1 or 2 means the ranked table below is one matrix
+			// under several hypotheses and the true view-projection is not in the set at all --
+			// go to the probe sweep (PCSX2_REMIX_CAMTESTALL = 2), not to more re-ranking.
+			INFO_LOG("Remix: CAMTEST set -- PCSX2_REMIX_CAMDEPTH = {} ({} hypotheses per candidate x "
+					 "majorness), PCSX2_REMIX_CAMTESTALL = {} ({}). {} ranked rows over {}{} "
+					 "distinct matrices at {}{} distinct VU1 addresses. Scored per window: {:.0f} "
+					 "triples ({:.0f} published-candidate, {:.0f} probe-window); of those {:.0f} also "
+					 "cleared split+score, which is all the table held before CAMTESTALL. Table "
+					 "capacity {} -- if 'scored per window' approaches it, rows are being evicted and "
+					 "their histories reset.",
+				s_camdepth_active, (s_camdepth_active == 0) ? hypothesis_slots : max_camera_hypotheses,
+				s_camtest_all_active,
+				(s_camtest_all_active == 0) ? "split+score survivors only" :
+					((s_camtest_all_active == 1) ? "every published candidate" :
+						"every published candidate + VU1 probe neighbourhood"),
+				count, distinct_content_saturated ? ">=" : "", distinct_content_count,
+				distinct_offset_saturated ? ">=" : "", distinct_offset_count,
+				s_camtest_round_scored * inv_round,
+				(s_camtest_round_scored - s_camtest_round_scored_probe) * inv_round,
+				s_camtest_round_scored_probe * inv_round,
+				s_camtest_round_scored_split * inv_round,
+				camtest_candidate_slots);
+
+			// Rows printed. Wider under CAMTESTALL because the whole point is to see past the two
+			// rows the shape filters were leaving; the elected row is always printed on top of it.
+			// Now a live knob, because 32 of 4,569 was hiding every row worth reading -- see
+			// camtest_row_limit().
+			const u32 row_limit = (s_camtest_all_active > 0) ? camtest_row_limit() : 8u;
+			const int source_filter = camtest_source_filter();
+
+			// FROZEN. A candidate whose own recovered forward barely rotated over the pair cannot be
+			// the camera when the real camera turned several degrees -- it is a matrix that stopped
+			// updating, and a matrix that does not move has no drift for free. These dominated the
+			// top of the first real table (own-turn 0.00-0.03 deg, depth scale 3.7e5) and made the
+			// ranking unreadable. They are TAGGED and still printed, never hidden: a suppressed row
+			// cannot be checked, and the whole point of this instrument is that nothing is decided
+			// by a filter. The summary line below reports the best row that is neither frozen nor
+			// ineligible, which is the one a reader actually wants.
+			const double pair_turn = s_camtest_round_turn * inv_round;
+			const double frozen_turn = 0.25 * pair_turn;
+
+			const camtest_candidate* best_usable = nullptr;
+			float best_usable_drift = 0.f;
+			u32 best_usable_rank = 0;
+
+			// ONE PASS FOR THE WHOLE TABLE, before anything is printed. The freeze verdict used to
+			// be computed inside the print loop, which meant it existed only for rows that were
+			// printed -- and the per-source summary below needs it for the ~4,500 rows that are not.
+			for (u32 i = 0; i < count; ++i)
+			{
+				const camtest_candidate& slot = *rows[i].entry;
+
+				// This candidate's OWN last turn, in degrees. A candidate whose drift is low because
+				// it never moves is not a camera, and this is the column that says so.
+				double dot = 0.0;
+				for (u32 k = 0; k < 3; ++k)
+					dot += static_cast<double>(slot.now_forward[k]) * static_cast<double>(slot.prev_forward[k]);
+
+				rows[i].turn = std::acos(std::clamp(dot, -1.0, 1.0)) * (180.0 / 3.14159265358979323846);
+				rows[i].frozen = (pair_turn > 0.0) && (rows[i].turn < frozen_turn);
+
+				if (!best_usable && !rows[i].frozen && slot.eligible)
+				{
+					best_usable = &slot;
+					best_usable_drift = rows[i].drift;
+					best_usable_rank = i + 1;
+				}
+			}
+
+			u32 printed = 0;
+
+			for (u32 i = 0; i < count; ++i)
+			{
+				const camtest_candidate& slot = *rows[i].entry;
+				const bool elected = (slot.key == s_camtest_elected_key);
+				const double turn = rows[i].turn;
+				const bool frozen = rows[i].frozen;
+
+				// PCSX2_REMIX_CAMTESTSRC. Filters what is PRINTED, never the rank: #238 still means
+				// 238th of the full table.
+				if (source_filter >= 0 && static_cast<int>(slot.source) != source_filter && !elected)
+					continue;
+
+				// The top few plus the elected one, always, so "is the elected candidate the best
+				// available?" is answered on every round even when it ranks last. Counted over rows
+				// that PASSED the filter, so restricting to one source yields row_limit rows OF THAT
+				// SOURCE rather than whatever fraction of it happens to sit in the global top N.
+				if (printed >= row_limit && !elected)
+					continue;
+
+				++printed;
+
+				INFO_LOG("Remix: CAMTEST   #{} drift {:.4g} alpha {:.3f} (centroid {:.4g}) pairs {} "
+						 "wit {} (alphaN {}) | src={} off=0x{:04x} pc=0x{:04x} ucode=0x{:016x} hyp={}/{} "
+						 "content=0x{:016x}{} fovY {:.2f} dscale {:.4g}{}{} own-turn {:.2f} deg{}",
+					i + 1, rows[i].drift, slot.last_alpha, slot.last_centroid_drift, slot.pairs,
+					slot.last_witnesses, slot.last_alpha_witnesses,
+					candidate_source_name(slot.source),
+					slot.mem_offset, slot.start_pc, slot.ucode_hash, slot.hypothesis,
+					slot.column_major ? 'C' : 'R', slot.content_hash,
+					slot.raw_only ? " RAW(does not split/score -- can never be elected)" : "",
+					slot.fov_y, slot.depth_scale,
+					// The correction that produced that dscale, so the reading is auditable: a
+					// row at dscale ~1 off a wdiv of 1.4e7 and a row at dscale ~1 with no
+					// correction at all are very different findings.
+					(slot.w_divisor != 1.f || slot.swap_zw)
+						? fmt::format(" [wdiv {:.6g} x2^{:.2f}{}]", slot.w_divisor,
+							  (slot.w_divisor > 0.f) ? std::log2(slot.w_divisor) : 0.f,
+							  slot.swap_zw ? ", z/w SWAPPED" : "")
+						: std::string(),
+					slot.eligible ? "" : " (INELIGIBLE: depth scale outside PCSX2_REMIX_CAMSCALE)",
+					turn, frozen ? " FROZEN(own-turn under a quarter of the pair's)" : "",
+					elected ? "  <-- ELECTED" : "");
+			}
+
+			// --- PER SOURCE, and this is the block that closes the visibility hole ---------------
+			//
+			// The ranked table is sorted by drift and a FROZEN row has low drift for free, so the
+			// printed window fills with frozen rows and everything else is invisible no matter how
+			// many rows are printed. On the 2026-08-16 10:19 session that produced a completely
+			// wrong conclusion: source 7's ten PRINTED rows were all frozen, which read as "the
+			// register-resident matrix does not rotate", while the table held 4,569 rows and the
+			// best non-frozen eligible one sat at rank #238.
+			//
+			// So every source gets one line, every round, naming its best NON-FROZEN row and how
+			// many of its rows froze. A source whose rows are all frozen says so explicitly instead
+			// of being indistinguishable from a source with no rows at all. Log-only.
+			for (u32 source = 0; source <= 7; ++source)
+			{
+				u32 total = 0;
+				u32 frozen_count = 0;
+				u32 eligible_count = 0;
+				const camtest_row* best = nullptr;
+				u32 best_rank = 0;
+
+				for (u32 i = 0; i < count; ++i)
+				{
+					if (rows[i].entry->source != source)
+						continue;
+
+					++total;
+					frozen_count += rows[i].frozen ? 1u : 0u;
+					eligible_count += rows[i].entry->eligible ? 1u : 0u;
+
+					if (!best && !rows[i].frozen)
+					{
+						best = &rows[i];
+						best_rank = i + 1;
+					}
+				}
+
+				if (total == 0)
+					continue;
+
+				if (best)
+				{
+					const camtest_candidate& slot = *best->entry;
+					INFO_LOG("Remix: CAMTEST src={} -- {} rows ({} frozen, {} eligible). Best "
+							 "NON-FROZEN: #{} of {} drift {:.4g} alpha {:.3f} wit {} (alphaN {}) "
+							 "own-turn {:.2f} deg dscale {:.4g} wdiv {:.6g}{} | off=0x{:04x} "
+							 "pc=0x{:04x} hyp={}/{} content=0x{:016x}{}{}",
+						candidate_source_name(source), total, frozen_count, eligible_count,
+						best_rank, count, best->drift, slot.last_alpha, slot.last_witnesses,
+						slot.last_alpha_witnesses, best->turn, slot.depth_scale, slot.w_divisor,
+						slot.swap_zw ? " z/w SWAPPED" : "",
+						slot.mem_offset, slot.start_pc, slot.hypothesis,
+						slot.column_major ? 'C' : 'R', slot.content_hash,
+						slot.eligible ? "" : " (INELIGIBLE: depth scale outside PCSX2_REMIX_CAMSCALE)",
+						slot.raw_only ? " RAW(does not split/score)" : "");
+				}
+				else
+				{
+					INFO_LOG("Remix: CAMTEST src={} -- {} rows, ALL FROZEN (own-turn under a quarter "
+							 "of the pair's {:.2f} deg). Nothing this source published rotated with "
+							 "the eye over the measured pairs, so none of its drift figures mean "
+							 "anything.",
+						candidate_source_name(source), total, pair_turn);
+				}
+			}
+
+			// The one row a reader wants: lowest drift among candidates that both rotated with the
+			// eye and recover the guest's own unit. Printed separately rather than by re-sorting,
+			// so the raw drift ranking above is never quietly reordered under anyone.
+			if (best_usable)
+			{
+				INFO_LOG("Remix: CAMTEST best non-frozen, eligible row -- #{} drift {:.4g} alpha "
+						 "{:.3f} dscale {:.4g} wdiv {:.6g}{} | src={} off=0x{:04x} pc=0x{:04x} "
+						 "ucode=0x{:016x} hyp={}/{} content=0x{:016x}{}. Alpha ~0 here with a lever "
+						 "arm above ~1 deg is the answer; alpha ~1 or ~2 means the search has still "
+						 "not reached the camera. If a ':w' row is eligible at alpha ~1.5 where its "
+						 "baseline twin was ineligible at the same alpha, the depth scale was NOT "
+						 "the obstacle -- the matrix is camera-attached but is not the "
+						 "view-projection, and the next question is the z/w swap "
+						 "(PCSX2_REMIX_CAMDEPTH = 2), not another scale.",
+					best_usable_rank, best_usable_drift, best_usable->last_alpha,
+					best_usable->depth_scale, best_usable->w_divisor,
+					best_usable->swap_zw ? " z/w SWAPPED" : "",
+					candidate_source_name(best_usable->source), best_usable->mem_offset,
+					best_usable->start_pc, best_usable->ucode_hash, best_usable->hypothesis,
+					best_usable->column_major ? 'C' : 'R', best_usable->content_hash,
+					best_usable->raw_only ? " RAW(does not split/score)" : "");
+			}
+			else
+			{
+				INFO_LOG("Remix: CAMTEST best non-frozen, eligible row -- NONE. Every ranked row "
+						 "either froze (own-turn under a quarter of the pair's {:.2f} deg) or "
+						 "recovers a depth scale outside PCSX2_REMIX_CAMSCALE. The table is not a "
+						 "ranking of cameras; do not read the top of it as one.",
+					pair_turn);
+			}
+		}
+
+		// Window-side half. Called at the TOP of resolve_world_camera, before anything replaces the
+		// camera or the candidate solvers, for the same reason WORLDPROBE and WORLDFIX sample their
+		// eye there: the camera being paired with this window's geometry has to be the camera that
+		// geometry was un-projected against.
+		void camtest_evaluate()
+		{
+			const int mode = camtest_mode();
+			const int all_mode = camtest_all_mode();
+
+			if (all_mode != s_camtest_all_logged_mode)
+			{
+				s_camtest_all_logged_mode = all_mode;
+				INFO_LOG("Remix: PCSX2_REMIX_CAMTESTALL = {} ({}). It widens WHAT IS MEASURED, never "
+						 "what can be installed: a matrix that fails split_view_projection_direct has "
+						 "no view/projection to elect and the election loop skips it before any rank "
+						 "is computed, so no matrix this knob adds can become the camera under any "
+						 "mode. Under PCSX2_REMIX_CAMTEST = 1 it changes the log only. Under "
+						 "PCSX2_REMIX_CAMTEST = 2 the camera is already chosen by measurement, and "
+						 "this changes which measurements exist. It also costs GS-thread time on "
+						 "pairing windows, which can move frame pacing and therefore the turn rate -- "
+						 "compare the round header's mean turn before comparing runs.",
+					all_mode,
+					(all_mode == 0) ? "off -- only triples that split and score are measured" :
+						((all_mode == 1) ? "measure every published candidate x majorness x hypothesis" :
+							"measure every published candidate, plus the VU1 transform-probe neighbourhood"));
+			}
+
+			if (mode != s_camtest_logged_mode)
+			{
+				s_camtest_logged_mode = mode;
+				INFO_LOG("Remix: PCSX2_REMIX_CAMTEST = {} ({}). Drift is how far a static draw's "
+						 "RECOVERED WORLD POSITION moves between two windows while the eye turns: it "
+						 "is ~0 for the real camera and grows with distance for a wrong view "
+						 "rotation. Set PCSX2_REMIX_CAMTESTAFTER to delay arming into gameplay.",
+					mode,
+					(mode == 0) ? "off" : ((mode == 1) ? "audit only, no behaviour change" :
+						"elect the lowest-drift candidate instead of the highest shape score"));
+			}
+
+			if (mode == 0)
+			{
+				// OFF DOES NOT CONSUME THE ARM. The per-draw dump sets s_drawdump_started = true with
+				// a zero budget on the first qualifying frame whatever its own knob says, which makes
+				// it impossible to arm mid-run; nothing here latches while the feature is off.
+				s_camtest_active = 0;
+				s_camtest_all_active = 0;
+				return;
+			}
+
+			if (!s_camtest_started)
+			{
+				// A qualifying window submitted geometry with a world camera live -- the same
+				// condition FRAMETRACE and WORLDPROBE arm on. IT RETRIES: one presented window in
+				// three on this title submits nothing at all (the game's 40 fps against our 60 Hz
+				// present), so a one-shot arm has a one-in-three chance of landing on an empty one,
+				// which has already silently produced a whole run of nothing once.
+				if (s_submitted_this_frame == 0 || !s_active_camera.valid)
+					return;
+
+				if (s_camtest_skipped < camtest_after_frames())
+				{
+					++s_camtest_skipped;
+					return;
+				}
+
+				s_camtest_started = true;
+				s_camtest_hb_window = s_frame_counter;
+				INFO_LOG("Remix: CAMTEST armed at frame {} after skipping {} qualifying window(s). "
+						 "First table at {} qualifying pairs (PCSX2_REMIX_CAMTESTPAIRS), then 2x that, "
+						 "up to {}. Pairs are formed against an ANCHOR window held for up to {} windows "
+						 "(PCSX2_REMIX_CAMTESTSPAN) so the turn accumulates to at least {:.2f} deg "
+						 "before the pair counts -- pairing against the previous window gave only 0.44 "
+						 "deg at full stick, which is too small to rank anything. A 'CAMTEST heartbeat' "
+						 "follows every {} windows whether or not a table fires; read its LEVER ARM "
+						 "and ACCUMULATED TURN first.",
+					s_frame_counter, s_camtest_skipped, camtest_first_round_pairs(),
+					camtest_round_pairs_max, camtest_span_windows(), camtest_min_turn_degrees(),
+					camtest_heartbeat_windows());
+			}
+
+			s_camtest_active = mode;
+			s_camtest_all_active = all_mode;
+
+			const u64 window = s_frame_counter;
+			const u32 inside = s_camtest_inside_draws;
+			s_camtest_inside_draws = 0;
+
+			// The notes describing the solvers about to be evaluated were made by the PREVIOUS
+			// resolve pass, which is the one that un-projected this window -- so these counters are
+			// read and cleared here, before the loop below writes the next pass's.
+			const u32 noted_split = s_camtest_noted_split;
+			const u32 noted_raw = s_camtest_noted_raw;
+			const u32 noted_probe = s_camtest_noted_probe;
+			s_camtest_noted_split = 0;
+			s_camtest_noted_raw = 0;
+			s_camtest_noted_probe = 0;
+
+			const bool camera_valid = s_active_camera.valid;
+			float forward[3] = {0.f, 0.f, 0.f};
+
+			if (camera_valid)
+			{
+				// Camera forward in world space, exactly as submit_camera() and WORLDPROBE compute
+				// it: p_view = p_world * V is row-vector, so view z's gradient is V's third column.
+				forward[0] = s_active_camera.view.m[0][2];
+				forward[1] = s_active_camera.view.m[1][2];
+				forward[2] = s_active_camera.view.m[2][2];
+			}
+
+			// Heartbeat accounting for this window, gathered whether or not anything qualifies.
+			++s_camtest_hb_windows;
+			s_camtest_hb_inside_sum += static_cast<double>(inside);
+			s_camtest_hb_inside_max = std::max(s_camtest_hb_inside_max, inside);
+
+			// ---- ANCHOR ADVANCE ------------------------------------------------------------
+			// The witnesses captured their anchor during THIS window's draws (camtest_sample read
+			// the same flag), and the candidate solvers still hold the set in force for this window
+			// -- the resolve below has not written the next set yet. This is therefore the one
+			// instant at which all three halves of an anchor are simultaneously consistent, which
+			// is why the roll moved here from the top of resolve_world_camera.
+			//
+			// Requires geometry: an anchor on a window that drew nothing has no witnesses attached
+			// to it, and one presented window in three on this title is exactly that window. The arm
+			// simply stays up until a window with draws arrives.
+			if (s_camtest_anchor_arm && camera_valid && inside > 0)
+			{
+				camtest_roll();
+
+				s_camtest_anchor_arm = false;
+				s_camtest_cycle_paired = false;
+				++s_camtest_anchor_cycles;
+				s_camtest_prev_valid = true;
+				s_camtest_prev_window = window;
+
+				for (u32 k = 0; k < 3; ++k)
+				{
+					s_camtest_prev_eye[k] = s_active_camera.position[k];
+					s_camtest_prev_forward[k] = forward[k];
+				}
+			}
+			else if (camera_valid && s_camtest_prev_valid && window > s_camtest_prev_window)
+			{
+				double dot = 0.0;
+				double move = 0.0;
+
+				for (u32 k = 0; k < 3; ++k)
+				{
+					dot += static_cast<double>(forward[k]) * static_cast<double>(s_camtest_prev_forward[k]);
+					const double d = static_cast<double>(s_active_camera.position[k] - s_camtest_prev_eye[k]);
+					move += d * d;
+				}
+
+				const double turn = std::acos(std::clamp(dot, -1.0, 1.0)) * (180.0 / 3.14159265358979323846);
+				move = std::sqrt(move);
+
+				// BEFORE the turn gate, deliberately. The turn statistic has to describe what the eye
+				// actually did, not what the eye did on windows that already passed a turn test --
+				// that circularity is exactly why the old log could not tell the two faults apart.
+				s_camtest_hb_turn_sum += turn;
+				s_camtest_hb_turn_max = std::max(s_camtest_hb_turn_max, turn);
+				++s_camtest_hb_turn_count;
+
+				// Also before the gate: how many witnesses are paired across THIS window and the
+				// previous one, which is the witness-side precondition on its own. A turn of 20 deg
+				// with survivors 0 and a turn of 0.01 deg with survivors 19 are opposite problems and
+				// produced an identical (empty) log before this.
+				{
+					u32 survivors = 0;
+					for (const camtest_witness& witness : s_camtest_witnesses)
+					{
+						if (witness.key != 0 && witness.prev_valid && witness.count != 0 &&
+							witness.frame == window && witness.prev_frame == s_camtest_prev_window &&
+							witness.count == witness.prev_count)
+							++survivors;
+					}
+
+					s_camtest_hb_survivors_last = survivors;
+					s_camtest_hb_survivors_max = std::max(s_camtest_hb_survivors_max, survivors);
+				}
+
+				const float turn_min = camtest_min_turn_degrees();
+				const float turn_max = camtest_max_turn_degrees();
+				const u64 span = window - s_camtest_prev_window;
+
+				// RE-ANCHOR POLICY. The anchor is HELD to the full span rather than released the
+				// moment the turn threshold is met, and every window in between that clears the
+				// threshold counts as its own pair. Releasing early was the obvious design and it is
+				// the worse one: it pins every pair at exactly turn_min. Per unit of play time,
+				//
+				//   release at 2 deg  -> ~1 pair per 11 windows, lever arm 2 deg
+				//   hold to 30        -> ~20 pairs per 30 windows, lever arm 2..6 deg
+				//
+				// and alpha's noise falls with turn x sqrt(pairs), so holding wins on both terms at
+				// once. The pairs within one cycle share an anchor and are therefore correlated --
+				// that is the cost, and it is why the round line reports turn MIN and MAX rather
+				// than the mean alone, so a table built mostly from short-arm pairs is visible.
+				//
+				//   jump -- over the cap. Re-anchoring IMMEDIATELY is the point: without it a cut
+				//           would poison every remaining window of the cycle behind a stale anchor.
+				//   span -- the normal end of a cycle.
+				const bool over_cap = turn > static_cast<double>(turn_max);
+				const bool span_done = span >= static_cast<u64>(camtest_span_windows());
+
+				if (over_cap)
+					++s_camtest_reanchor_jump;
+				else if (span_done)
+					++s_camtest_reanchor_span;
+
+				if (span_done && s_camtest_cycle_paired)
+					++s_camtest_reanchor_harvest;
+
+				s_camtest_anchor_arm = over_cap || span_done;
+
+				if (turn < static_cast<double>(turn_min))
+				{
+					++s_camtest_reject_turn;
+				}
+				else if (turn > static_cast<double>(turn_max))
+				{
+					++s_camtest_reject_jump;
+				}
+				else
+				{
+					const u64 previous = s_camtest_prev_window;
+					const double turn_radians = turn * (3.14159265358979323846 / 180.0);
+					u32 witnesses_used = 0;
+
+					for (camtest_candidate& slot : s_camtest_candidates)
+					{
+						// A solver's stamp is the FIRST window it un-projected, and it stays in force
+						// until the next resolve replaces it -- which on this title is not every
+						// window: one presented window in three carries no new candidate matrices at
+						// all (the game's 40 fps against our 60 Hz present), and the camera is simply
+						// held through it. So the test is containment, not equality: `now` must
+						// already have been in force at `window`, and `prev` must have been the one
+						// in force at `previous`. Requiring equality here silently threw away every
+						// pair that straddled a held window, which is two thirds of them.
+						if (slot.key == 0 || !slot.prev_valid || slot.now_frame > window ||
+							slot.prev_frame > previous || previous >= slot.now_frame)
+							continue;
+
+						float drifts[camtest_witness_slots];
+						float centroids[camtest_witness_slots];
+						float alphas[camtest_witness_slots];
+						u32 used = 0;
+						u32 alpha_used = 0;
+
+						for (camtest_witness& witness : s_camtest_witnesses)
+						{
+							if (witness.key == 0 || !witness.prev_valid || witness.count == 0 ||
+								witness.frame != window || witness.prev_frame != previous ||
+								witness.count != witness.prev_count)
+								continue;
+
+							// Idempotent, and set here rather than after the maths: this witness has
+							// met every precondition for a pair, which is what "not an orphan" means.
+							witness.ever_paired = true;
+
+							double sum = 0.0;
+							double centre_now[3] = {0.0, 0.0, 0.0};
+							double centre_prev[3] = {0.0, 0.0, 0.0};
+							bool finite = true;
+
+							for (u32 i = 0; i < witness.count; ++i)
+							{
+								float now[3];
+								float prev[3];
+								remix_ps2::solve_world_position(slot.now_solver, witness.now[i][0],
+									witness.now[i][1], witness.now[i][2], now);
+								remix_ps2::solve_world_position(slot.prev_solver, witness.prev[i][0],
+									witness.prev[i][1], witness.prev[i][2], prev);
+
+								double squared = 0.0;
+								for (u32 k = 0; k < 3; ++k)
+								{
+									const double d = static_cast<double>(now[k]) - static_cast<double>(prev[k]);
+									squared += d * d;
+									centre_now[k] += static_cast<double>(now[k]);
+									centre_prev[k] += static_cast<double>(prev[k]);
+								}
+
+								if (!std::isfinite(squared))
+								{
+									finite = false;
+									break;
+								}
+
+								sum += std::sqrt(squared);
+							}
+
+							if (!finite)
+								continue;
+
+							const double inv = 1.0 / static_cast<double>(witness.count);
+							double centre_squared = 0.0;
+							double range_squared = 0.0;
+
+							for (u32 k = 0; k < 3; ++k)
+							{
+								const double d = (centre_now[k] - centre_prev[k]) * inv;
+								centre_squared += d * d;
+
+								// How far this witness is from the eye THIS candidate recovers. A
+								// wrong view rotation displaces a static point by range x rotation,
+								// so the drift only means something beside the range it happened at.
+								const double r = (centre_now[k] * inv) - static_cast<double>(slot.now_eye[k]);
+								range_squared += r * r;
+							}
+
+							// Per unit of guest depth, so one camera emitted at two column scales --
+							// which this title does, an exact 10x on columns 0 and 1 -- ranks the
+							// same instead of the larger one being penalised for its scale.
+							//
+							// THE GUARD WAS `> 1e-6f` AND THAT SILENTLY BROKE THE THING IT EXISTS FOR.
+							// A candidate at this title's dscale of 7.232e-08 does not clear 1e-6, so
+							// `scale` fell back to 1.0 and its drift was reported RAW -- in a recovered
+							// space compressed ~1.4e7x against every other row's. Its drift column read
+							// 0.002402 not because it was steady but because its whole world is small,
+							// which is the precise failure the division exists to prevent, applied
+							// backwards. It is also the column PCSX2_REMIX_CAMTEST = 2 elects on.
+							//
+							// 1e-30 is a numerical floor, not a policy: 7.232e-08 is a perfectly well
+							// conditioned divisor in double, and the only value that must not be
+							// divided by is one that is zero or denormal. EXPECT THE REPORTED DRIFT OF
+							// ANY ROW WITH dscale < 1e-6 TO JUMP BY 1/dscale AGAINST EARLIER SESSIONS
+							// -- that is the correction, not a regression. Alpha is unaffected: it
+							// never went through `scale` at all, which is why alpha and drift
+							// disagreed about the same row.
+							const double scale = (std::isfinite(slot.depth_scale) && slot.depth_scale > 1e-30f)
+													 ? static_cast<double>(slot.depth_scale)
+													 : 1.0;
+
+							drifts[used] = static_cast<float>((sum * inv) / scale);
+							centroids[used] = static_cast<float>(std::sqrt(centre_squared) / scale);
+							++used;
+
+							// Scale-free, and computed from the RAW recovered values: the range
+							// carries the same recovered scale as the drift, so it cancels.
+							const double range = std::sqrt(range_squared);
+							if (range > 1e-3 && turn_radians > 1e-6)
+							{
+								alphas[alpha_used] = static_cast<float>((sum * inv) / (range * turn_radians));
+								++alpha_used;
+							}
+						}
+
+						if (used == 0)
+							continue;
+
+						// MEDIAN, not mean: some witnesses are genuinely dynamic geometry -- a
+						// character, a door, a vehicle in motion -- and those move in world space
+						// under the correct camera too.
+						witnesses_used = std::max(witnesses_used, used);
+
+						slot.last_witnesses = used;
+						slot.last_alpha_witnesses = alpha_used;
+						slot.last_drift = camtest_median(drifts, used);
+						slot.last_centroid_drift = camtest_median(centroids, used);
+						slot.last_alpha = (alpha_used > 0) ? camtest_median(alphas, alpha_used) : 0.f;
+						++slot.pairs;
+
+						slot.history[slot.history_next] = slot.last_drift;
+						slot.history_next = (slot.history_next + 1) % camtest_history;
+						slot.history_count = std::min(slot.history_count + 1, camtest_history);
+					}
+
+					if (witnesses_used > 0)
+					{
+						++s_camtest_pairs;
+						s_camtest_cycle_paired = true;
+
+						if (s_camtest_round == 0 || witnesses_used < s_camtest_round_witness_min)
+							s_camtest_round_witness_min = witnesses_used;
+
+						// The lever arm this pair actually delivered. Reported as mean/min/max
+						// rather than mean alone: the mean hid that every pair in the first round
+						// was under half a degree.
+						if (s_camtest_round == 0 || turn < s_camtest_round_turn_min)
+							s_camtest_round_turn_min = turn;
+
+						s_camtest_round_turn_max = std::max(s_camtest_round_turn_max, turn);
+						s_camtest_round_span += static_cast<double>(span);
+						s_camtest_round_span_max =
+							std::max(s_camtest_round_span_max, static_cast<u32>(span));
+
+						s_camtest_hb_pair_turn_sum += turn;
+						s_camtest_hb_pair_turn_max = std::max(s_camtest_hb_pair_turn_max, turn);
+						s_camtest_hb_pair_span_sum += static_cast<double>(span);
+						++s_camtest_hb_pair_count;
+
+						++s_camtest_round;
+						s_camtest_round_turn += turn;
+						s_camtest_round_move += move;
+						s_camtest_round_witnesses += static_cast<double>(witnesses_used);
+						s_camtest_round_inside += static_cast<double>(inside);
+
+						// max(), not a sum: under CAMTESTALL every splitting triple is noted by both
+						// paths, so `raw` already contains `split` and adding them would double-count.
+						s_camtest_round_scored +=
+							static_cast<double>(std::max(noted_split, noted_raw) + noted_probe);
+						s_camtest_round_scored_split += static_cast<double>(noted_split);
+						s_camtest_round_scored_probe += static_cast<double>(noted_probe);
+
+						// Adaptive target: 8, 16, 32, 60, 60, ... The per-candidate drift history is a
+						// 64-deep ring that a report does not clear, so table N+1 is always computed
+						// over more evidence than table N -- an early table is noisy, never wrong in a
+						// way a later one does not correct.
+						u32 target = camtest_first_round_pairs();
+						for (u32 i = 0; i < s_camtest_rounds_done && target < camtest_round_pairs_max; ++i)
+							target *= 2;
+
+						target = std::min(target, camtest_round_pairs_max);
+
+						if (s_camtest_round >= target)
+						{
+							++s_camtest_rounds_done;
+							camtest_report(window);
+							s_camtest_round = 0;
+							s_camtest_round_turn = 0.0;
+							s_camtest_round_move = 0.0;
+							s_camtest_round_witnesses = 0.0;
+							s_camtest_round_inside = 0.0;
+							s_camtest_round_witness_min = 0;
+							s_camtest_round_scored = 0.0;
+							s_camtest_round_scored_split = 0.0;
+							s_camtest_round_scored_probe = 0.0;
+							s_camtest_round_turn_min = 0.0;
+							s_camtest_round_turn_max = 0.0;
+							s_camtest_round_span = 0.0;
+							s_camtest_round_span_max = 0;
+						}
+					}
+				}
+			}
+
+			// NOTE: the anchor is NOT advanced here any more. It moves only in the arm branch above,
+			// which is what lets the turn accumulate across a span instead of being reset to the
+			// previous window every time. The old unconditional advance is what capped the lever arm
+			// at one window of rotation -- 0.44 deg on this title at full stick.
+
+			// ---- HEARTBEAT -----------------------------------------------------------------
+			// SILENCE IS NOT AN ACCEPTABLE OUTPUT. An armed instrument that produces nothing for
+			// 551 windows has told the user nothing about which of its preconditions failed, and
+			// three sessions were spent that way. This fires on a fixed window cadence whether or
+			// not a round does, and the two numbers that separate the two failure causes --
+			// 'eye turn max' and 'survivors' -- are printed first.
+			if (const u32 cadence = camtest_heartbeat_windows();
+				cadence > 0 && window >= (s_camtest_hb_window + cadence))
+			{
+				const double inv = (s_camtest_hb_windows > 0)
+									   ? (1.0 / static_cast<double>(s_camtest_hb_windows)) : 0.0;
+				const double inv_turn = (s_camtest_hb_turn_count > 0)
+											? (1.0 / static_cast<double>(s_camtest_hb_turn_count)) : 0.0;
+
+				u32 target = camtest_first_round_pairs();
+				for (u32 i = 0; i < s_camtest_rounds_done && target < camtest_round_pairs_max; ++i)
+					target *= 2;
+
+				target = std::min(target, camtest_round_pairs_max);
+
+				u32 witnesses_live = 0;
+				for (const camtest_witness& witness : s_camtest_witnesses)
+					witnesses_live += (witness.key != 0) ? 1u : 0u;
+
+				const double inv_pair = (s_camtest_hb_pair_count > 0)
+											? (1.0 / static_cast<double>(s_camtest_hb_pair_count)) : 0.0;
+
+				INFO_LOG("Remix: CAMTEST heartbeat @ frame {} -- {} rounds so far, {}/{} pairs toward "
+						 "the next. Over the last {} windows: LEVER ARM on counted pairs mean {:.2f} "
+						 "deg max {:.2f} deg over a mean span of {:.1f} windows ({} pairs); "
+						 "ACCUMULATED TURN anchor->now max {:.3f} deg mean {:.3f} deg over {} "
+						 "evaluations (need {:.3f}..{:.3f}, span cap {}); WITNESSES SURVIVING to the "
+						 "anchor: last {} max {}. Witness draws/window mean {:.1f} max {}, table holds "
+						 "{} of {}. Anchors: {} cycles, re-anchored {} on harvest {} on span {} on "
+						 "jump. Since last beat: pairs +{}, rejected +{} no-turn +{} jump, dropped +{} "
+						 "at a viewport edge, +{} for a full witness table, +{} orphaned witnesses "
+						 "(drew once, never paired). Candidates {} of {} slots, {} evicted with "
+						 "history. Session totals: {} pairs, {} no-turn, {} jump, {} edge-dropped, {} "
+						 "overflow, {} orphans.",
+					window, s_camtest_rounds_done, s_camtest_round, target,
+					s_camtest_hb_windows,
+					s_camtest_hb_pair_turn_sum * inv_pair, s_camtest_hb_pair_turn_max,
+					s_camtest_hb_pair_span_sum * inv_pair, s_camtest_hb_pair_count,
+					s_camtest_hb_turn_max, s_camtest_hb_turn_sum * inv_turn, s_camtest_hb_turn_count,
+					camtest_min_turn_degrees(), camtest_max_turn_degrees(), camtest_span_windows(),
+					s_camtest_hb_survivors_last, s_camtest_hb_survivors_max,
+					s_camtest_hb_inside_sum * inv, s_camtest_hb_inside_max,
+					witnesses_live, camtest_witness_slots,
+					s_camtest_anchor_cycles, s_camtest_reanchor_harvest, s_camtest_reanchor_span,
+					s_camtest_reanchor_jump,
+					s_camtest_pairs - s_camtest_hb_pairs_at,
+					s_camtest_reject_turn - s_camtest_hb_noturn_at,
+					s_camtest_reject_jump - s_camtest_hb_jump_at,
+					s_camtest_clipped_draws - s_camtest_hb_clipped_at,
+					s_camtest_witness_overflow - s_camtest_hb_overflow_at,
+					s_camtest_orphans - s_camtest_hb_orphans_at,
+					s_camtest_used, camtest_candidate_slots, s_camtest_evictions,
+					s_camtest_pairs, s_camtest_reject_turn, s_camtest_reject_jump,
+					s_camtest_clipped_draws, s_camtest_witness_overflow, s_camtest_orphans);
+
+				// The one-line verdict, so the reading does not have to be re-derived each time.
+				if (s_camtest_pairs == s_camtest_hb_pairs_at)
+				{
+					if (s_camtest_hb_turn_count == 0)
+						INFO_LOG("Remix: CAMTEST heartbeat verdict -- NO PAIRS, AND NO WINDOW STEP WAS "
+								 "EVER FORMED. Not a turn problem and not a witness problem: no window "
+								 "in the last {} carried an accepted world-mode non-sky draw with a "
+								 "valid world camera, so there was never a `previous` to pair against. "
+								 "Witness draws/window reads {:.1f}. Look at whether the world camera "
+								 "is alive at all (the 'camera world score' field on the vu stats line) "
+								 "before looking at anything here.",
+							s_camtest_hb_windows, s_camtest_hb_inside_sum * inv);
+					else if (s_camtest_hb_turn_max < static_cast<double>(camtest_min_turn_degrees()))
+						INFO_LOG("Remix: CAMTEST heartbeat verdict -- NO PAIRS: THE ACCUMULATED TURN "
+								 "NEVER REACHED THE THRESHOLD (max {:.3f} deg over a span of up to {} "
+								 "windows, need {:.3f}). Either the eye is not turning, or the span is "
+								 "too short for how slowly it is turning -- 'ACCUMULATED TURN ... over "
+								 "N evaluations' above says which, since a still eye gives max ~0 at "
+								 "every span. Raise PCSX2_REMIX_CAMTESTSPAN to accumulate longer, or "
+								 "lower PCSX2_REMIX_CAMTESTTURNMIN (both milli-degrees / windows) to "
+								 "accept a shorter lever arm -- the second buys pairs at the cost of "
+								 "the ranking being noisier.",
+							s_camtest_hb_turn_max, camtest_span_windows(), camtest_min_turn_degrees());
+					else if (s_camtest_hb_survivors_max == 0)
+						INFO_LOG("Remix: CAMTEST heartbeat verdict -- NO PAIRS, BUT THE EYE DID TURN "
+								 "(max {:.3f} deg). NO WITNESS EVER REACHED A SECOND WINDOW, so the "
+								 "fault is in the sampler, not the input: check 'orphaned' and "
+								 "'full witness table' above, and note that a witness must draw in two "
+								 "CONSECUTIVE geometry-carrying windows with an identical (material, "
+								 "vertex count, index count) key and a screen box strictly inside the "
+								 "viewport.",
+							s_camtest_hb_turn_max);
+					else
+						INFO_LOG("Remix: CAMTEST heartbeat verdict -- NO PAIRS, but the eye turned "
+								 "(max {:.3f} deg) AND {} witnesses did survive. The two halves are "
+								 "not landing on the same window pair: turn CONTINUOUSLY rather than "
+								 "in bursts, and check the jump rejections above against "
+								 "PCSX2_REMIX_CAMTESTTURNMAX.",
+							s_camtest_hb_turn_max, s_camtest_hb_survivors_max);
+				}
+
+				s_camtest_hb_window = window;
+				s_camtest_hb_windows = 0;
+				s_camtest_hb_inside_sum = 0.0;
+				s_camtest_hb_inside_max = 0;
+				s_camtest_hb_survivors_max = 0;
+				s_camtest_hb_turn_sum = 0.0;
+				s_camtest_hb_turn_max = 0.0;
+				s_camtest_hb_turn_count = 0;
+				s_camtest_hb_pair_turn_sum = 0.0;
+				s_camtest_hb_pair_turn_max = 0.0;
+				s_camtest_hb_pair_span_sum = 0.0;
+				s_camtest_hb_pair_count = 0;
+				s_camtest_hb_pairs_at = s_camtest_pairs;
+				s_camtest_hb_noturn_at = s_camtest_reject_turn;
+				s_camtest_hb_jump_at = s_camtest_reject_jump;
+				s_camtest_hb_clipped_at = s_camtest_clipped_draws;
+				s_camtest_hb_overflow_at = s_camtest_witness_overflow;
+				s_camtest_hb_orphans_at = s_camtest_orphans;
+			}
+		}
+
+		// Cleared alongside worldfix_reset_all(), and for the reason recorded there: s_frame_counter
+		// is zeroed on GS close, so slots carrying frame indices from the previous session would sit
+		// permanently in the future and the test would silently pair nothing.
+		void camtest_reset_all()
+		{
+			for (camtest_witness& slot : s_camtest_witnesses)
+				slot = camtest_witness{};
+
+			for (camtest_candidate& slot : s_camtest_candidates)
+				slot = camtest_candidate{};
+
+			// The index points into the array that was just cleared; leaving it populated would
+			// hand a stale slot back for a key whose history no longer exists.
+			camtest_index_reset();
+
+			s_camtest_used = 0;
+			s_camtest_started = false;
+			s_camtest_skipped = 0;
+			s_camtest_elected_key = 0;
+			s_camtest_prev_window = 0;
+			s_camtest_prev_valid = false;
+			s_camtest_inside_draws = 0;
+			s_camtest_clipped_draws = 0;
+			s_camtest_pairs = 0;
+			s_camtest_reject_turn = 0;
+			s_camtest_reject_jump = 0;
+			s_camtest_round = 0;
+			s_camtest_round_turn = 0.0;
+			s_camtest_round_move = 0.0;
+			s_camtest_round_witnesses = 0.0;
+			s_camtest_round_inside = 0.0;
+			s_camtest_round_witness_min = 0;
+			s_camtest_round_scored = 0.0;
+			s_camtest_round_scored_split = 0.0;
+			s_camtest_round_scored_probe = 0.0;
+			s_camtest_noted_split = 0;
+			s_camtest_noted_raw = 0;
+			s_camtest_noted_probe = 0;
+			s_camtest_witness_overflow = 0;
+			s_camtest_orphans = 0;
+			s_camtest_evictions = 0;
+			s_camtest_rounds_done = 0;
+			s_camtest_hb_window = 0;
+			s_camtest_hb_windows = 0;
+			s_camtest_hb_inside_sum = 0.0;
+			s_camtest_hb_inside_max = 0;
+			s_camtest_hb_survivors_last = 0;
+			s_camtest_hb_survivors_max = 0;
+			s_camtest_hb_turn_sum = 0.0;
+			s_camtest_hb_turn_max = 0.0;
+			s_camtest_hb_turn_count = 0;
+			s_camtest_hb_pairs_at = 0;
+			s_camtest_hb_noturn_at = 0;
+			s_camtest_hb_jump_at = 0;
+			s_camtest_hb_clipped_at = 0;
+			s_camtest_hb_overflow_at = 0;
+			s_camtest_hb_orphans_at = 0;
+			s_camtest_hb_pair_turn_sum = 0.0;
+			s_camtest_hb_pair_turn_max = 0.0;
+			s_camtest_hb_pair_span_sum = 0.0;
+			s_camtest_hb_pair_count = 0;
+			s_camtest_round_turn_min = 0.0;
+			s_camtest_round_turn_max = 0.0;
+			s_camtest_round_span = 0.0;
+			s_camtest_round_span_max = 0;
+			s_camtest_anchor_arm = true;
+			s_camtest_cycle_paired = false;
+			s_camtest_anchor_cycles = 0;
+			s_camtest_reanchor_harvest = 0;
+			s_camtest_reanchor_span = 0;
+			s_camtest_reanchor_jump = 0;
+		}
+
 		// Latches the VU thread's candidates and turns the best one into a world camera.
 		// Runs after Present, so the camera resolved here is the one both the next frame's
 		// draws and the next frame's SetupCamera use -- geometry and camera always reference
 		// the same matrix (RPCS3's one-frame latch).
 		void resolve_world_camera()
 		{
+			// PCSX2_REMIX_CAMTEST scores the window that just ended against the candidate solvers
+			// that actually un-projected it, so it has to run before anything below replaces either
+			// of them. It is also where the mode the draw path reads is refreshed.
+			camtest_evaluate();
+
+			// PCSX2_REMIX_CAMDEPTH, refreshed once per resolve and cached for the whole window --
+			// the same discipline, and for the same two reasons, as s_camtest_active above: the
+			// environment must not be read from the draw path, and the frame election and the
+			// per-draw solver must enumerate the SAME family or they place geometry in two
+			// different worlds. Read live through env_int_live, never latched: the renderer goes
+			// live ~0.2 s before the per-game .conf is applied, and live_int would never see the
+			// .conf at all because it re-parses only on a generation counter the .conf does not
+			// bump. Four measurements on this project have already been lost to that.
+			{
+				const int depth_mode = camdepth_mode();
+				const int snap_mode = camdepth_snap();
+
+				if (depth_mode != s_camdepth_logged_mode)
+				{
+					s_camdepth_logged_mode = depth_mode;
+					INFO_LOG("Remix: PCSX2_REMIX_CAMDEPTH = {} ({}), snap {}. This is the w-column "
+							 "half of the hypothesis set. normalize_screen_clip only ever rewrote "
+							 "columns 0 and 1, and make_clip_solver reads columns {{0, 1, 3}} -- so "
+							 "the recovered world's UNIT is set by column 3 alone and NO hypothesis "
+							 "could change it. That is why the one candidate whose own rotation "
+							 "tracks the view (slice-vf pc=0x2040, own-turn 19.7 deg) reports "
+							 "dscale 7.232e-08 and is refused by PCSX2_REMIX_CAMSCALE. A ':w' "
+							 "hypothesis divides ALL SIXTEEN terms by the measured |column 3 xyz|, "
+							 "which is projectively invariant (same NDC) and lands dscale at ~1; a "
+							 "':zw' hypothesis exchanges columns 2 and 3 first, which is NOT "
+							 "invariant and recovers a different world. AT ANY NON-ZERO SETTING "
+							 "THIS CAN CHANGE THE PICTURE: the added hypotheses go through the same "
+							 "election as the originals, and a ':w' winner rescales the recovered "
+							 "world about the eye (scene radius, light placement, the depth-scale "
+							 "gate's verdict all move). Expect alpha to be UNCHANGED by ':w' except "
+							 "through the alpha accumulator's range > 1e-3 gate re-admitting near "
+							 "witnesses -- alpha divides drift by range and both carry the scale.",
+						depth_mode,
+						(depth_mode == 0) ? "off -- the seven screen hypotheses that shipped, unrenamed" :
+							((depth_mode == 1) ? "seven baseline + seven ':w' (whole matrix / |col3|)" :
+								((depth_mode == 2) ? "seven baseline + seven ':zw' (columns 2,3 swapped, then normalised)" :
+									"seven ':w' + seven ':zw', no baseline")),
+						(snap_mode > 0) ? "ON (divisor snapped to the nearest power of two within 2%)"
+										: "off (divisor used as measured)");
+				}
+
+				s_camdepth_active = depth_mode;
+				s_camdepth_snap_active = snap_mode;
+
+				// The eligibility gate, refreshed here for the same reason and read from the cache
+				// by every call site. Below 1 the gate (scale >= 1/limit && scale <= limit) is the
+				// empty set, so that is refused rather than honoured.
+				const float scale_limit = env_float_signed(L"PCSX2_REMIX_CAMSCALE", 8.f);
+				s_camera_scale_limit =
+					(std::isfinite(scale_limit) && scale_limit >= 1.f) ? scale_limit : 8.f;
+			}
+
 			RemixVU1Capture::Frame frame{};
 			const bool have = RemixVU1Capture::Latch(frame);
 
@@ -1911,10 +4841,37 @@ namespace RemixSubmit
 			s_stats.vu_reentrant += frame.kicks_reentrant;
 			s_stats.vu_sliced += frame.sliced_matrices;
 			s_stats.vu_sliced_published += frame.sliced_published;
+
+			s_stats.vu_programs_used = std::max(s_stats.vu_programs_used, frame.programs_used);
+			if (frame.programs_limit != 0)
+				s_stats.vu_programs_limit = frame.programs_limit;
+
+			s_stats.vu_programs_refused += frame.programs_refused;
+			if (frame.programs_refused != 0)
+			{
+				s_stats.vu_refused_start_pc = frame.refused_start_pc;
+				s_stats.vu_refused_ucode = frame.refused_ucode;
+			}
 			s_stats.cam_candidates += frame.count;
 			s_stats.cam_last_candidates = frame.count;
 
 			const viewport_constants vp = s_last_viewport;
+
+			static u32 transform_probes_written = 0;
+			if (remix_ps2::dump_enabled() && frame.transform_probe_valid && transform_probes_written < 8)
+			{
+				++transform_probes_written;
+				std::string probe = fmt::format("VU-PROBE f={} ucode=0x{:016x} base_qw={} matrix_qw={}",
+					s_frame_counter, frame.transform_probe_ucode, frame.transform_probe_base,
+					frame.transform_probe_matrix);
+				for (u32 qword = 0; qword < 64; ++qword)
+				{
+					const float* const v = &frame.transform_probe[qword * 4];
+					fmt::format_to(std::back_inserter(probe), " | q{:03d} [{:.6g} {:.6g} {:.6g} {:.6g}]",
+						(frame.transform_probe_base + qword) & 0x3FFu, v[0], v[1], v[2], v[3]);
+				}
+				dump_write(probe);
+			}
 
 			if (remix_ps2::nocam_enabled() || !have || frame.count == 0 || !vp.valid)
 			{
@@ -1926,32 +4883,9 @@ namespace RemixSubmit
 			const float height = static_cast<float>(vp.height);
 			const float reference_aspect = (height > 0.f) ? (width / height) : (4.f / 3.f);
 
-			// The guest's post-divide output space is not knowable in advance: the fused
-			// matrix may already carry the full 12.4 viewport fold, or emit pixels, or emit
-			// plain NDC and leave the viewport to a post-divide multiply-add in the VU. Try
-			// each, both majorness ways round, and let score_perspective decide. That is a
-			// handful of 4x4 inversions per frame.
-			struct hypothesis
-			{
-				const char* name;
-				float scale_x;
-				float offset_x;
-				float scale_y;
-				float offset_y;
-			};
-
-			const hypothesis hypotheses[] = {
-				// GS 12.4 subpixels: the exact inverse of the per-vertex un-projection.
-				{"gs", width * 8.f, vp.ofx + (width * 8.f) - 8.f + 0.05f,
-					-(height * 8.f), vp.ofy + (height * 8.f) - 8.f + 0.05f},
-				// Pixels, origin top-left. XYOFFSET cancels: it is added after this stage.
-				{"px", width * 0.5f, (width * 0.5f) - 0.5f, -(height * 0.5f), (height * 0.5f) - 0.5f},
-				// Already NDC, +Y up like Remix.
-				{"ndc", 1.f, 0.f, 1.f, 0.f},
-				// Already NDC, +Y down like the GS.
-				{"ndcY", 1.f, 0.f, -1.f, 0.f},
-			};
-
+			// The hypothesis set (fixed + derived) is enumerated by build_camera_hypotheses above,
+			// which the per-draw solver shares so the two can never disagree about what space the
+			// guest emits into.
 			float best_score = 0.f;
 			remix_ps2::vp_split best_split{};
 			remix_ps2::mat4 best_normalized = remix_ps2::mat4_identity();
@@ -1960,6 +4894,22 @@ namespace RemixSubmit
 			u8 best_source = 0;
 			const char* best_name = "";
 			bool best_transposed = false;
+
+			// The quantity the election maximises. It IS best_score under every mode but
+			// PCSX2_REMIX_CAMTEST = 2, which replaces it with a measured-drift rank; best_score is
+			// still recorded either way, because the hysteresis and the logging read it.
+			float best_rank = 0.f;
+			u64 best_camtest_key = 0;
+
+			// camtest_roll() USED TO BE CALLED HERE, unconditionally, once per window. It now lives
+			// inside camtest_evaluate() and fires only when the anchor advances -- rolling it every
+			// window is exactly what pinned the pair to a one-window separation and held the
+			// measurable turn down to 0.44 deg at full stick. Its new home is also the only instant
+			// at which the candidate solvers, the witness clip samples and the window's eye all
+			// describe the same window. Do not restore this call.
+
+			// Once per resolve, not per candidate and never per draw.
+			const int divcam = divcam_mode();
 
 			for (u32 c = 0; c < frame.count; ++c)
 			{
@@ -1980,64 +4930,29 @@ namespace RemixSubmit
 				{
 					const remix_ps2::mat4 oriented = (major == 0) ? raw : remix_ps2::mat4_transpose(raw);
 
-					// The four fixed hypotheses above assume the guest's post-divide space is
-					// one of the obvious ones. Rainbow Six 3's is not: it emits a [0,1]-style
-					// normalised space and keeps the aspect correction in a separate
-					// post-divide scale vector, so its offsets are 0.5 and nothing in the
-					// table matches.
-					//
-					// The offsets do not have to be guessed. For a fused matrix the viewport
-					// offset is *determined*: u = col0 - ox*col3 must be the view rotation's
-					// column 0 times a scalar, and that is only orthogonal to col3 for
-					// ox = dot(col0, col3) / |col3|^2. Same for oy. Any output range of the
-					// form NDC[-1,1] -> [0, R] additionally has scale == offset, which is
-					// what fixes sx.
-					//
-					// sy is then the one genuinely free parameter, and it is chosen so the
-					// recovered aspect equals the display's. Be clear about what that costs:
-					// score_perspective's aspect test is constructed rather than measured for
-					// these two hypotheses, so it no longer discriminates. Its fovY window
-					// still does, and the split itself -- which is what actually decides
-					// whether the matrix is a camera -- is untouched.
-					hypothesis derived[2] = {};
-					u32 derived_count = 0;
-					{
-						const float c3[3] = {oriented.m[0][3], oriented.m[1][3], oriented.m[2][3]};
-						const float len_sq = (c3[0] * c3[0]) + (c3[1] * c3[1]) + (c3[2] * c3[2]);
+					camera_hypothesis hypotheses[max_camera_hypotheses];
+					const u32 hypothesis_count = build_camera_hypotheses(oriented, vp, reference_aspect,
+						major != 0, candidate.source, candidate.ucode_hash, s_camdepth_active,
+						s_camdepth_snap_active, hypotheses);
 
-						if (len_sq > 1e-8f && std::isfinite(len_sq))
+					for (u32 h = 0; h < hypothesis_count; ++h)
+					{
+						const camera_hypothesis& hyp = hypotheses[h];
+
+						const remix_ps2::mat4 normalized = apply_camera_hypothesis(oriented, hyp);
+
+						// PCSX2_REMIX_CAMTESTALL. Noted HERE, above the split and above the shape
+						// score, because those two are exactly what this mode exists to stop being
+						// the arbiter. camtest_note_candidate below re-notes the same key for a
+						// triple that does split -- same normalised matrix, so the same solver and
+						// a bit-identical eye -- and adds the fovY the split makes available.
+						if (s_camtest_all_active > 0)
 						{
-							const float c0[3] = {oriented.m[0][0], oriented.m[1][0], oriented.m[2][0]};
-							const float c1[3] = {oriented.m[0][1], oriented.m[1][1], oriented.m[2][1]};
-
-							const float ox = ((c0[0] * c3[0]) + (c0[1] * c3[1]) + (c0[2] * c3[2])) / len_sq;
-							const float oy = ((c1[0] * c3[0]) + (c1[1] * c3[1]) + (c1[2] * c3[2])) / len_sq;
-
-							const float u[3] = {c0[0] - (ox * c3[0]), c0[1] - (ox * c3[1]), c0[2] - (ox * c3[2])};
-							const float v[3] = {c1[0] - (oy * c3[0]), c1[1] - (oy * c3[1]), c1[2] - (oy * c3[2])};
-
-							const float len_u = std::sqrt((u[0] * u[0]) + (u[1] * u[1]) + (u[2] * u[2]));
-							const float len_v = std::sqrt((v[0] * v[0]) + (v[1] * v[1]) + (v[2] * v[2]));
-
-							if (len_u > 1e-6f && len_v > 1e-6f && std::abs(ox) > 1e-6f && std::abs(oy) > 1e-6f)
-							{
-								const float sy_mag = std::abs(oy) * (len_v / len_u) / reference_aspect;
-
-								derived[0] = {"auto", ox, ox, -sy_mag, oy};
-								derived[1] = {"autoY", ox, ox, sy_mag, oy};
-								derived_count = 2;
-							}
+							camtest_note_raw(camtest_identity(candidate, major != 0, hyp.name),
+								candidate.source, candidate.mem_offset, candidate.start_pc,
+								candidate.ucode_hash, content, major != 0, hyp.name, hyp.scale_w,
+								hyp.swap_zw, normalized);
 						}
-					}
-
-					for (u32 h = 0; h < (std::size(hypotheses) + derived_count); ++h)
-					{
-						const hypothesis& hyp = (h < std::size(hypotheses)) ?
-						                            hypotheses[h] :
-						                            derived[h - std::size(hypotheses)];
-
-						const remix_ps2::mat4 normalized = remix_ps2::normalize_screen_clip(
-							oriented, hyp.scale_x, hyp.offset_x, hyp.scale_y, hyp.offset_y);
 
 						remix_ps2::vp_split split{};
 						remix_ps2::split_stage stage = remix_ps2::split_stage::accepted;
@@ -2070,8 +4985,21 @@ namespace RemixSubmit
 						// window scan turned up. The split and the perspective filter above
 						// have already agreed it is a camera; this only settles which of
 						// several accepted candidates the frame anchors to.
-						if (candidate.source != 0)
+						if (candidate.source == 4)
+							score += 100.f;
+						else if (candidate.source != 0)
 							score += 10.f;
+
+						// PCSX2_REMIX_DIVCAM. The microprogram's own statement about which matrix
+						// produced the perspective divide's denominator, which is the one piece of
+						// evidence here that is a definition rather than a heuristic.
+						const bool feeds_div =
+							(candidate.flags & RemixVU1Capture::candidate_flag_feeds_div) != 0;
+
+						if (divcam > 0 && feeds_div)
+							score += 100.f;
+						if (divcam >= 2 && !feeds_div)
+							score -= 1000.f;
 
 						if (score > candidate_best)
 						{
@@ -2080,8 +5008,39 @@ namespace RemixSubmit
 							remix_ps2::describe_projection(split.projection, candidate_params);
 						}
 
-						if (score > best_score)
+						// PCSX2_REMIX_CAMTEST. The identity is the whole (candidate, majorness,
+						// hypothesis) triple -- exactly what would be installed if this won -- so the
+						// drift measured for it is the drift of the thing being elected.
+						const u64 camtest_key = (s_camtest_active > 0)
+													? camtest_identity(candidate, major != 0, hyp.name)
+													: 0;
+
+						if (s_camtest_active > 0)
+							camtest_note_candidate(camtest_key, candidate, major != 0, hyp.name,
+								hyp.scale_w, hyp.swap_zw, content, normalized, split);
+
+						// Mode 2 ranks by measured drift instead of shape score. See
+						// camtest_rank_base for the ordering rule and for the fallback when nothing
+						// has been measured yet.
+						float rank = score;
+
+						if (s_camtest_active >= 2)
 						{
+							float drift = 0.f;
+							if (camtest_ranked_drift(camtest_key, drift))
+								rank = camtest_rank_base / (1.f + std::max(0.f, drift));
+						}
+
+						// The two new back-slice sources are AUDIT-ONLY until DIVCAM says otherwise.
+						// Everything above still ran for them -- the split, the score, the CAMTEST
+						// note and therefore the measured drift -- so they appear in the CAMTEST
+						// table with a real alpha and can be compared against the incumbent before
+						// anything is staked on them. They simply cannot win.
+						const bool election_eligible = (candidate.source < 6) || (divcam > 0);
+
+						if (election_eligible && rank > best_rank)
+						{
+							best_rank = rank;
 							best_score = score;
 							best_split = split;
 							best_normalized = normalized;
@@ -2090,6 +5049,7 @@ namespace RemixSubmit
 							best_source = candidate.source;
 							best_name = hyp.name;
 							best_transposed = (major != 0);
+							best_camtest_key = camtest_key;
 						}
 					}
 				}
@@ -2099,7 +5059,7 @@ namespace RemixSubmit
 					dump_write(fmt::format(
 						"f={} src={} off=0x{:04x} pc=0x{:04x} ucode=0x{:016x} shape={:.2f} res=[{} ] best={} "
 						"score={:.2f} fovY={:.2f} aspect={:.3f} near={:.5g} M={}",
-						s_frame_counter, (candidate.source == 0) ? "scan" : ((candidate.source == 1) ? "slice" : ((candidate.source == 2) ? "slice-tops" : "pinned")),
+						s_frame_counter, candidate_source_name(candidate.source),
 						candidate.mem_offset, candidate.start_pc, candidate.ucode_hash,
 						candidate.score, detail, candidate_name, candidate_best,
 						candidate_params.fov_y_degrees, candidate_params.aspect, candidate_params.near_plane,
@@ -2107,10 +5067,94 @@ namespace RemixSubmit
 				}
 			}
 
+			// PCSX2_REMIX_CAMTESTALL = 2. Deliberately OUTSIDE the loop above, and after it: these
+			// are not candidates, they are the VU1 neighbourhood the slicer never reads. Nothing
+			// below this point can see them -- best_rank, best_split and s_camtest_elected_key are
+			// already decided from frame.items[] alone -- so they are measured and nothing else.
+			if (s_camtest_all_active >= 2)
+				camtest_scan_probe(frame, vp, reference_aspect);
+
 			if (!(best_score > 0.f))
 			{
 				drop_stale_camera();
 				return;
+			}
+
+			// The identity of the triple the election just installed, so the CAMTEST table can mark
+			// its row. Updated only on an actual election: a window that elects nothing is still
+			// drawing with the previous camera, and so is still described by its row.
+			s_camtest_elected_key = best_camtest_key;
+
+			// --- PCSX2_REMIX_WORLDFIX: the one sign the hypothesis set cannot reach ---------------
+			//
+			// m[1][1] of the recovered projection is POSITIVE BY CONSTRUCTION and no hypothesis can
+			// change it. try_split_once takes up = forward x (up_hint x forward), which is just the
+			// component of up_hint perpendicular to forward, and up_hint is by definition the world
+			// direction in which clip y increases -- so up . col1 > 0 always. Negating scale_y does
+			// flip col1, but it also flips up_hint, hence right and up, and the two flips cancel
+			// there. What does NOT cancel is m[0][0]: the sign of scale_x or scale_y flips it either
+			// way. So the hypothesis set spans exactly TWO of the four sign combinations, m[0][0] is
+			// the only free bit, and score_perspective merely docks 0.5 for it
+			// (RemixTransforms.cpp:502-503) -- a penalty the +100 source bonus above swamps
+			// completely. (The `m[1][1] < 0` penalty on the next line there is unreachable from this
+			// path for the same reason.)
+			//
+			// That bit is the recovered world's HANDEDNESS. Getting it wrong mirrors the recovered
+			// world about the plane spanned by the camera's forward and up axes -- a plane whose
+			// normal is `right`, which is horizontal, and which TURNS WITH THE EYE. A mirror plane
+			// that rotates re-mirrors the world every frame, so static geometry counter-rotates at
+			// twice the yaw rate and a fixed directional light's shadow swings as the player turns.
+			// The rendered image cannot show it: negating column 0 of the normalised fused matrix
+			// negates the recovered world's lateral axis AND the projection's m[0][0], the camera is
+			// re-derived from that same matrix, and view * projection == fused still holds exactly.
+			// The picture is bit-identical; only the world coordinates move.
+			//
+			// Which sign is correct cannot be decided from one frame -- that is precisely what the
+			// WORLDFIX audit measures across frames. So this offers both directions and neither is
+			// the default.
+			if (const int worldfix = worldfix_mode(); worldfix >= 2)
+			{
+				const bool want_positive = (worldfix == 2);
+
+				if ((best_split.projection.m[0][0] < 0.f) == want_positive)
+				{
+					// Negating column 0 of the normalised fused matrix IS negating the winning
+					// hypothesis' scale_x: normalize_screen_clip divides column 0 by it. Doing it
+					// here rather than re-running the hypothesis loop keeps every other term of the
+					// election -- candidate, majorness, offsets -- exactly as it was scored.
+					remix_ps2::mat4 flipped = best_normalized;
+					for (u32 i = 0; i < 4; ++i)
+						flipped.m[i][0] = -flipped.m[i][0];
+
+					remix_ps2::vp_split reflected{};
+					if (remix_ps2::split_view_projection_direct(flipped, reflected))
+					{
+						best_normalized = flipped;
+						best_split = reflected;
+
+						static bool logged = false;
+						if (!logged)
+						{
+							logged = true;
+							INFO_LOG("Remix: WORLDFIX {} flipped the recovered world's handedness -- "
+									 "projection m00 is now {:.5g}. The image is unchanged by "
+									 "construction; only the recovered world coordinates move. If "
+									 "this is the right direction, WORLDFIX audit alpha falls to ~0 "
+									 "and a static object's shadow stops swinging as you turn.",
+								worldfix, best_split.projection.m[0][0]);
+						}
+					}
+					else
+					{
+						static bool warned = false;
+						if (!warned)
+						{
+							warned = true;
+							WARNING_LOG("Remix: WORLDFIX {} could not re-split the handedness-flipped "
+										"matrix -- leaving the camera as elected", worldfix);
+						}
+					}
+				}
 			}
 
 			world_camera camera{};
@@ -2328,11 +5372,24 @@ namespace RemixSubmit
 			++s_stats.cam_accept;
 			if (best_source != 0)
 				++s_stats.cam_accept_sliced;
+			if (!s_drawdump_world_armed)
+			{
+				s_drawdump_world_armed = true;
+				s_drawdump_started = false;
+				s_drawdump_frames_left = 0;
+				s_drawdump_skipped = 0;
+			}
 
 			// Pin the address the winner came from. A camera actually recovered from an
 			// offset is stronger evidence than any shape score, and without it the true
 			// matrix has to out-rank thousands of shape-plausible windows every frame.
-			RemixVU1Capture::SetPinnedOffset(best_offset);
+			//
+			// A register-resident winner (source 7) has no address to pin -- its rows are VF
+			// registers -- and it publishes 0xFFFFFFFF for exactly that reason. Leave the
+			// existing pin alone rather than clearing it: the per-kick ring behind it is a
+			// separate mechanism and there is no reason to retire a working address.
+			if (best_source != 7)
+				RemixVU1Capture::SetPinnedOffset(best_offset);
 
 			if (!s_logged_world_camera)
 			{
@@ -2343,13 +5400,622 @@ namespace RemixSubmit
 						 "[matrix-implied near {:.5g}, not used]",
 					(best_source == 0) ? "window scan" :
 						((best_source == 1) ? "ucode back-slice" :
-							((best_source == 2) ? "ucode back-slice (TOPS)" : "pinned back-slice address")),
+							((best_source == 2) ? "ucode back-slice (TOPS)" :
+								((best_source == 3) ? "pinned back-slice address" : "SOCOM CA fixed VU block"))),
 					best_name, best_transposed ? "column-major" : "row-major", best_score,
 					params.fov_y_degrees, camera.near_plane, camera.far_plane,
 					camera.position[0], camera.position[1], camera.position[2],
 					camera.depth_scale, camera.depth_anisotropy,
 					described ? params.near_plane : 0.f);
 			}
+
+			// The three numbers that decide the WORLDFIX diagnosis and that no existing line prints.
+			// m00's SIGN is the recovered world's handedness (see the correction site above); its
+			// magnitude with m11 gives the recovered aspect, and the gap between that and the
+			// display's is the only term of score_perspective that can be wrong without any other
+			// symptom -- on this title the elected hypothesis scores 5.00 out of a possible 6.00 and
+			// the aspect term is the one that was docked.
+			if (worldfix_mode() > 0 && !s_worldfix_logged_projection)
+			{
+				s_worldfix_logged_projection = true;
+				const float aspect_recovered = (std::abs(best_split.projection.m[0][0]) > 1e-6f)
+												   ? (std::abs(best_split.projection.m[1][1]) / std::abs(best_split.projection.m[0][0]))
+												   : 0.f;
+				INFO_LOG("Remix: WORLDFIX projection -- m00 {:.5g} (sign {}), m11 {:.5g}, recovered "
+						 "aspect {:.4f} vs display {:.4f} (delta {:.4f}), fovY {:.2f} deg, fovX "
+						 "{:.2f} deg. m00 < 0 means the recovered world is a mirror image; m11 is "
+						 "positive by construction.",
+					best_split.projection.m[0][0], (best_split.projection.m[0][0] < 0.f) ? "-" : "+",
+					best_split.projection.m[1][1], aspect_recovered, reference_aspect,
+					std::abs(aspect_recovered - reference_aspect), params.fov_y_degrees,
+					(std::abs(best_split.projection.m[0][0]) > 1e-6f)
+						? static_cast<float>(2.0 * std::atan(1.0 / std::abs(static_cast<double>(best_split.projection.m[0][0]))) * (180.0 / 3.14159265358979323846))
+						: 0.f);
+			}
+		}
+
+		// --- per-draw camera placement (step 4A) ----------------------------------------------
+		//
+		// WHAT THIS FIXES, and it is measured, not inferred. PCSX2_REMIX_FRAMETRACE=600 on the
+		// user's own SOCOM CA gameplay run (logs\remix_matrices.txt, 600 FRAME lines) says:
+		//
+		//   * 200 of 600 presented windows submit ZERO geometry, and the spacing between empty
+		//     windows is exactly 3 in 199 of 199 cases. That is the game's 40 fps against our
+		//     60 Hz present. It is real, it is expected, and it is NOT the defect.
+		//   * On the 400 non-empty windows, ringN/draws has a median of 0.999 -- essentially
+		//     every draw in the window carries a kick camera DIFFERENT from the window's first
+		//     draw. Exactly one window in 400 had ringN == 0.
+		//   * Window N's first draw carries window N-1's second camera in 398 of 399 cases
+		//     (99.7%): draw 0 is one game-frame stale, and the rest of the window is current.
+		//   * The frame-latched camera that un-projects the WHOLE window equals that stale
+		//     first-draw camera in 394 of 400 windows (98.5%), and equals the camera ~99.9% of
+		//     the draws were actually built under in 4 of 400 (1%).
+		//
+		// So the backend un-projects ~830 draws per frame with a camera belonging to exactly one
+		// of them -- the first -- and that one is a game-frame out of date. Un-projection inverts
+		// a view-projection, so applying the wrong inverse is a PROJECTIVE error, not a rigid one:
+		// near vertices barely move, far vertices swing hard, and a triangle spanning depth
+		// becomes a spike. That is the shattering in the user's clip, and it is why the damage
+		// stays inside scene scale (extent-reject reads 0 in every stats block) instead of
+		// flinging geometry to infinity.
+		//
+		// REFUTED, with the measurement, so none of these is re-chased:
+		//   * Camera REFUSAL. `REFUSED 0` and `cam world 897 fallback 3` at frame 900; accept
+		//     climbs +300 per 300-frame stats block. resolve_world_camera accepts on essentially
+		//     every frame. Do not re-derive this.
+		//   * Camera DROPOUT / stale-hold. fresh=0 on ZERO of the 600 traced windows -- a camera
+		//     is accepted for every single one -- and `age` is exactly 200 windows at 1 and 200 at
+		//     2, which is the 40/60 pacing and nothing else. drop_stale_camera() never fired
+		//     in-mission. The seed's "one frame in three latches ZERO candidates" is dead: the
+		//     matrix dump's period-3 gaps are windows in which the game built no frame at all
+		//     (no new matrices of ANY source, object matrices included).
+		//   * The RING FAILING TO RECORD. miss totals 823 across all 600 windows and every one of
+		//     them is in the very first traced window, before the pin settled. The kick ring
+		//     records reliably; branch C of the plan is ruled out.
+		//
+		// THE TRAP THAT NEARLY SANK THIS, AND WHY IT IS NOT ONE. The four figures above hash the
+		// RAW 16 floats the ring returns, and this title emits its camera at TWO COLUMN SCALES: the
+		// gameplay draw dump (logs\remix_draws.txt, frames 1834/1836/1837/1839) shows exactly two
+		// matrices per frame at the same VU1 offset 0x0080, one at d=0 and one at d=22/23, related
+		// by an EXACT uniform scale of 10.0000 on columns 0 and 1 with columns 2 and 3 bit-equal --
+		// unanimous over all four frames and all four rows. If the acceptance pipeline normalised
+		// that scale away, both would produce ONE solver, every raw-hash counter above would still
+		// read 0.999, and per-draw placement would change precisely nothing on screen. That is this
+		// project's oldest failure mode: a counter that passes while the picture does not move.
+		//
+		// MEASURED 2026-08-15, and it settles it: THE PIPELINE DOES NOT ABSORB THE SCALE. Over the
+		// 1301 `src=socom-fixed` candidate lines in remix_matrices.txt --
+		//   * The winning hypothesis is `ndc` in 1301 of 1301. normalize_screen_clip(m, 1, 0, 1, 0)
+		//     composes with the IDENTITY, so the matrix reaches the split completely unmodified and
+		//     there is no stage left that could divide a scale out.
+		//   * The derived `auto`/`autoY` hypotheses -- the only ones that WOULD absorb it, being
+		//     derived from the matrix and therefore scaling with it -- are not even generated for
+		//     this title's row-major orientation. The dump's own res= field says so:
+		//     `res=[ gs/R=- px/R=- ndc/R=5.00 ndcY/R=4.50 gs/C=- px/C=- ndc/C=- ndcY/C=- auto/C=-
+		//     autoY/C=- ]`. auto/R and autoY/R are absent because oy computes to ~0 here and
+		//     build_camera_hypotheses requires |oy| > 1e-6.
+		//   * The recovered fovY tracks the column scale ONE FOR ONE. The fovY histogram is
+		//     112.64 (n=803), 112.11 (246), 28.08 (111), 17.07 (61); tan(fovY/2) of those groups
+		//     stands in ratio 1.000 : 1.010 : 6.001 : 9.999 to the base group -- the 10x variant is
+		//     right there as its own fovY. Across 20 independent candidate pairs that share
+		//     columns 2&3 to within 1% while columns 0&1 differ by a uniform factor k (k from 0.77
+		//     to 1.18), tan(fovY/2) moves by that same k every time, to three decimals.
+		//   * `aspect` reads 1.244 on 1296 of 1301 and is the field that must NOT be used to answer
+		//     this: aspect is the ratio of the two scaled terms, so a UNIFORM (k,k) scale cancels
+		//     out of it by construction. Aspect stability is not evidence of absorption. It was
+		//     read as such once; do not repeat it.
+		//
+		// So the 10x pair is two genuinely different un-projections, and the difference has exactly
+		// the shape of the artefact: world' - world = 0.9 * w * B^-1 * (ndc_x, ndc_y, 0), which is
+		// ZERO at the screen centre and grows with both depth and screen offset. Centre stays,
+		// edges at distance fly. That is the spike.
+		//
+		// Because the raw hash and the normalised solver therefore separate the same cameras, the
+		// per-draw cache below is keyed on the RAW ring hash -- the cheap key -- and a per-window
+		// census counts the DISTINCT NORMALISED SOLVERS beside the distinct raw hashes so the two
+		// can never again be conflated. If `solvers` ever reads 1 on a window while `rings` reads
+		// 2+, the absorption story is back and per-draw placement is a dead end for that title;
+		// that is what the census is for and it costs one 12-float compare per draw.
+		//
+		// WHAT THIS DELIBERATELY DOES NOT CHANGE. SetupCamera stays frame-latched: the Remix
+		// camera is one per present by construction, and the frame camera is a perfectly good
+		// choice for it. Only the GEOMETRY moves to per-draw placement, which is the half that was
+		// wrong -- a draw's vertices must be un-projected through the matrix the guest actually
+		// projected them with, and nothing else.
+		//
+		// The contained fallback, if this ever proves unstable: latch the frame camera to the
+		// window's LAST/majority ring camera instead of its first. That fixes ~99.9% of the draws
+		// with none of this machinery, at the cost of the one straddling draw.
+
+		// PCSX2_REMIX_PERDRAWCAM: 1 places each draw with its own kick camera, 0 (DEFAULT) is the
+		// old frame-latched behaviour.
+		//
+		// DEFAULT 0, deliberately, even though the measurement above says the fix is sound. The
+		// per-window census this change also adds runs UNCONDITIONALLY, so the very next run
+		// reports whether a window's draws really do need more than one solver without altering a
+		// single pixel -- measurement first, behaviour second, one variable per arm, which is this
+		// project's standing rule after three separate arms passed their counter and failed the
+		// screenshot. The knob is live and the per-game .conf is re-polled about once a second, so
+		// the user can turn placement on MID-RUN by adding one conf line; no rebuild, no relaunch.
+		//
+		// READ LIVE, NEVER LATCHED. This is not a style preference, it is the trap that cost this
+		// project a whole measured run three hours ago: PCSX2_REMIX_FRAMETRACE shipped as
+		// `static const` and produced ZERO output on a run whose own log confirmed the knob was
+		// applied, because the renderer goes live at t=9.774 s and the per-game .conf is applied
+		// at t=10.008 s -- the latch cached 0 before the value existed and never re-read it. See
+		// frametrace_frames() for the full account. Any knob a .conf delivers MUST be live.
+		//
+		// Logged whenever the resolved value CHANGES rather than once at first use (the ALPHASTATE
+		// precedent, adapted for exactly the reason above): the first get() legitimately happens
+		// before the conf is applied, so a one-shot log would report the default and be wrong in
+		// the file the user reads to check the arm took.
+		int per_draw_camera_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_PERDRAWCAM", 0, 0, 1);
+			static int logged = -1;
+
+			const int mode = value.get();
+			if (mode != logged)
+			{
+				logged = mode;
+				INFO_LOG("Remix: PERDRAWCAM = {} -- {} (the per-window camera census runs either way; "
+						 "read 'per-draw camera' on the stats line)",
+					mode,
+					(mode != 0) ? "each draw is un-projected with the camera its own XGKICK carried; "
+								  "the frame-latched camera is the fallback and still drives SetupCamera" :
+								  "every draw is un-projected with the frame-latched camera (pre-4A behaviour)");
+			}
+
+			return mode;
+		}
+
+		// Two clip solvers are "the same camera" when every coefficient agrees to a relative
+		// tolerance. Relative to the whole block rather than per entry, because the coefficients
+		// span orders of magnitude and legitimately pass through zero.
+		//
+		// 1e-3 is set against what it has to separate, and the gap is four orders of magnitude:
+		// two cameras one game frame apart at 40 fps differ by whole percent of their rotation
+		// coefficients even at a gentle turn rate, while float rounding from an exact rescale
+		// differs by ~1e-7 relative. Nothing about this threshold is delicate.
+		bool solvers_equivalent(const remix_ps2::clip_solver& a, const remix_ps2::clip_solver& b)
+		{
+			constexpr float tol = 1e-3f;
+
+			float scale = 0.f;
+			for (u32 k = 0; k < 3; ++k)
+			{
+				for (u32 i = 0; i < 3; ++i)
+					scale = std::max(scale, std::max(std::abs(a.inverse[k][i]), std::abs(b.inverse[k][i])));
+			}
+
+			// A zero or non-finite block is not a camera and must not compare equal to anything,
+			// including another zero block.
+			if (!(scale > 0.f) || !std::isfinite(scale))
+				return false;
+
+			for (u32 k = 0; k < 3; ++k)
+			{
+				for (u32 i = 0; i < 3; ++i)
+				{
+					if (!(std::abs(a.inverse[k][i] - b.inverse[k][i]) <= (tol * scale)))
+						return false;
+				}
+			}
+
+			float bias_scale = 0.f;
+			for (u32 i = 0; i < 3; ++i)
+				bias_scale = std::max(bias_scale, std::max(std::abs(a.bias[i]), std::abs(b.bias[i])));
+
+			for (u32 i = 0; i < 3; ++i)
+			{
+				if (!(std::abs(a.bias[i] - b.bias[i]) <= (tol * std::max(bias_scale, 1e-6f))))
+					return false;
+			}
+
+			return true;
+		}
+
+		// One solved clip solver per distinct ring camera. Tiny on purpose: the trace says a window
+		// contains at most two distinct kick cameras (the stale first draw's, and the current game
+		// frame's), so eight slots hold several windows of history and the solve runs about twice
+		// per frame -- against the 32-candidate x 14-hypothesis search resolve_world_camera already
+		// does every frame, that is noise.
+		//
+		// A REFUSED matrix is cached too, as valid = false. Without that, a ring hash the pipeline
+		// rejects would re-run the full hypothesis search on every one of the ~830 draws that carry
+		// it, which would turn a fallback into a frame-time cliff.
+		struct per_draw_camera_entry
+		{
+			u64 hash = 0; // ring matrix content hash; 0 = empty slot
+			bool solved = false; // false = the acceptance pipeline refused this matrix
+			u64 last_used = 0; // s_frame_counter of the last hit, for eviction
+			remix_ps2::clip_solver solver{};
+		};
+
+		inline constexpr u32 per_draw_camera_slots = 8;
+		per_draw_camera_entry s_per_draw_cameras[per_draw_camera_slots]{};
+
+		// --- the per-window camera census -----------------------------------------------------
+		//
+		// The single most decisive number this change produces, and the answer to a question the
+		// ring-hash counters structurally cannot answer: how many DISTINCT CAMERAS -- after
+		// normalisation, i.e. as actual un-projections rather than as raw VU1 matrices -- did the
+		// draws of one presented window get built under?
+		//
+		//   solvers == 1  -> every draw in the window shares one camera. Per-draw placement can
+		//                    then change nothing, whatever the raw ring hashes say, and the
+		//                    shattering has some other cause. Stop and re-diagnose.
+		//   solvers >= 2  -> the window genuinely straddles two cameras. Branch A stands.
+		//
+		// `rings` is the same census over the RAW ring hashes, kept beside it on purpose: rings
+		// above solvers is exactly the "same camera at two column scales" case this title turned
+		// out to have (see the block comment above), and having both numbers side by side is what
+		// stops the raw count ever being read as proof of multi-camera rendering again.
+		//
+		// Accumulated on the GS thread during the window, read and reset once in OnVSync.
+		struct window_camera_census
+		{
+			u32 solver_count = 0;
+			u32 ring_count = 0;
+			bool overflowed = false; // more than the slots below could hold, in either census
+			remix_ps2::clip_solver solvers[per_draw_camera_slots];
+			u64 rings[per_draw_camera_slots];
+		};
+
+		window_camera_census s_window_cameras{};
+
+		void census_note_solver(const remix_ps2::clip_solver& solver)
+		{
+			for (u32 i = 0; i < s_window_cameras.solver_count; ++i)
+			{
+				if (solvers_equivalent(s_window_cameras.solvers[i], solver))
+					return;
+			}
+
+			if (s_window_cameras.solver_count >= per_draw_camera_slots)
+			{
+				s_window_cameras.overflowed = true;
+				return;
+			}
+
+			s_window_cameras.solvers[s_window_cameras.solver_count++] = solver;
+		}
+
+		void census_note_ring(u64 ring_hash)
+		{
+			if (ring_hash == 0)
+				return;
+
+			for (u32 i = 0; i < s_window_cameras.ring_count; ++i)
+			{
+				if (s_window_cameras.rings[i] == ring_hash)
+					return;
+			}
+
+			if (s_window_cameras.ring_count >= per_draw_camera_slots)
+			{
+				s_window_cameras.overflowed = true;
+				return;
+			}
+
+			s_window_cameras.rings[s_window_cameras.ring_count++] = ring_hash;
+		}
+
+		// One-entry memo over LookupKickCamera, keyed on the transported kick sequence.
+		//
+		// GSKickSeq() is stamped once per completed GS PACKET (MTGS.cpp:1071 Gif_SendRemixKickSeq),
+		// not once per draw, so a run of consecutive draws shares one sequence and therefore one
+		// ring answer. Without this the ring is walked once per draw, and the walk steps up to 2048
+		// slots on a valid-gap (RemixVU1Capture.cpp:269) -- at ~830 draws a frame that is the one
+		// part of 4A that could plausibly cost GS frame time, and it is the cost the plan's risk
+		// register flagged when this lookup was diagnostic-only and gated off.
+		//
+		// Safe by construction: the ring is append-only from the VU side, so the same sequence
+		// always yields the same answer, and a slot recycled between two lookups of one sequence
+		// would only make the second answer staler than the first.
+		struct kick_camera_memo
+		{
+			u64 seq = ~0ull; // unreachable sentinel: g_kick_seq starts at 0 and only climbs
+			u64 hash = 0; // 0 = the ring held nothing usable for this sequence
+			float m[16] = {};
+		};
+
+		kick_camera_memo s_kick_camera_memo{};
+
+		// GS thread. LookupKickCamera plus the content fold, memoised. Returns 0 on a ring miss.
+		u64 lookup_draw_kick_camera(float (&m)[16])
+		{
+			const u64 seq = RemixVU1Capture::GSKickSeq();
+
+			if (seq != s_kick_camera_memo.seq)
+			{
+				s_kick_camera_memo.seq = seq;
+				s_kick_camera_memo.hash = 0;
+
+				u32 offset = 0;
+				if (RemixVU1Capture::LookupKickCamera(seq, s_kick_camera_memo.m, offset))
+				{
+					// hash_floats IS the fold the CAMERA/cm= lines and the FRAME lines use (same
+					// fnv_seed and fnv_prime, same 16 floats in the same order), so a ring hash is
+					// the same number everywhere and the two dump files join on it.
+					s_kick_camera_memo.hash = hash_floats(s_kick_camera_memo.m, 16);
+				}
+			}
+
+			std::memcpy(m, s_kick_camera_memo.m, sizeof(m));
+			return s_kick_camera_memo.hash;
+		}
+
+		// Runs the SAME acceptance pipeline resolve_world_camera runs -- build_camera_hypotheses
+		// (shared code, not a copy) x majorness, split_view_projection_direct, score_perspective,
+		// make_clip_solver -- on one ring matrix, and applies the gates that do not need a frame's
+		// worth of context.
+		//
+		// DEVIATION FROM THE PLAN'S LETTER, recorded because it is a deliberate one: the plan named
+		// four steps and this also applies resolve's finite-eye, origin-eye and depth-scale
+		// /anisotropy gates, plus the refuted-matrix set. The direction of the deviation is what
+		// makes it safe -- every added gate can only REJECT, and a rejection falls back to the
+		// frame solver, i.e. to exactly today's behaviour. The reason is in resolve's own comment:
+		// the depth-scale check is "the gate that matters" and the only one that can catch a
+		// wrong-UNIT camera on its first acceptance, and a per-draw camera gets none of the
+		// frame-level corroboration (the drift guard, the extent refutation) that the frame camera
+		// accumulates over frames. ~830 draws per frame ride on this; a weaker gate here than on
+		// the frame camera is the "per-draw scatter worse than the disease" risk the plan names.
+		bool solve_per_draw_clip(const float (&m)[16], remix_ps2::clip_solver& out)
+		{
+			const viewport_constants vp = s_last_viewport;
+			if (!vp.valid)
+				return false;
+
+			const float width = static_cast<float>(vp.width);
+			const float height = static_cast<float>(vp.height);
+			const float reference_aspect = (height > 0.f) ? (width / height) : (4.f / 3.f);
+
+			remix_ps2::mat4 raw{};
+			std::memcpy(&raw.m[0][0], m, sizeof(float) * 16);
+
+			float best_score = 0.f;
+			remix_ps2::vp_split best_split{};
+			remix_ps2::mat4 best_normalized = remix_ps2::mat4_identity();
+
+			for (u32 major = 0; major < 2; ++major)
+			{
+				const remix_ps2::mat4 oriented = (major == 0) ? raw : remix_ps2::mat4_transpose(raw);
+
+				// source 0 / ucode 0: the ring stores raw VU1 memory read at the pinned offset and
+				// carries no ucode identity with it, so the "r6" derived hypothesis -- which is
+				// keyed on one exact Rainbow Six 3 ucode hash -- is correctly not offered here.
+				// On this title it never applies anyway; SOCOM's winner is the "gs" hypothesis.
+				// s_camdepth_active / s_camdepth_snap_active, NOT camdepth_mode(): this runs on the
+				// draw path (~830 draws a window on this title) and must not touch the environment,
+				// and it must agree with the frame election about which family was enumerated.
+				// resolve_world_camera refreshes both once per window, at the same instant it
+				// refreshes s_camtest_active.
+				camera_hypothesis hypotheses[max_camera_hypotheses];
+				const u32 hypothesis_count = build_camera_hypotheses(oriented, vp, reference_aspect,
+					major != 0, 0, 0, s_camdepth_active, s_camdepth_snap_active, hypotheses);
+
+				for (u32 h = 0; h < hypothesis_count; ++h)
+				{
+					const camera_hypothesis& hyp = hypotheses[h];
+
+					const remix_ps2::mat4 normalized = apply_camera_hypothesis(oriented, hyp);
+
+					remix_ps2::vp_split split{};
+					if (!remix_ps2::split_view_projection_direct(normalized, split))
+						continue;
+
+					const float score = remix_ps2::score_perspective(split.projection, reference_aspect);
+					if (!(score > 0.f))
+						continue;
+
+					// Strict >, so the FIRST hypothesis achieving the best score wins -- the same
+					// tie-break resolve_world_camera uses, over the same ordering.
+					if (score > best_score)
+					{
+						best_score = score;
+						best_split = split;
+						best_normalized = normalized;
+					}
+				}
+			}
+
+			if (!(best_score > 0.f))
+				return false;
+
+			remix_ps2::clip_solver solver{};
+			remix_ps2::mat4 view_to_world{};
+			if (!remix_ps2::make_clip_solver(best_normalized, solver) ||
+				!remix_ps2::mat4_invert(best_split.view, view_to_world))
+				return false;
+
+			const float eye[3] = {view_to_world.m[3][0], view_to_world.m[3][1], view_to_world.m[3][2]};
+			if (!std::isfinite(eye[0]) || !std::isfinite(eye[1]) || !std::isfinite(eye[2]))
+				return false;
+
+			// An eye at exactly the origin is a solver degeneracy, not a camera (resolve's own
+			// finding: SOCOM produced (0,0,0) exactly when the split collapsed).
+			if (std::sqrt((eye[0] * eye[0]) + (eye[1] * eye[1]) + (eye[2] * eye[2])) < 1e-4f)
+				return false;
+
+			// Depth-scale consistency, verbatim in intent from resolve_world_camera: un-projecting
+			// the NDC centre at w = 1 must land ~1 unit from the eye, and the corners must not vary
+			// by more than the anisotropy limit. This is the check that catches a camera whose
+			// recovered world unit is 1000x the guest's -- the vertex explosion this title has
+			// already produced once -- and it needs no geometry, so it works on the first solve.
+			{
+				static constexpr float ndc_samples[5][2] = {
+					{0.f, 0.f}, {-1.f, -1.f}, {1.f, -1.f}, {-1.f, 1.f}, {1.f, 1.f}};
+
+				float centre_scale = 0.f;
+				float min_scale = std::numeric_limits<float>::max();
+				float max_scale = 0.f;
+
+				for (u32 i = 0; i < std::size(ndc_samples); ++i)
+				{
+					float probe[3];
+					remix_ps2::solve_world_position(solver, ndc_samples[i][0], ndc_samples[i][1], 1.f, probe);
+
+					const float dx = probe[0] - eye[0];
+					const float dy = probe[1] - eye[1];
+					const float dz = probe[2] - eye[2];
+					const float distance = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+					if (!std::isfinite(distance) || !(distance > 0.f))
+						return false;
+
+					if (i == 0)
+						centre_scale = distance;
+
+					min_scale = std::min(min_scale, distance);
+					max_scale = std::max(max_scale, distance);
+				}
+
+				const float scale_limit = camera_scale_limit();
+				if (!(centre_scale >= (1.f / scale_limit)) || !(centre_scale <= scale_limit))
+					return false;
+
+				if (!(max_scale <= (camera_anisotropy_limit() * min_scale)))
+					return false;
+			}
+
+			out = solver;
+			return true;
+		}
+
+		// The cache lookup on its own: raw ring hash -> solved solver, at most one solve per hash.
+		// nullptr means the pipeline refused this matrix (a verdict that is cached too -- without
+		// that, the ~830 draws carrying a refused hash would each re-run the whole hypothesis
+		// search and turn a fallback into a frame-time cliff).
+		const remix_ps2::clip_solver* cached_per_draw_solver(u64 ring_hash, const float (&ring_m)[16])
+		{
+			per_draw_camera_entry* victim = &s_per_draw_cameras[0];
+
+			for (u32 i = 0; i < per_draw_camera_slots; ++i)
+			{
+				per_draw_camera_entry& entry = s_per_draw_cameras[i];
+
+				if (entry.hash == ring_hash)
+				{
+					entry.last_used = s_frame_counter;
+					return entry.solved ? &entry.solver : nullptr;
+				}
+
+				// Empty slots first, then least-recently-used. hash == 0 can only mean an unused
+				// slot, because a ring hash of 0 is rejected by the caller and never reaches here.
+				if ((entry.hash == 0 && victim->hash != 0) ||
+					(entry.hash != 0 && victim->hash != 0 && entry.last_used < victim->last_used))
+					victim = &entry;
+			}
+
+			++s_stats.perdraw_solved;
+
+			victim->hash = ring_hash;
+			victim->last_used = s_frame_counter;
+			// Cleared before the solve so an evicted tenant's solver can never sit under a new
+			// hash: solve_per_draw_clip only writes `out` on success.
+			victim->solver = remix_ps2::clip_solver{};
+			victim->solved = solve_per_draw_clip(ring_m, victim->solver);
+
+			if (!victim->solved)
+			{
+				++s_stats.perdraw_refused;
+				return nullptr;
+			}
+
+			// Canonicalise against an equivalent solver already in the cache, so two raw hashes
+			// that normalise to the same camera end up holding bit-identical solvers rather than
+			// two nearly-equal ones. Costs at most eight 12-float compares, once per new hash, and
+			// it is what makes "one camera, one solver" true of the cache and not just of the
+			// census.
+			for (u32 i = 0; i < per_draw_camera_slots; ++i)
+			{
+				per_draw_camera_entry& entry = s_per_draw_cameras[i];
+
+				if (&entry == victim || !entry.solved || entry.hash == 0)
+					continue;
+
+				if (solvers_equivalent(entry.solver, victim->solver))
+				{
+					victim->solver = entry.solver;
+					break;
+				}
+			}
+
+			return &victim->solver;
+		}
+
+		// GS thread, called for EVERY world-mode draw whatever PCSX2_REMIX_PERDRAWCAM says.
+		//
+		// The census is unconditional on purpose -- it is the measurement the next run has to
+		// produce, and it must describe the frame the user is actually looking at, not a frame
+		// rendered differently because measuring was switched on. Only the PLACEMENT is knob-gated.
+		//
+		// `ring_m` is the matrix the caller's memoised LookupKickCamera returned and `ring_hash`
+		// its hash_floats fold; the caller passes both so the ring is walked at most once per draw.
+		//
+		// Returns the solver to un-project this draw with, or nullptr meaning "the frame solver" --
+		// which is what a ring miss, a refuted matrix, a refused solve, a ring camera that
+		// normalises to the frame camera, and a disabled knob all return. Falling back rather than
+		// guessing is the ring's standing contract (RemixVU1Capture.h:127-129): a wrong camera
+		// places geometry in view space, which is the defect this whole mechanism exists to remove.
+		const remix_ps2::clip_solver* per_draw_solver(u64 ring_hash, const float (&ring_m)[16])
+		{
+			census_note_ring(ring_hash);
+
+			const remix_ps2::clip_solver* candidate = nullptr;
+			bool counted = false;
+
+			if (ring_hash == 0)
+			{
+				// Ring miss.
+				++s_stats.perdraw_fallback;
+				counted = true;
+			}
+			else if (ring_hash == s_active_camera.matrix_hash)
+			{
+				// The draw was built under the camera the frame latched, so the frame solver
+				// already IS its own solver. On the measured run this is about one draw per
+				// window: the stale first one.
+				++s_stats.perdraw_match;
+				counted = true;
+			}
+			else if (s_refuted_matrices.count(ring_hash) != 0)
+			{
+				// Refuted by the extent check on an earlier frame. A matrix not trustworthy as the
+				// frame camera is not trustworthy for 830 draws either.
+				++s_stats.perdraw_fallback;
+				counted = true;
+			}
+			else
+			{
+				candidate = cached_per_draw_solver(ring_hash, ring_m);
+
+				if (!candidate)
+				{
+					++s_stats.perdraw_fallback;
+					counted = true;
+				}
+				else if (solvers_equivalent(*candidate, s_active_camera.solver))
+				{
+					// Different raw matrix, SAME un-projection. This is the trap-detector: on a
+					// title whose acceptance pipeline normalises the difference away, this counter
+					// carries the draws and per-draw placement is a no-op that a raw ring-hash
+					// count would have reported as a 99.9% hit rate. Use the frame solver, which
+					// is the identical answer and costs nothing.
+					++s_stats.perdraw_same_solver;
+					candidate = nullptr;
+					counted = true;
+				}
+			}
+
+			if (!counted)
+				++s_stats.perdraw_distinct;
+
+			census_note_solver(candidate ? *candidate : s_active_camera.solver);
+
+			// Measured either way; placed only when asked.
+			return (candidate && per_draw_camera_mode() != 0) ? candidate : nullptr;
 		}
 
 		void submit_debug_triangle()
@@ -2725,10 +6391,13 @@ namespace RemixSubmit
 		// How far the recovered world space's unit may be from the guest's own, before the
 		// camera is refused. See check_depth_scale: for a rigid view transform the two are the
 		// same, so this is a wide tolerance around 1 rather than a fitted number.
+		//
+		// Returns the value resolve_world_camera refreshed at the top of this window. It is NOT a
+		// `static const` env read any more -- see s_camera_scale_limit for why that had never once
+		// let a per-game .conf move this gate.
 		float camera_scale_limit()
 		{
-			static const float value = env_float(L"PCSX2_REMIX_CAMSCALE", 8.f);
-			return value;
+			return s_camera_scale_limit;
 		}
 
 		// How much that unit may vary between the centre of the frame and its corners. A well
@@ -3027,13 +6696,31 @@ namespace RemixSubmit
 		// derived from what the title actually does rather than picked and hoped for.
 		u64 drawdump_frames()
 		{
-			static const u64 value =
-				static_cast<u64>(std::max<s64>(0, remix_ps2::read_env_int(L"PCSX2_REMIX_DRAWDUMP", 0)));
-			return value;
+			return static_cast<u64>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_DRAWDUMP", 0), 0, 16));
 		}
 
-		u64 s_drawdump_frames_left = 0;
-		bool s_drawdump_started = false;
+		bool drawdump_world_only()
+		{
+			return remix_ps2::read_env_int(L"PCSX2_REMIX_DRAWDUMP_WORLD", 0) != 0;
+		}
+
+		// Submitting frames to let pass before the dump starts. Default 0 = start immediately,
+		// which is what shipped and what the arming rule above describes.
+		//
+		// MEASURED 2026-08-15, the reason this exists: the first dump this title ever produced
+		// landed on frames 3, 5, 6 and 8 -- the first frames that submitted with a world camera,
+		// i.e. mission start. Those frames carry 11 sky draws each, while in-mission the stats line
+		// settles to 2.0/frame, so the dump described a scene nobody was asking about. A dump is
+		// only evidence for the scene it was taken in; "first frames that submit" is not the scene
+		// the player is looking at when they report something.
+		//
+		// Read live, like drawdump_frames() and for the same reason -- see frametrace_frames().
+		u64 drawdump_after_frames()
+		{
+			return static_cast<u64>(
+				std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_DRAWDUMPAFTER", 0), 0, 1000000));
+		}
+
 		// EXPLODE offender lines written so far. Session-lifetime like drawdump_write's own line
 		// count, not per-frame: the offenders worth reading are the first ones, and after a hundred
 		// of them the stats-line counter is the number that matters.
@@ -3058,6 +6745,735 @@ namespace RemixSubmit
 		}
 
 		u32 s_fardump_written = 0;
+
+		// --- per-frame window trace -----------------------------------------------------------
+		//
+		// PCSX2_REMIX_FRAMETRACE=N writes one FRAME line per presented frame, for N frames, into the
+		// matrix dump. It describes the WINDOW rather than the camera: how many draws were built in
+		// it, how many distinct per-kick cameras those draws were built under, and whether the
+		// camera the window used was resolved for it or carried over from an earlier one.
+		//
+		// It exists because of what the 2026-08-15 clip run REFUTED. This title presents one
+		// shattered frame in every three at 60 Hz, and both obvious explanations are dead. The camera
+		// is not being dropped: `accept` climbs +300 per 300-frame stats block, so resolve_world_camera
+		// accepted on ~898 of 900 frames and drop_stale_camera never fired in-mission. The vertices
+		// are not being flung out of the scene either: extent-reject reads 0 in every block, so the
+		// damage stays inside scene scale. And the 2-on/1-off cadence in the matrix dump is not a
+		// capture miss -- the absent windows carry no new matrices of ANY source, object matrices
+		// included, which means the game built no frame in them: 40 fps of rendering against a 60 Hz
+		// present (the run's own status bar, `FPS: 39-40  VPS: 60-61`).
+		//
+		// So the presented-frame unit and the game-frame unit disagree every third window, and the
+		// open question is only WHICH form the disagreement takes. This measures it: draws split
+		// across two ring cameras -- one window straddling two game frames -- shows up as ringN > 0,
+		// while a sparse or partial window shows up as `sub` dipping with a single ring hash. Those
+		// two findings want completely different fixes, and on this title guessing between them has
+		// historically cost a session.
+		//
+		// Off by default, because the draw-side sampler calls LookupKickCamera, which walks up to
+		// 2048 ring slots on a valid-gap (RemixVU1Capture.cpp:269) -- not a cost to pay per draw on
+		// a run nobody is measuring.
+		//
+		// READ LIVE, NOT LATCHED, and that distinction is the whole reason this knob works.
+		// MEASURED 2026-08-15: latched as `static const`, this shipped and produced ZERO FRAME
+		// lines on a run whose own log confirmed `PCSX2_REMIX_FRAMETRACE = 600 (PCSX2 toggle)` was
+		// applied. The per-game .conf is read at t=10.008 s but the renderer goes live at t=9.774 s
+		// (`renderer is live`), so OnVSync had already called this and cached 0 -- permanently --
+		// several frames before the conf existed. The arming check then never fired.
+		//
+		// This is the same trap `dump_enabled()`/`nocam_enabled()` were un-latched for
+		// (RemixTransforms.cpp), and the same one `drawdump_frames()` above already avoids by
+		// reading live -- which is exactly why the draw dump wrote on that run and this did not.
+		// The latch bought nothing anyway: the per-draw hot path gates on `s_frametrace_left`, a
+		// plain counter, and never calls this. **Any knob delivered by the per-game .conf must be
+		// read live; latching one is a silent no-op that looks like a broken feature.**
+		u64 frametrace_frames()
+		{
+			return static_cast<u64>(
+				std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_FRAMETRACE", 0), 0, 100000));
+		}
+
+		// Qualifying windows to let pass before the trace arms. Default 0 = arm immediately.
+		//
+		// MEASURED 2026-08-15, and this is why it exists: the trace armed at the first submitting
+		// window and ran 600, i.e. windows ~34-934 -- which on this title is almost entirely the
+		// loading and mission-intro phase. The per-window camera census then showed the
+		// multi-camera condition it was hunting **stops at window ~600 and never recurs**:
+		// `multi` freezes at 126 while the window count climbs 353 -> 1952, and `draws distinct`
+		// freezes at 49,418 at the same moment. So the trace characterised startup and was read as
+		// though it characterised gameplay, and the fix built on it (per-draw camera placement) is
+		// a no-op in the scene the player is actually looking at.
+		//
+		// This is the SECOND time this exact mistake was made in one session -- `DRAWDUMPAFTER`
+		// above exists for the same reason, and the trace was left arming at frame one anyway.
+		// **A diagnostic that arms on "the first frame that qualifies" measures startup. If the
+		// symptom is in gameplay, the measurement must be delayed to gameplay.**
+		//
+		// Read live, like every other conf-delivered knob -- see frametrace_frames().
+		u64 frametrace_after_frames()
+		{
+			return static_cast<u64>(
+				std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_FRAMETRACEAFTER", 0), 0, 1000000));
+		}
+
+		// What the draw path accumulates for one window. GS thread only -- the sampler runs in
+		// OnDrawPrims and the reader in OnVSync, and both of those are the GS thread. Nothing here
+		// touches VU1 state; the ring is read through LookupKickCamera and only through it.
+		struct frame_trace_state
+		{
+			u32 draws = 0; // draws sampled this window
+			u32 misses = 0; // ring lookups that held nothing for the draw's kick
+			u32 not_first = 0; // draws whose ring camera differed from the window's first
+			u64 first_hash = 0; // the window's first ring camera
+			u64 second_hash = 0; // the first ring camera that differed from it
+		};
+
+		frame_trace_state s_frame_trace{};
+		u64 s_frametrace_left = 0;
+		u64 s_frametrace_skipped = 0; // qualifying windows passed over while FRAMETRACEAFTER counts down
+		bool s_frametrace_started = false;
+
+		// The active camera's matrix hash as of the last VSync, and the frame at which it last
+		// changed. `age` on the FRAME line is the difference: 1 on a window whose camera was
+		// resolved for it, higher on one still drawing with an older camera.
+		u64 s_frametrace_cam_hash = 0;
+		u64 s_frametrace_cam_since = 0;
+
+		// --- world-position probe -------------------------------------------------------------
+		//
+		// PCSX2_REMIX_WORLDPROBE=N writes one WORLDPROBE line per presented window, for N windows,
+		// into the matrix dump beside the FRAME lines (same f=, so the two join).
+		//
+		// THE QUESTION IT ANSWERS, and it is a single yes/no: does the un-projection recover
+		// STABLE world positions for static geometry as the camera turns, or do the recovered
+		// positions carry the camera's rotation?
+		//
+		// It exists because a light was reported sitting at/behind the eye and sweeping its
+		// shadows with the view, and every light that could physically do that has been ruled out:
+		// light_mode()==1 builds ONE Distant light with a hard-coded world direction and no
+		// position; every camera-attached light (place_debug_light at cam.position, place_sun_light
+		// along camera forward) is gated on light_mode()==2, which this title does not run; the
+		// runtime's own fallback is off (rtx.fallbackLightMode = 0); and the symptom survives
+		// LIGHTMODE = 0, i.e. a frame with no lights created at all. What is left is the other
+		// half of the same appearance: a fixed light over a WORLD THAT ROTATES. If our recovered
+		// positions are camera-relative rather than world-absolute, a fixed light rakes across the
+		// scene exactly as a camera-mounted one would, and the implausible `Vertical FOV: 112.6`
+		// falls out of the same wrong-but-self-consistent camera solve.
+		//
+		// READ-ONLY. Nothing here is submitted, no transform is altered, no gate moves. It reads
+		// s_scratch_vertices at the point the draw has been accepted and BEFORE the stable-identity
+		// path re-expresses those positions as local + instance transform, so what it measures is
+		// the world-space placement either path produces. Default 0 = off, and off costs one u64
+		// compare per draw.
+		//
+		// READ LIVE, NEVER LATCHED -- see frametrace_frames() for the run this cost.
+		u64 worldprobe_frames()
+		{
+			return static_cast<u64>(
+				std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_WORLDPROBE", 0), 0, 100000));
+		}
+
+		// Qualifying windows to let pass before the probe arms. Default 0 = arm immediately.
+		//
+		// Mirrors drawdump_after_frames()/frametrace_after_frames(), and for the reason recorded
+		// there: BOTH of those armed on "the first frame that qualifies", which on this title is
+		// mission start, and both produced measurements of the loading phase that were then read
+		// as gameplay. The symptom this probe is aimed at is something the player sees while
+		// TURNING THE CAMERA in-mission, so the measurement has to be delayed to in-mission.
+		//
+		// Read live, like every other conf-delivered knob.
+		u64 worldprobe_after_frames()
+		{
+			return static_cast<u64>(
+				std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_WORLDPROBEAFTER", 0), 0, 1000000));
+		}
+
+		// Draws followed on the line. Four is what fits while staying readable, and it is enough
+		// that one of them going ABSENT does not blind the run.
+		constexpr u32 worldprobe_slots = 4;
+
+		// Distinct content hashes considered in one window. A cap, not a target: the scan below is
+		// linear in it, and beyond this the extra candidates cannot win a slot anyway without
+		// being enormous.
+		constexpr u32 worldprobe_candidates = 64;
+
+		// NON-EMPTY windows surveyed before the tracked set is chosen.
+		//
+		// MEASURED 2026-08-15, and this is why selection is no longer taken from a single window:
+		// the first capture returned 1,417 lines all reading `slots=0`, with no hashes at all. The
+		// selection was one-shot, taken on the arming window, and this title under
+		// PCSX2_REMIX_HOLDEMPTY = 2 submits ZERO geometry in one presented window out of three --
+		// 57 of 171 windows, spacing exactly 3 in 56 of 56 gaps, which is the game's 40 fps against
+		// our 60 Hz present. The arming window landed on one of those, the empty selection was
+		// frozen, and the whole 345-degree capture the user performed was unusable. A 1-in-3
+		// failure rate on a one-shot choice.
+		//
+		// So selection now RETRIES until a window actually carries qualifying draws, and while it
+		// is at it, surveys several of them. Ranking on windows-seen first means a transient draw
+		// -- an effect quad, a muzzle flash -- cannot take a slot from level geometry just by being
+		// large in the one window that happened to be looked at. Eight non-empty windows is about
+		// a fifth of a second of presented time at this title's cadence: long enough that a
+		// one-frame draw loses, short enough that the view has not meaningfully turned.
+		constexpr u32 worldprobe_survey_windows = 8;
+
+		// Ceiling on the survey table. Same reasoning as worldprobe_candidates, applied across
+		// windows rather than within one.
+		constexpr u32 worldprobe_survey_cap = 256;
+
+		// One followed draw's accumulation for one window. Several draws in a window may share a
+		// content hash (one texture, several pieces of level), and they are merged here rather
+		// than fought over: `draws` and `verts` are printed precisely so a reader can see whether
+		// the merged SET changed between two lines before comparing their centroids.
+		struct worldprobe_entry
+		{
+			u64 content_hash = 0;
+			u32 draws = 0;
+			u32 vertices = 0;
+			u32 triangles = 0;
+			double sum[3] = {0.0, 0.0, 0.0};
+			scene_bounds bounds{};
+		};
+
+		// The current window's accumulation. Before the tracked set is chosen this holds every
+		// world-mode non-sky content hash the window produced (capped); afterwards it is pre-seeded
+		// with exactly the tracked hashes, in slot order, and nothing else is ever admitted.
+		std::vector<worldprobe_entry> s_worldprobe_frame;
+
+		// One candidate hash's standing across the survey. `windows` is how many NON-EMPTY windows
+		// it appeared in and is the primary ranking key -- persistence is what distinguishes level
+		// geometry from a draw that happened to be big once.
+		struct worldprobe_candidate
+		{
+			u64 content_hash = 0;
+			u32 windows = 0;
+			u32 triangles = 0; // largest single-window triangle count seen
+		};
+
+		// Accumulated across survey windows and discarded the moment selection lands.
+		std::vector<worldprobe_candidate> s_worldprobe_survey;
+		u32 s_worldprobe_surveyed = 0; // non-empty windows folded into the survey so far
+
+		u64 s_worldprobe_tracked[worldprobe_slots] = {};
+		u32 s_worldprobe_tracked_count = 0;
+		u64 s_worldprobe_left = 0;
+		u64 s_worldprobe_skipped = 0; // qualifying windows passed over while WORLDPROBEAFTER counts down
+		bool s_worldprobe_started = false;  // the draw-side sampler is on
+		bool s_worldprobe_selected = false; // the tracked hashes have been picked and are now fixed
+		bool s_worldprobe_logged_arm = false; // one-shot "armed" line
+
+		// The camera the window that just ended un-projected its draws with. Sampled at VSync
+		// BEFORE resolve_world_camera() replaces it, exactly where FRAMETRACE samples `used=`.
+		struct worldprobe_camera
+		{
+			bool valid = false;
+			u64 hash = 0;
+			float position[3] = {0.f, 0.f, 0.f};
+			float forward[3] = {0.f, 0.f, 0.f};
+		};
+
+		// Draw-side sampler. Called only for accepted, world-mode, non-sky draws while the probe
+		// is armed; `triangles` is the post-compaction count, i.e. the same number the per-draw
+		// dump prints as tris=.
+		//
+		// Keyed on the MATERIAL content hash and deliberately not on the mesh hash. The mesh hash
+		// is the wrong key here twice over: under PCSX2_REMIX_STABLEID = 0 it is built from
+		// quantized POSITIONS, so it would change every window in precisely the failure case this
+		// probe exists to detect, and under STABLEID = 1 it folds in a size term that a bad solve
+		// can move. The material hash comes from TEX0/TEXA/CLUT -- guest state, untouched by any
+		// camera -- so it cannot be broken by the thing being measured.
+		void worldprobe_sample(u64 content_hash, u32 triangles)
+		{
+			worldprobe_entry* entry = nullptr;
+
+			for (worldprobe_entry& candidate : s_worldprobe_frame)
+			{
+				if (candidate.content_hash == content_hash)
+				{
+					entry = &candidate;
+					break;
+				}
+			}
+
+			if (!entry)
+			{
+				// Once the tracked set is fixed the accumulator holds exactly those hashes, so a
+				// miss here is a draw we are deliberately NOT following, and dropping it is the
+				// whole point: admitting it would put a DIFFERENT object in a slot and make the
+				// window-to-window comparison compare two unrelated things. That is the one
+				// failure mode that would render this entire measurement meaningless.
+				if (s_worldprobe_selected || s_worldprobe_frame.size() >= worldprobe_candidates)
+					return;
+
+				s_worldprobe_frame.push_back(worldprobe_entry{});
+				entry = &s_worldprobe_frame.back();
+				entry->content_hash = content_hash;
+			}
+
+			++entry->draws;
+			entry->triangles += triangles;
+			entry->vertices += static_cast<u32>(s_scratch_vertices.size());
+
+			// s_scratch_vertices still holds WORLD positions at the call site: the stable-identity
+			// path does not rewrite them to local until after the batch branch. Summed in double
+			// so a centroid taken over thousands of vertices at world scale does not lose the
+			// digits the comparison depends on.
+			for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+			{
+				entry->bounds.add(v.position);
+
+				for (u32 k = 0; k < 3; ++k)
+					entry->sum[k] += static_cast<double>(v.position[k]);
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------
+		// PCSX2_REMIX_WORLDFIX audit -- does recovered world geometry hold still while the eye turns?
+		// -----------------------------------------------------------------------------------------
+		//
+		// WHY THIS IS NOT WORLDPROBE. WORLDPROBE keys on the MATERIAL content hash and says so
+		// (worldprobe_sample above). Its slots are therefore "every piece of level wearing this
+		// texture", and the MEMBERSHIP of that set changes every window as the guest culls. The
+		// confound is not theoretical: re-analysing the 17,412 WORLDPROBE lines already in
+		// logs/remix_matrices.txt, slot C6FC960431E8CE4C ranges from v=3 to v=3414 vertices inside
+		// one capture and slot D12EA192BF997FBD from v=21 to v=2098. A centroid taken over a
+		// changing set moves for reasons that have nothing to do with the un-projection -- and the
+		// visible subset of a large mesh sits near the screen centre by construction, which mimics
+		// precisely the camera-locking the probe exists to detect. Restricted to the windows where
+		// that set is provably constant, the same data gives alpha = 0.10, 1.84 and 1.94 for three
+		// different tracked draws, which a single global camera error cannot produce.
+		//
+		// THE KEY USED HERE is (material hash, vertex count, index count). It pins one submitted
+		// mesh, contains no position data -- so the thing being measured cannot move the key -- and
+		// changes the instant the merged set changes, so mismatched windows simply do not pair.
+		//
+		// WHAT IT REPORTS. Over consecutive window pairs it least-squares fits
+		//
+		//     d(world bearing of the tracked centroid) = alpha * d(camera yaw)
+		//
+		//   alpha ~ 0  static geometry stands still in world space while the eye turns. CORRECT.
+		//   alpha ~ 1  the geometry rides the camera: the elected matrix's rotation is not the one
+		//              the vertices were drawn with (a stale, foreign, or per-object matrix).
+		//   alpha ~ 2  the recovered world is MIRRORED about a plane fixed to the camera. Because
+		//              that plane turns with the eye, the world is re-mirrored every frame and a
+		//              fixed point's image counter-rotates at twice the yaw rate.
+		//
+		// A pair is rejected unless the yaw actually moved and the eye did not: translation
+		// parallax would otherwise be read as rotation. Both rejections are counted, so an audit
+		// that measured nothing says so instead of printing a confident zero.
+		constexpr u32 worldfix_slots = 16;
+
+		struct worldfix_slot
+		{
+			u64 key = 0;
+			u64 frame = 0; // window this slot's `now` came from
+			float now[3] = {0.f, 0.f, 0.f};
+			u64 prev_frame = 0;
+			float prev[3] = {0.f, 0.f, 0.f};
+			bool prev_valid = false;
+		};
+
+		worldfix_slot s_worldfix[worldfix_slots];
+
+		// Least-squares accumulators for d(bearing) against d(yaw), through the origin: a pair with
+		// no yaw carries no information about alpha and is rejected before it gets here, so the fit
+		// has no intercept to estimate.
+		double s_worldfix_sxx = 0.0;
+		double s_worldfix_sxy = 0.0;
+		double s_worldfix_syy = 0.0;
+		u64 s_worldfix_pairs = 0;
+		u64 s_worldfix_reject_yaw = 0;   // the eye did not turn enough to measure anything
+		u64 s_worldfix_reject_move = 0;  // the eye translated far enough to fake a rotation
+		u64 s_worldfix_windows = 0;
+		int s_worldfix_last_mode = -1;
+
+		// The mode the DRAW path tests. Refreshed from the environment once per presented window by
+		// worldfix_window() below -- never cached beyond that, so a .conf applied mid-session is
+		// picked up on the next window. The draw path must not call worldfix_mode() itself: that is
+		// a GetEnvironmentVariableW, and this title submits ~830 draws a window.
+		int s_worldfix_active = 0;
+		bool s_worldfix_prev_camera_valid = false;
+		float s_worldfix_prev_eye[3] = {0.f, 0.f, 0.f};
+		float s_worldfix_prev_forward[3] = {0.f, 0.f, 0.f};
+		u64 s_worldfix_prev_frame = 0;
+
+		// Draw-side sampler. Same call site and same gating as worldprobe_sample: accepted,
+		// world-mode, non-sky draws only, with s_scratch_vertices still holding WORLD positions.
+		void worldfix_sample(u64 content_hash, u32 vertex_count, u32 index_count)
+		{
+			const u64 key = fnv_mix(fnv_mix(content_hash, vertex_count), index_count);
+
+			worldfix_slot* slot = nullptr;
+			worldfix_slot* oldest = &s_worldfix[0];
+
+			for (worldfix_slot& candidate : s_worldfix)
+			{
+				if (candidate.key == key)
+				{
+					slot = &candidate;
+					break;
+				}
+
+				if (candidate.frame < oldest->frame)
+					oldest = &candidate;
+			}
+
+			if (!slot)
+			{
+				slot = oldest;
+				*slot = worldfix_slot{};
+				slot->key = key;
+			}
+			else if (slot->frame == s_frame_counter)
+			{
+				// Two draws in one window with an identical (material, vertex, index) fingerprint
+				// are two instances of the same shape, not one object seen twice. Keep the first:
+				// which one is kept must not depend on submission order, or the pair below compares
+				// two different objects and reports their separation as camera-induced motion.
+				return;
+			}
+
+			slot->prev_valid = (slot->frame != 0);
+			slot->prev_frame = slot->frame;
+			for (u32 k = 0; k < 3; ++k)
+				slot->prev[k] = slot->now[k];
+
+			slot->frame = s_frame_counter;
+
+			double sum[3] = {0.0, 0.0, 0.0};
+			for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+			{
+				for (u32 k = 0; k < 3; ++k)
+					sum[k] += static_cast<double>(v.position[k]);
+			}
+
+			const double inv = s_scratch_vertices.empty()
+								   ? 0.0
+								   : (1.0 / static_cast<double>(s_scratch_vertices.size()));
+
+			for (u32 k = 0; k < 3; ++k)
+				slot->now[k] = static_cast<float>(sum[k] * inv);
+		}
+
+		// Window-side half. Called at VSync with the camera the window that just ended actually
+		// un-projected against -- the same instant, and for the same reason, that WORLDPROBE
+		// samples its own camera: reading it after resolve_world_camera() would pair this window's
+		// positions with the next window's eye.
+		void worldfix_window(int mode, const worldprobe_camera& cam)
+		{
+			s_worldfix_active = mode;
+
+			if (mode != s_worldfix_last_mode)
+			{
+				s_worldfix_last_mode = mode;
+				INFO_LOG("Remix: PCSX2_REMIX_WORLDFIX = {} ({}). alpha near 0 means recovered world "
+						 "geometry holds still as the eye turns (correct); near 1 means it rides the "
+						 "camera; near 2 means the recovered world is mirrored about a camera-fixed "
+						 "plane. Modes 2 and 3 flip the recovered handedness and cannot change the "
+						 "rendered image.",
+					mode,
+					(mode == 0) ? "off" : ((mode == 1) ? "audit only" : ((mode == 2) ? "audit + force m00 > 0" : "audit + force m00 < 0")));
+			}
+
+			if (mode == 0)
+				return;
+
+			const bool have_pair = s_worldfix_prev_camera_valid && cam.valid &&
+								   (s_frame_counter > s_worldfix_prev_frame);
+
+			if (have_pair)
+			{
+				++s_worldfix_windows;
+
+				const double yaw_now = std::atan2(static_cast<double>(cam.forward[0]),
+					static_cast<double>(cam.forward[2]));
+				const double yaw_prev = std::atan2(static_cast<double>(s_worldfix_prev_forward[0]),
+					static_cast<double>(s_worldfix_prev_forward[2]));
+
+				double dyaw = yaw_now - yaw_prev;
+				while (dyaw > 3.14159265358979323846) dyaw -= 2.0 * 3.14159265358979323846;
+				while (dyaw < -3.14159265358979323846) dyaw += 2.0 * 3.14159265358979323846;
+
+				const double eye_move = std::sqrt(
+					static_cast<double>((cam.position[0] - s_worldfix_prev_eye[0]) * (cam.position[0] - s_worldfix_prev_eye[0]) +
+										(cam.position[1] - s_worldfix_prev_eye[1]) * (cam.position[1] - s_worldfix_prev_eye[1]) +
+										(cam.position[2] - s_worldfix_prev_eye[2]) * (cam.position[2] - s_worldfix_prev_eye[2])));
+
+				// 0.05 deg per window: below this the bearing change is all quantisation and the
+				// ratio is a divide by noise.
+				if (std::abs(dyaw) < 0.00087)
+				{
+					++s_worldfix_reject_yaw;
+				}
+				else
+				{
+					for (const worldfix_slot& slot : s_worldfix)
+					{
+						if (slot.key == 0 || !slot.prev_valid)
+							continue;
+
+						if (slot.frame != s_frame_counter || slot.prev_frame != s_worldfix_prev_frame)
+							continue;
+
+						const double nx = static_cast<double>(slot.now[0] - cam.position[0]);
+						const double nz = static_cast<double>(slot.now[2] - cam.position[2]);
+						const double px = static_cast<double>(slot.prev[0] - s_worldfix_prev_eye[0]);
+						const double pz = static_cast<double>(slot.prev[2] - s_worldfix_prev_eye[2]);
+
+						const double range = std::sqrt((nx * nx) + (nz * nz));
+						if (!(range > 1e-3))
+							continue;
+
+						// The eye must have moved far less than the object is distant, or walking
+						// past a near object produces a bearing sweep with no rotation in it at all.
+						if (eye_move > (0.02 * range))
+						{
+							++s_worldfix_reject_move;
+							continue;
+						}
+
+						double dbearing = std::atan2(nx, nz) - std::atan2(px, pz);
+						while (dbearing > 3.14159265358979323846) dbearing -= 2.0 * 3.14159265358979323846;
+						while (dbearing < -3.14159265358979323846) dbearing += 2.0 * 3.14159265358979323846;
+
+						s_worldfix_sxx += dyaw * dyaw;
+						s_worldfix_sxy += dyaw * dbearing;
+						s_worldfix_syy += dbearing * dbearing;
+						++s_worldfix_pairs;
+					}
+				}
+
+				// Reported on a fixed cadence rather than at exit: ops.finalize is not guaranteed to
+				// run, and a diagnostic whose only output is at shutdown is a diagnostic that
+				// produces nothing on the run that mattered.
+				if (s_worldfix_pairs > 0 && (s_worldfix_windows % 600) == 0)
+				{
+					const double alpha = (s_worldfix_sxx > 1e-12) ? (s_worldfix_sxy / s_worldfix_sxx) : 0.0;
+					const double r2 = (s_worldfix_sxx > 1e-12 && s_worldfix_syy > 1e-12)
+										  ? ((s_worldfix_sxy * s_worldfix_sxy) / (s_worldfix_sxx * s_worldfix_syy))
+										  : 0.0;
+
+					INFO_LOG("Remix: WORLDFIX audit -- alpha {:.3f} (R2 {:.3f}) over {} paired "
+							 "samples in {} windows; rejected {} for no yaw, {} for eye translation. "
+							 "alpha 0 = world holds still (correct), 1 = world rides the camera, "
+							 "2 = world mirrored about a camera-fixed plane.",
+						alpha, r2, s_worldfix_pairs, s_worldfix_windows,
+						s_worldfix_reject_yaw, s_worldfix_reject_move);
+				}
+			}
+
+			s_worldfix_prev_camera_valid = cam.valid;
+			s_worldfix_prev_frame = s_frame_counter;
+			for (u32 k = 0; k < 3; ++k)
+			{
+				s_worldfix_prev_eye[k] = cam.position[k];
+				s_worldfix_prev_forward[k] = cam.forward[k];
+			}
+		}
+
+		// Re-arms the accumulator for the next window. After selection it is PRE-SEEDED with the
+		// tracked hashes in slot order, so slot i always means hash i and a hash that did not draw
+		// this window prints ABSENT in its own slot instead of quietly ceding it to another draw.
+		void worldprobe_reset_frame()
+		{
+			s_worldprobe_frame.clear();
+
+			if (!s_worldprobe_selected)
+				return;
+
+			for (u32 i = 0; i < s_worldprobe_tracked_count; ++i)
+			{
+				worldprobe_entry seed{};
+				seed.content_hash = s_worldprobe_tracked[i];
+				s_worldprobe_frame.push_back(seed);
+			}
+		}
+
+		// Cleared alongside worldprobe_reset_all(). s_frame_counter is zeroed on GS close, so slots
+		// carrying frame indices from the previous session would sit permanently "in the future" and
+		// the audit would silently pair nothing.
+		void worldfix_reset_all()
+		{
+			for (worldfix_slot& slot : s_worldfix)
+				slot = worldfix_slot{};
+
+			s_worldfix_sxx = 0.0;
+			s_worldfix_sxy = 0.0;
+			s_worldfix_syy = 0.0;
+			s_worldfix_pairs = 0;
+			s_worldfix_reject_yaw = 0;
+			s_worldfix_reject_move = 0;
+			s_worldfix_windows = 0;
+			s_worldfix_prev_camera_valid = false;
+			s_worldfix_prev_frame = 0;
+			s_worldfix_logged_projection = false;
+		}
+
+		void worldprobe_reset_all()
+		{
+			s_worldprobe_frame.clear();
+			s_worldprobe_survey.clear();
+			s_worldprobe_surveyed = 0;
+			s_worldprobe_tracked_count = 0;
+			s_worldprobe_left = 0;
+			s_worldprobe_skipped = 0;
+			s_worldprobe_started = false;
+			s_worldprobe_selected = false;
+			s_worldprobe_logged_arm = false;
+
+			for (u32 i = 0; i < worldprobe_slots; ++i)
+				s_worldprobe_tracked[i] = 0;
+		}
+
+		// Freezes the tracked set from the survey. Called only with a NON-EMPTY survey, so it
+		// always selects at least one hash and can never be reached twice -- it sets
+		// s_worldprobe_selected, and every caller is gated on that being false.
+		void worldprobe_select()
+		{
+			// Persistence first, size second. A draw present in every surveyed window is level
+			// geometry, which is the only kind of thing whose world position is supposed to hold
+			// still while the eye turns; a bigger draw that appeared once is exactly what this
+			// ordering is here to reject. stable_sort so a tie resolves by first-seen order and
+			// the choice is reproducible from the log rather than arbitrary.
+			std::stable_sort(s_worldprobe_survey.begin(), s_worldprobe_survey.end(),
+				[](const worldprobe_candidate& a, const worldprobe_candidate& b) {
+					if (a.windows != b.windows)
+						return a.windows > b.windows;
+
+					return a.triangles > b.triangles;
+				});
+
+			const u32 candidates = static_cast<u32>(s_worldprobe_survey.size());
+			s_worldprobe_tracked_count = std::min<u32>(candidates, worldprobe_slots);
+
+			std::string chosen;
+			for (u32 i = 0; i < s_worldprobe_tracked_count; ++i)
+			{
+				s_worldprobe_tracked[i] = s_worldprobe_survey[i].content_hash;
+				chosen += fmt::format(" [{:016X} t={} w={}]", s_worldprobe_survey[i].content_hash,
+					s_worldprobe_survey[i].triangles, s_worldprobe_survey[i].windows);
+			}
+
+			s_worldprobe_selected = true;
+			s_worldprobe_survey.clear();
+			s_worldprobe_survey.shrink_to_fit();
+
+			// One-shot, and it exists because the first version of this probe FAILED SILENTLY: it
+			// selected from one window, that window was one of the empty ones this title presents
+			// every third frame, and 1,417 lines of `slots=0` were written with nothing in the log
+			// to say why. A selection that produced nothing must be visible in emulog.txt.
+			INFO_LOG("Remix: WORLDPROBE selected {} draw(s) to follow at frame {} -- from {} "
+					 "candidate hash(es) over {} non-empty window(s):{}",
+				s_worldprobe_tracked_count, s_frame_counter, candidates, s_worldprobe_surveyed,
+				chosen);
+		}
+
+		// Folds the window that just ended into the survey, and selects once enough non-empty
+		// windows have been seen.
+		//
+		// The retry IS the fix for the empty-selection failure: an empty window contributes
+		// nothing, advances nothing, and costs nothing -- the probe simply looks again next
+		// window. Nothing here can spin: the only state that advances is s_worldprobe_surveyed,
+		// it advances at most once per presented window and only on a window that contributed at
+		// least one hash, and it is compared against a compile-time constant.
+		void worldprobe_survey_window()
+		{
+			if (s_worldprobe_frame.empty())
+				return;
+
+			++s_worldprobe_surveyed;
+
+			for (const worldprobe_entry& entry : s_worldprobe_frame)
+			{
+				worldprobe_candidate* candidate = nullptr;
+
+				for (worldprobe_candidate& known : s_worldprobe_survey)
+				{
+					if (known.content_hash == entry.content_hash)
+					{
+						candidate = &known;
+						break;
+					}
+				}
+
+				if (!candidate)
+				{
+					if (s_worldprobe_survey.size() >= worldprobe_survey_cap)
+						continue;
+
+					s_worldprobe_survey.push_back(worldprobe_candidate{});
+					candidate = &s_worldprobe_survey.back();
+					candidate->content_hash = entry.content_hash;
+				}
+
+				++candidate->windows;
+				candidate->triangles = std::max(candidate->triangles, entry.triangles);
+			}
+
+			if (s_worldprobe_surveyed < worldprobe_survey_windows)
+				return;
+
+			// Guaranteed non-empty: s_worldprobe_surveyed only reaches here by having been advanced
+			// on windows that each contributed at least one entry, and entries are only dropped at
+			// the cap, which cannot empty a non-empty table.
+			if (s_worldprobe_survey.empty())
+				return;
+
+			worldprobe_select();
+		}
+
+		// Emit only. Selection has already happened -- every call site is gated on
+		// s_worldprobe_selected, so this can never write a line without a tracked set behind it.
+		void worldprobe_emit(const worldprobe_camera& cam)
+		{
+			// cv/cam/p/fwd describe the eye the geometry on this same line was un-projected
+			// against, so the two are always read together.
+			std::string line = fmt::format(
+				"WORLDPROBE f={} cv={} cam={:016X} p=({:.2f},{:.2f},{:.2f}) fwd=({:.4f},{:.4f},{:.4f}) slots={}",
+				s_frame_counter, cam.valid ? 1 : 0, cam.hash,
+				cam.position[0], cam.position[1], cam.position[2],
+				cam.forward[0], cam.forward[1], cam.forward[2],
+				s_worldprobe_tracked_count);
+
+			for (u32 i = 0; i < s_worldprobe_tracked_count; ++i)
+			{
+				const u64 tracked = s_worldprobe_tracked[i];
+
+				// Indexed, because the accumulator is re-seeded in tracked order every window --
+				// but hash-checked as well, so a future change that breaks that invariant reports
+				// ABSENT rather than silently mislabelling a slot.
+				const worldprobe_entry* entry = nullptr;
+				if (i < s_worldprobe_frame.size() && s_worldprobe_frame[i].content_hash == tracked)
+					entry = &s_worldprobe_frame[i];
+
+				if (!entry || entry->draws == 0 || entry->vertices == 0 || !entry->bounds.valid)
+				{
+					line += fmt::format(" | h={:016X} ABSENT", tracked);
+					continue;
+				}
+
+				const double inv = 1.0 / static_cast<double>(entry->vertices);
+				const float cx = static_cast<float>(entry->sum[0] * inv);
+				const float cy = static_cast<float>(entry->sum[1] * inv);
+				const float cz = static_cast<float>(entry->sum[2] * inv);
+
+				// Distance from the eye to the centroid. This is the discriminator: under a
+				// camera-relative recovery a pure look-around holds d fixed while c swings,
+				// because the geometry is being carried around the eye instead of standing still.
+				const float dx = cx - cam.position[0];
+				const float dy = cy - cam.position[1];
+				const float dz = cz - cam.position[2];
+				const float dist = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+				line += fmt::format(
+					" | h={:016X} n={} v={} t={} c=({:.2f},{:.2f},{:.2f}) d={:.2f} "
+					"b=({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})",
+					tracked, entry->draws, entry->vertices, entry->triangles, cx, cy, cz, dist,
+					entry->bounds.min[0], entry->bounds.min[1], entry->bounds.min[2],
+					entry->bounds.max[0], entry->bounds.max[1], entry->bounds.max[2]);
+			}
+
+			dump_write(line);
+		}
 
 		// Minimum render-target AREA in pixels for a target to count as on-screen; anything below it
 		// is an off-screen scratch target. 0 disables the gate. Latched -- read once per draw.
@@ -3463,20 +7879,341 @@ namespace RemixSubmit
 				surface.indices.push_back(base + index);
 		}
 
+		// --- hold-previous-window (step 4B) -----------------------------------------------------
+		//
+		// PCSX2_REMIX_HOLDEMPTY makes a presented window that submits NO geometry re-present the
+		// previous window instead of presenting an empty scene.
+		//   0 = off, the empty window presents empty (pre-4B behaviour)
+		//   1 = hold the GEOMETRY only. The window's own, newer camera is submitted.
+		//   2 = hold the geometry AND the CAMERA (DEFAULT), so the held window is a true duplicate
+		//       of the window it repeats.
+		//   3 = SKIP THE PRESENT entirely. Nothing is submitted and Present is not called, so the
+		//       previous frame stays on screen and the present rate becomes the game's own 40 Hz.
+		//       Opt-in; best on a VRR display, see below.
+		//
+		// WHAT IS MEASURED. FRAMETRACE, armed in gameplay with FRAMETRACEAFTER = 1200 (171 windows,
+		// f=2002..2172, the user's own in-mission run), says the period-3 signal this title has is
+		// exactly one thing and nothing else:
+		//   - sub = 0 on 57 of 171 windows (33.3%), and the spacing between those windows is
+		//     EXACTLY 3 in 56 of 56 gaps. Every third presented window submits zero geometry.
+		//   - sub on every other window is a flat 300-399. No dips, no sparse windows.
+		//   - sol (distinct NORMALISED solvers per window) = 1 on all 114 non-empty windows, so no
+		//     window straddles two cameras and branch 4A cannot help here; rings = 2 on all 114,
+		//     i.e. two raw matrices that normalise to ONE camera.
+		//   - miss = 0 total, fresh = 0 on zero windows, age deterministic (1 non-empty, 2 empty).
+		// That is the game rendering at 40 fps against a 60 Hz present, which the run's own status
+		// bar already said out loud (`FPS: 39-40  VPS: 60-61`), and it is the ONLY thing in the
+		// trace that varies with period 3.
+		//
+		// WHAT IS INFERRED, and this branch is falsifiable on it. That the empty window is the
+		// shattered frame in the user's clip is NOT proven: the trace and the clip are different
+		// runs and the identity was never established frame-for-frame. It is the strongest
+		// remaining candidate because nothing else in the measured path varies with period 3 --
+		// not because anyone observed it. If holding the previous window does not remove the
+		// shattering, the mechanism is elsewhere and the diagnosis has to start again; it does not
+		// mean the hold needs tuning.
+		//
+		// WHY THE DETECTION IS A ZERO TEST AND NOT A THRESHOLD. The plan drafted this as "sub under
+		// half the rolling median" back when a sparse window was still a live hypothesis. It is not:
+		// sub is either 0 or 300-399, with nothing in between, on 171 consecutive windows. A
+		// rolling-median heuristic against that distribution can only add false positives, so the
+		// test is s_submitted_this_frame == 0 and nothing more.
+		//
+		// THE CAMERA ON A HELD WINDOW, and a REFUTATION of the reasoning this shipped with.
+		//
+		// Mode 1 shipped first, holding only the geometry, on the argument that the camera choice
+		// was moot: `age = 2` on every empty FRAME line was read as "the active camera on an empty
+		// window is already the one the held geometry was built with, so holding it or advancing it
+		// is the same picture". **That is measured FALSE.** Checked directly against the user's
+		// gameplay trace (FRAME lines, f=2182..2312):
+		//     empty windows whose camera == the previous window's : 0
+		//     empty windows whose camera CHANGED                  : 43
+		// The camera advances on EVERY held window. Sample:
+		//     f=2184 sub=121 used=C9D87690
+		//     f=2185 sub=0   used=3A94504C   <- held geometry, NEW camera
+		//     f=2186 sub=121 used=3A94504C
+		// and the camera sequence over windows reads A,A,B,C,C,D,E,E -- advancing unevenly. `age`
+		// counts windows since the hash last CHANGED; it never said the empty window shared the
+		// previous window's camera, and reading it that way was the error.
+		//
+		// So under mode 1 a held window re-path-traces last game-frame's geometry FROM A MOVED EYE.
+		// The image shifts while the geometry does not, which is a smear/judder artifact on turns
+		// that the user reported after mode 1 shipped.
+		//
+		// WHY MODE 2 IS THE DEFAULT. The game is natively 40 fps -- the user confirmed it runs at
+		// 40 fps with RTX off -- so the 40-on-60 cadence is not a cost this backend introduced and
+		// there is no frame rate to recover. Ordinary 40-on-60 judder is the floor and is not ours
+		// to fix. What IS ours is the artifact on top of it: stock PCSX2 re-blits the SAME PIXELS
+		// on a duplicate vsync, a true frame repeat, while mode 1 renders a new viewpoint onto
+		// stale geometry. Mode 2 re-submits the previous window's camera along with its geometry,
+		// so the held window is a true duplicate and the backend matches what the game does
+		// without RTX. Mode 1 stays reachable for the A/B, unchanged.
+		//
+		// HOW, without a second SetupCamera. The earlier objection -- that re-submitting a camera
+		// means two SetupCamera calls per present, whose ordering against DrawInstance is untested
+		// on this runtime -- was legitimate, so the decision moved instead of the call: OnVSync runs
+		// submit_camera() before batch_flush(), and s_submitted_this_frame is already final for the
+		// window at the top of OnVSync (it is cleared at the bottom). So the hold is DECIDED before
+		// submit_camera() and simply changes which camera that one call submits. Still exactly one
+		// SetupCamera per present, no reordering, no second call. decide_hold_window() is that
+		// decision and hold_previous_window() only executes it.
+		//
+		// Note for whoever next reads a trace: the FRAME line's `used=` is the RESOLVED camera and
+		// is unchanged by this. Under mode 2 a held window SUBMITS the previous window's camera,
+		// which `used=` does not show -- read `cam-held` on the stats line for that.
+		//
+		// MODE 3, AND WHY IT IS NOT THE DEFAULT. Modes 1 and 2 both manufacture a 60 Hz stream out
+		// of 40 fps of content, so each game frame occupies one or two refreshes unevenly and some
+		// judder is unavoidable -- the floor described above. On a VRR display that floor is not
+		// necessary at all: present 40 times a second, each present a unique frame, and the panel
+		// refreshes to match. The user's display is an LG G3 (120 Hz OLED, HDMI 2.1 VRR /
+		// G-Sync Compatible), so mode 3 skips the present on an empty window entirely. It also
+		// removes ~33% of the path-tracing work per second, as a side effect rather than a goal.
+		//
+		// It is NOT the default because mode 2 is correct on any display while mode 3 is correct
+		// only on a variable-refresh one -- on a fixed 60 Hz panel a dropped present is a stutter,
+		// not a saved frame -- and because the risk below is audited but not RUN.
+		//
+		// WHAT WAS AUDITED FOR MODE 3, since "skip a Present" is the kind of change that hangs a
+		// title with this one's history:
+		//   - EMULATION PACING AND AUDIO ARE NOT OURS TO BREAK. RemixSubmit::OnVSync() is called
+		//     from GSRenderer::VSync (GSRenderer.cpp:645) BEFORE the emulator's own present block
+		//     (:649-720), and that block -- BeginPresentFrame / PresentRect / EndPresentFrame,
+		//     PerformanceMetrics::Update, the vsync throttle -- runs unconditionally whatever Remix
+		//     does. PCSX2 already skips its own presentation on duplicate frames there
+		//     (`skip_frame || ShouldSkipPresentingFrame()`, :649). So the emulator's frame limiter
+		//     never observes the Remix Present and cannot be paced by it.
+		//   - NOTHING IS LEFT UNPRESENTED IN THE RUNTIME. A skipped window makes ZERO Remix API
+		//     calls by construction: no SetupCamera, no CreateMesh (there is no geometry), no
+		//     DrawInstance, no light instances, no beacon. There is no accumulated scene waiting
+		//     for a Present, which is the only way a missing Present could strand runtime state.
+		//   - OUR OWN PER-FRAME BOOKKEEPING IS NOT PRESENT-DRIVEN. Everything after Present in
+		//     OnVSync runs unchanged on a skipped window: s_frame_counter still increments, so
+		//     batch_reap() ages handles at the same rate and the held set stays valid for exactly
+		//     as long; the viewport latch, the extent refutation (inert -- s_frame_bounds is empty
+		//     on an empty window), the stats tick (s_frame_counter % interval), mesh and material
+		//     reaping, the config poll and apply_live_knobs all still run. The beacon's empty-frame
+		//     STREAK still counts the window; only its submission is suppressed.
+		//   - IT CAN NEVER SKIP TWICE IN A ROW. A skip consumes the held set exactly as a hold
+		//     does (s_held_used), so a skipped present is always followed by a real one. The screen
+		//     cannot go stale for more than one window, and a genuine drought -- a load, a
+		//     cinematic -- presents normally from its second window onward.
+		// WHAT WAS NOT VERIFIED: any of this at runtime. Whether the Remix runtime and the Vulkan
+		// swapchain behind it are content with a variable present cadence cannot be established
+		// without launching the emulator, which this session did not do. Mode 3 is opt-in for that
+		// reason, and the recovery from anything unexpected is one conf line back to 2.
+		//
+		// SAFETY, against the risk register's "hold detection fires on legitimate cuts -> visible
+		// freeze-frames": a held set is used AT MOST ONCE. Two empty windows in a row -- a load, a
+		// cinematic, a fade -- present the second one empty exactly as today, so the worst case this
+		// can produce is one repeated frame at a scene boundary, not a frozen screen. A live world
+		// camera is required as well, which excludes menus and loading screens outright.
+		//
+		// DEFAULT 2, unlike PERDRAWCAM's 0. That knob shipped off because its census could answer
+		// the question without changing a pixel; this one has no such reading -- the whole claim is
+		// about what the screen looks like -- and the 'empty' counter measures the population it
+		// acts on whatever the mode. 1 is the shipped-and-confirmed geometry-only behaviour, 0
+		// restores the pre-4B behaviour exactly.
+		//
+		// READ LIVE, NEVER LATCHED. Same trap as everything else the .conf delivers: the renderer
+		// goes live at t=9.774 s and the per-game .conf applies at t=10.008 s, so a `static const`
+		// caches the default before the value exists and never re-reads it. FRAMETRACE shipped that
+		// way and produced zero output on a run whose own log confirmed it was applied -- see
+		// frametrace_frames(). Logged on CHANGE rather than once, for the same reason (the first
+		// get() legitimately reports the default).
+		int hold_empty_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_HOLDEMPTY", 2, 0, 3);
+			static int logged = -1;
+
+			const int mode = value.get();
+			if (mode != logged)
+			{
+				logged = mode;
+				INFO_LOG("Remix: HOLDEMPTY = {} -- {} (requires PCSX2_REMIX_BATCH = 1; read "
+						 "'hold-empty' on the stats line, and treat 'offcadence' as the "
+						 "misdetection tell)",
+					mode,
+					(mode == 3) ? "a window that submits NO geometry is NOT PRESENTED AT ALL -- the "
+								  "previous frame stays on screen and the present rate becomes the "
+								  "game's own. Best on a variable-refresh display; on a fixed-rate "
+								  "one a dropped present is a stutter. Never two in a row" :
+					(mode == 2) ? "a presented window that submits NO geometry re-presents the "
+								  "previous window's geometry AND its camera -- a true duplicate "
+								  "frame, at most once in a row" :
+					(mode == 1) ? "a presented window that submits NO geometry re-presents the "
+								  "previous window's geometry under this window's own newer camera "
+								  "(the eye moves over stale geometry; smears on turns)" :
+								  "an empty window presents an empty scene (pre-4B behaviour)");
+			}
+
+			return mode;
+		}
+
+		// Cadence bookkeeping, shared by every mode that acts on an empty window. A repeated frame
+		// (modes 1 and 2) and a skipped present (mode 3) are the same event as far as "did this
+		// fire where it was supposed to" is concerned, and `offcadence` is only a tell if every
+		// mode feeds it -- mode 3 in particular, which is the one worth watching closely.
+		void note_hold_cadence()
+		{
+			if (s_have_held_before)
+			{
+				const u64 gap = (s_frame_counter >= s_last_hold_window) ?
+									(s_frame_counter - s_last_hold_window) : 0;
+				s_stats.hold_gap_last = gap;
+
+				if (gap == 3)
+					++s_stats.hold_gap3;
+				else
+					++s_stats.hold_offcadence;
+			}
+
+			s_have_held_before = true;
+			s_last_hold_window = s_frame_counter;
+		}
+
+		// Decides whether THIS window holds, and counts every window it looks at. Must be called
+		// exactly once per window, at the top of OnVSync and BEFORE submit_camera(): mode 2 changes
+		// which camera that call submits, so the decision cannot wait for flush time. Everything it
+		// reads is already final for the window -- s_submitted_this_frame is cleared at the bottom
+		// of OnVSync, and s_active_camera is only replaced by resolve_world_camera(), also at the
+		// bottom -- so deciding early reads exactly what deciding late would have read.
+		//
+		// Rides the batch path because that is the only path with a retained set to re-present, and
+		// it is what the deployed config uses (PCSX2_REMIX_BATCH = 1). Under BATCH = 0 nothing is
+		// ever captured, so this counts the empty windows and does nothing else.
+		bool decide_hold_window()
+		{
+			s_hold_pending = false;
+
+			// The whole detection. Not a threshold -- see hold_empty_mode().
+			if (s_submitted_this_frame != 0)
+				return false;
+
+			++s_stats.hold_empty_windows;
+
+			// Nothing captured yet: BATCH = 0, or the first window of a scene.
+			if (s_held_instances.empty() || hold_empty_mode() == 0)
+				return false;
+
+			// At most one repeat per real window. This is the freeze-frame guard, and it is also
+			// what keeps a load screen looking like a load screen.
+			if (s_held_used)
+			{
+				++s_stats.hold_skip_consecutive;
+				return false;
+			}
+
+			// The handles are borrowed, not owned. batch_reap() keeps a mesh while
+			// created_frame + BATCHRETAIN > s_frame_counter, so this is that same predicate: with
+			// the deployed BATCHRETAIN = 16 it never fires, and with BATCHRETAIN = 1 it refuses
+			// every hold rather than handing the runtime a destroyed handle.
+			if ((s_held_frame + batch_retain_frames()) <= s_frame_counter)
+			{
+				++s_stats.hold_skip_stale;
+				s_held_instances.clear();
+				return false;
+			}
+
+			// A live world camera on both sides. The held vertices are in whichever space the
+			// window that built them submitted in, and re-presenting world-space geometry under a
+			// view-space camera (or the reverse) would place all of it wrong -- which is the very
+			// failure this is meant to remove. Also excludes menus and loads, which never solve a
+			// camera at all. Under mode 2 it is s_held_camera that is submitted, and the same test
+			// covers it: s_held_world IS s_held_camera.valid as of the window that captured them.
+			if (!s_active_camera.valid || !s_held_world)
+			{
+				++s_stats.hold_skip_nocam;
+				return false;
+			}
+
+			s_hold_pending = true;
+			return true;
+		}
+
+		// Executes the decision decide_hold_window() already made. Called from batch_flush on the
+		// empty-window path, i.e. after submit_camera and before Present -- so under mode 2 the
+		// camera these instances are drawn against has already been submitted as the held one.
+		// Returns true if anything was drawn.
+		bool hold_previous_window()
+		{
+			if (!s_hold_pending)
+				return false;
+
+			const remixapi_Interface& api = s_remix.api();
+			const bool attach_blend = (alpha_state_mode() == 2);
+			u64 drawn = 0;
+
+			for (held_instance& held : s_held_instances)
+			{
+				if (!held.handle)
+					continue;
+
+				remixapi_InstanceInfo instance{};
+				instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+				instance.pNext = attach_blend ? &held.blend : nullptr;
+				instance.categoryFlags = held.categories;
+				instance.mesh = held.handle;
+				instance.transform = held.transform;
+				instance.doubleSided = 1;
+
+				if (remix_ps2::guarded_draw_instance(api.DrawInstance, &instance) !=
+					REMIXAPI_ERROR_CODE_SUCCESS)
+				{
+					++s_stats.hold_failed;
+					continue;
+				}
+
+				s_frame_instanced_keys.insert(held.mesh_hash);
+				++drawn;
+			}
+
+			// Consumed even if every DrawInstance failed: a set that cannot be drawn once will not
+			// draw on the next window either, and retrying it would defeat the freeze-frame guard.
+			s_held_used = true;
+
+			if (drawn == 0)
+				return false;
+
+			++s_stats.hold_windows;
+			s_stats.hold_instances += drawn;
+			note_hold_cadence();
+			return true;
+		}
+
 		// Turns the frame's accumulated groups into meshes and instances them. Must run before
 		// Present, and is the whole point of batching: one CreateMesh and one DrawInstance per
 		// group, however many draws went into it.
+		//
+		// A window with no groups is where hold-previous-window lives: that is the empty window the
+		// step-4B measurement found, and it is the last point before Present at which anything can
+		// still be put on the screen.
 		void batch_flush()
 		{
 			if (s_batch_groups_used == 0)
 			{
 				s_batch_group_of_key.clear();
+				hold_previous_window();
 				return;
 			}
 
 			const remixapi_Interface& api = s_remix.api();
 			u64 vertices_this_frame = 0;
 			u64 surfaces_this_frame = 0;
+
+			// Start this window's held set. Captured unconditionally, not behind hold_empty_mode():
+			// the knob is live and the .conf is re-polled about once a second, so flipping it on
+			// mid-run has to find a set already standing. The cost is one push_back per GROUP, and
+			// this title runs a handful of groups per frame.
+			s_held_instances.clear();
+			s_held_frame = s_frame_counter;
+			s_held_world = s_active_camera.valid;
+			s_held_used = false;
+			// The camera this window's geometry was un-projected with, which is also the camera
+			// submit_camera() submitted at the top of this same OnVSync -- resolve_world_camera()
+			// does not run until the bottom. Mode 2 hands this straight back to submit_camera() on
+			// the next window if that window turns out to be empty.
+			s_held_camera = s_active_camera;
 
 			for (size_t g = 0; g < s_batch_groups_used; ++g)
 			{
@@ -3521,7 +8258,8 @@ namespace RemixSubmit
 				mesh_info.surfaces_count = s_batch_surface_scratch.size();
 
 				remixapi_MeshHandle handle = nullptr;
-				const u32 status = remix_ps2::guarded_create_mesh(api.CreateMesh, &mesh_info, &handle);
+				const auto create_mesh = api.CreateMeshBatched ? api.CreateMeshBatched : api.CreateMesh;
+				const u32 status = remix_ps2::guarded_create_mesh(create_mesh, &mesh_info, &handle);
 
 				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
 				{
@@ -3544,8 +8282,23 @@ namespace RemixSubmit
 				instance.transform = s_identity_transform;
 				instance.doubleSided = 1;
 
-				remix_ps2::guarded_draw_instance(api.DrawInstance, &instance);
+				const u32 draw_status = remix_ps2::guarded_draw_instance(api.DrawInstance, &instance);
 				s_frame_instanced_keys.insert(mesh_info.hash);
+
+				// Retained for the next window only, and only if it drew here: an instance the
+				// runtime refused once is not worth re-presenting. The blend struct is copied by
+				// value because instance.pNext must point at storage that outlives this call.
+				if (draw_status == REMIXAPI_ERROR_CODE_SUCCESS)
+				{
+					held_instance held{};
+					held.handle = handle;
+					held.blend = group.blend;
+					held.blend.pNext = nullptr;
+					held.categories = group.categories;
+					held.transform = instance.transform;
+					held.mesh_hash = mesh_info.hash;
+					s_held_instances.push_back(held);
+				}
 			}
 
 			s_stats.batch_surfaces_peak = std::max(s_stats.batch_surfaces_peak, surfaces_this_frame);
@@ -3576,6 +8329,20 @@ namespace RemixSubmit
 			s_batch_meshes.clear();
 			s_batch_group_of_key.clear();
 			s_batch_groups_used = 0;
+
+			// The held set borrows those handles, so it dies with them. Both callers -- save-state
+			// load and GS close -- replace the whole scene, which is also exactly the moment a
+			// repeated frame would be visible as a stutter across a cut. s_frame_counter is zeroed
+			// on close, so the cadence tracking resets here too or the first hold after a restart
+			// reads as a wild off-cadence gap.
+			s_held_instances.clear();
+			s_held_frame = 0;
+			s_held_world = false;
+			s_held_used = false;
+			s_held_camera = world_camera{};
+			s_hold_pending = false;
+			s_last_hold_window = 0;
+			s_have_held_before = false;
 		}
 
 		// Releases batch meshes whose frame is far enough behind that nothing in flight can still
@@ -3719,15 +8486,91 @@ namespace RemixSubmit
 			// visible, so a null result names the stage that produced it -- no kicks, no
 			// windows through the shape prefilter, no candidates, no split, or no score.
 			INFO_LOG("Remix: vu kicks {} scanned {} reentrant {} windows {} shape-ok {} | "
-					 "slice matrices {} published {} | cand {} (now {}) | "
+					 "programs {}/{}{} | slice matrices {} published {} | cand {} (now {}) | "
 					 "split-reject {} score-reject {} degenerate-reject {} scale-reject {} extent-reject {} accept {} (sliced {}) | camera {}{}",
 				s_stats.vu_kicks, s_stats.vu_kicks_scanned, s_stats.vu_reentrant, s_stats.vu_windows,
-				s_stats.vu_survivors, s_stats.vu_sliced, s_stats.vu_sliced_published,
+				s_stats.vu_survivors,
+				s_stats.vu_programs_used, s_stats.vu_programs_limit,
+				// A non-zero refusal count means entry points exist that were never sliced, so
+				// their matrices -- including any register-resident camera -- cannot reach the GS
+				// side at all. The named PC is the one to raise PCSX2_REMIX_MAXPROGRAMS for.
+				(s_stats.vu_programs_refused != 0)
+					? fmt::format(" REFUSED {} (last pc=0x{:04x} ucode=0x{:016x}) -- entry points "
+								  "never sliced; raise PCSX2_REMIX_MAXPROGRAMS",
+						  s_stats.vu_programs_refused, s_stats.vu_refused_start_pc,
+						  s_stats.vu_refused_ucode)
+					: std::string(),
+				s_stats.vu_sliced, s_stats.vu_sliced_published,
 				s_stats.cam_candidates, s_stats.cam_last_candidates, s_stats.cam_reject_split,
 				s_stats.cam_reject_score, s_stats.cam_reject_degenerate, s_stats.cam_reject_scale,
 				s_stats.cam_reject_extent, s_stats.cam_accept, s_stats.cam_accept_sliced,
 				s_active_camera.valid ? "world score " : "view-space",
 				s_active_camera.valid ? fmt::format("{:.2f} near {:.5g}", s_active_camera.score, s_active_camera.near_plane) : "");
+
+			// Per-draw camera placement, and the census that decides whether it can possibly help.
+			// Its own line because it counts DRAWS and WINDOWS while the line above counts frames.
+			//
+			// READ 'solvers/window' FIRST. It is the whole verdict:
+			//   peak 1  -> every window's draws shared ONE un-projection. Per-draw placement cannot
+			//              change the picture no matter what the ring hashes say, and the shatter
+			//              has another cause. Do not ship placement; re-diagnose.
+			//   peak 2+ -> windows genuinely straddle cameras; per-draw placement is the fix, and
+			//              'multi' says on how many windows.
+			// 'rings/window' above 'solvers/window' means the title emits one camera at more than
+			// one column scale (SOCOM CA does: an exact 10x on columns 0 and 1). That difference is
+			// NOT normalised away here -- measured, see per_draw_solver's comment -- so on this
+			// title the two counts should track each other.
+			//
+			// Of the draw counters: 'distinct' is the population per-draw placement acts on,
+			// 'same-solver' is the population it would be a no-op for, 'match' is the draws whose
+			// camera already IS the frame camera, and 'fallback' is ring misses plus refusals.
+			// 'refused' climbing is the plan's named tell for 4A mis-accepting a non-camera ring
+			// matrix -- watch it with maxpos and extent-reject, which read 0 today.
+			INFO_LOG("Remix: per-draw camera placement {} | solvers/window last {} peak {} "
+					 "(multi {} of {} windows{}) | rings/window last {} peak {} | "
+					 "draws distinct {} same-solver {} match {} fallback {} | solves {} refused {}",
+				(per_draw_camera_mode() != 0) ? "ON" : "OFF (frame-latched; census still measured)",
+				s_stats.perdraw_solvers_last, s_stats.perdraw_solvers_peak,
+				s_stats.perdraw_multi_windows, s_stats.perdraw_windows,
+				(s_stats.perdraw_census_overflow != 0) ?
+					fmt::format(", {} over census capacity", s_stats.perdraw_census_overflow) : std::string(),
+				s_stats.perdraw_rings_last, s_stats.perdraw_rings_peak,
+				s_stats.perdraw_distinct, s_stats.perdraw_same_solver, s_stats.perdraw_match,
+				s_stats.perdraw_fallback, s_stats.perdraw_solved, s_stats.perdraw_refused);
+
+			// Hold-previous-window. Its own line for the same reason as the one above: it counts
+			// WINDOWS, and the number that matters is a ratio against the frame count on the first
+			// line, not against anything else here.
+			//
+			// READ 'empty' AND 'offcadence' TOGETHER.
+			//   empty ~= frames/3 -> the measured cadence is present and this is acting on it.
+			//   held ~= empty     -> essentially every empty window was covered.
+			//   offcadence 0      -> every hold landed exactly 3 windows after the previous one,
+			//                        which is the only spacing this title's empty windows have.
+			//   offcadence rising -> the detection is firing somewhere it was not designed to (a
+			//                        load, a cinematic, a title that paces differently). It is the
+			//                        plan's named tell and it is why the counter exists.
+			// 'skip consec' is a genuine drought being correctly left alone rather than frozen.
+			// A hold repeats a frame, so it can only ever restore a coherent scene -- it cannot
+			// prove the shattering was the empty window. That identity is INFERRED; the user's eye
+			// on a fresh clip is the test. See hold_empty_mode().
+			// 'cam-held' is the mode-1-vs-2 reading, and under mode 2 it must track 'held'. Where it
+			// lags, a held window rendered stale geometry from a moved eye -- which is the smear the
+			// user reported on turns, and the reason mode 2 exists.
+			const int hold_mode_now = hold_empty_mode();
+			INFO_LOG("Remix: hold-empty {} | empty windows {} held {} cam-held {} skipped-present {} "
+					 "instances {} | "
+					 "gap3 {} offcadence {} (last gap {}) | skip: consec {} nocam {} stale {} | "
+					 "instance-fail {}",
+				(hold_mode_now == 3) ? "MODE 3 (empty window NOT presented; native-rate, VRR)" :
+				(hold_mode_now == 2) ? "MODE 2 (geometry + camera; true duplicate frame)" :
+				(hold_mode_now == 1) ? "MODE 1 (geometry only; window's own newer camera)" :
+									   "OFF (empty windows present empty; count only)",
+				s_stats.hold_empty_windows, s_stats.hold_windows, s_stats.hold_cameras,
+				s_stats.hold_skipped_presents, s_stats.hold_instances,
+				s_stats.hold_gap3, s_stats.hold_offcadence, s_stats.hold_gap_last,
+				s_stats.hold_skip_consecutive, s_stats.hold_skip_nocam, s_stats.hold_skip_stale,
+				s_stats.hold_failed);
 
 			// The split breakdown, printed only when something was rejected. One opaque count
 			// could not tell "the matrix was singular" from "the recovered projection was not a
@@ -4001,11 +8844,13 @@ namespace RemixSubmit
 		const bool untex_draw = !r.m_process_texture;
 		const bool fst_draw = !untex_draw && (r.PRIM->FST != 0);
 		const bool z_depth = untex_draw || fst_draw;
+		const bool fallback_screen_ui = !untex_draw && !s_active_camera.valid &&
+			(z_depth ? (r.m_vt.m_eq.z && (!fst_draw || !remix_ps2::nocam_enabled())) : r.m_vt.m_eq.q);
 
 		// Untextured: no texture means no Q was ever written, and also no material -- these come
 		// back from materials::bind() with the null binding and shade like Rainbow Six 3's white
 		// geometry. Untextured-and-placed beats absent, which is what dropping them amounted to.
-		if (untex_draw && (untex_z_mode() == 0 || !fst_z_solution(fst_z_a, fst_z_b)))
+		if (untex_draw && !fallback_screen_ui && (untex_z_mode() == 0 || !fst_z_solution(fst_z_a, fst_z_b)))
 		{
 			++s_stats.skip_untextured;
 			return;
@@ -4014,7 +8859,7 @@ namespace RemixSubmit
 		// FST=1: the guest fed direct UV texels, so Q is not the perspective divisor. Recoverable
 		// only if this title's Z has been shown to be a usable depth (see fst_z_solution), which
 		// is measured continuously from the FST=0 draws rather than assumed.
-		if (fst_draw && !fst_z_solution(fst_z_a, fst_z_b))
+		if (fst_draw && !fallback_screen_ui && !fst_z_solution(fst_z_a, fst_z_b))
 		{
 			++s_stats.skip_fst;
 			return;
@@ -4029,7 +8874,7 @@ namespace RemixSubmit
 		// viewed exactly head-on is lost -- applied to the only varying quantity FST draws have.
 		// Applies to every Z-depth draw, textured or not: for an untextured draw Q is not merely
 		// the wrong divisor, it was never written, so testing it would pass everything through.
-		if (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q)
+		if (!fallback_screen_ui && (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q))
 		{
 			// Counted separately: "how many FST draws have no depth variation at all" is the
 			// number that decides whether depth-from-Z can recover geometry for this title or
@@ -4260,6 +9105,33 @@ namespace RemixSubmit
 		const bool world_mode = s_active_camera.valid;
 		const float position_limit = max_position_magnitude();
 
+		// --- which camera un-projects THIS draw (step 4A) ------------------------------------
+		//
+		// The ring is walked at most once here (memoised per kick sequence) and the result serves
+		// both consumers below: the per-draw camera census and election, and the FRAMETRACE sampler
+		// further down, which used to do its own lookup -- two ring walks per draw on exactly the
+		// run the trace is measuring.
+		//
+		// Only in world mode: with no frame camera the vertex loop takes the view-space branch and
+		// no solver is read at all, so a lookup there would be pure cost.
+		//
+		// The CENSUS runs whatever PCSX2_REMIX_PERDRAWCAM says -- see per_draw_solver() above for
+		// why, for the measurement that made this necessary, for the three hypotheses it refutes
+		// (camera refusal, camera dropout, the ring failing to record), and for the fourth it
+		// nearly fell to (the same camera at two column scales).
+		float draw_kick_m[16] = {};
+		u64 draw_kick_hash = 0;
+
+		if (world_mode || s_frametrace_left > 0)
+			draw_kick_hash = lookup_draw_kick_camera(draw_kick_m);
+
+		// nullptr = "this draw's camera is the frame camera, or the ring/pipeline could not give a
+		// trustworthy one, or placement is off" -- all of which mean: un-project with the frame
+		// solver, unchanged.
+		const remix_ps2::clip_solver* const draw_camera =
+			world_mode ? per_draw_solver(draw_kick_hash, draw_kick_m) : nullptr;
+		const remix_ps2::clip_solver& base_solver = draw_camera ? *draw_camera : s_active_camera.solver;
+
 		// Sky geometry has to be solved in a space with no eye in it.
 		//
 		// solve_world_position computes (clip - bias) * B^-1, and for an accepted type-1
@@ -4276,7 +9148,11 @@ namespace RemixSubmit
 		// Both halves have to agree or the sky is displaced by the full eye position, which on
 		// save state 7 is ~20,000 units and puts the backdrop somewhere off in the distance
 		// instead of behind the level.
-		remix_ps2::clip_solver sky_solver = s_active_camera.solver;
+		//
+		// Derived from base_solver, not from s_active_camera.solver, so a sky draw placed with its
+		// own kick camera gets the bias-zeroed variant of THAT camera. The two halves have to be
+		// the same camera or the dome is displaced by the difference between them.
+		remix_ps2::clip_solver sky_solver = base_solver;
 		sky_solver.bias[0] = 0.f;
 		sky_solver.bias[1] = 0.f;
 		sky_solver.bias[2] = 0.f;
@@ -4288,7 +9164,7 @@ namespace RemixSubmit
 			classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(), s_submitted_this_frame,
 				draw_samples_render_target(tex_source));
 
-		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : s_active_camera.solver;
+		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : base_solver;
 
 		const GSVertex* const verts = r.m_vertex->buff;
 
@@ -4360,9 +9236,9 @@ namespace RemixSubmit
 			// Q = a*zn + b fitted on this title's FST=0 draws. Non-positive or non-finite
 			// results fall out at the same finite check -- Z below the far plane inverts to a
 			// negative w, and rejecting it is correct.
-			const float q = z_depth ?
+			const float q = fallback_screen_ui ? 1.f : (z_depth ?
 				static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
-				v.RGBAQ.Q;
+				v.RGBAQ.Q);
 			const float w = 1.0f / q;
 
 			remixapi_HardcodedVertex& out = s_scratch_vertices[i];
@@ -4458,7 +9334,7 @@ namespace RemixSubmit
 			// 2D that the exact const-Q test missed. Placed here because min_w/max_w only exist
 			// once the vertex loop has run; see w_flat_limit() for the menu measurement behind it.
 			const float flat_limit = w_flat_limit();
-			if (flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
+			if (!fallback_screen_ui && flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
 			{
 				++s_stats.skip_w_flat;
 				return;
@@ -4909,6 +9785,253 @@ namespace RemixSubmit
 
 		s_frame_group_keys.insert(group_key);
 
+		// PCSX2_REMIX_FRAMETRACE: one sample per draw, folded into the window's totals and read out
+		// at VSync. See frametrace_frames() for what it is measuring and why the obvious readings
+		// were refuted first.
+		//
+		// Placed here, in the SHARED section above the batch return, deliberately -- see the dump
+		// block below for what living on the far side of that return costs a diagnostic.
+		//
+		// The ring lookup itself now happens once, up at the per-draw camera election, and this
+		// only folds its result in -- reading it twice would double the trace's own cost on the
+		// exact run it is measuring. The accumulation deliberately stays HERE rather than moving up
+		// with the lookup: it must keep counting only the draws that clear every gate and are
+		// actually submitted, which is what the baseline 600-window measurement counted.
+		if (s_frametrace_left > 0)
+		{
+			++s_frame_trace.draws;
+
+			if (draw_kick_hash != 0)
+			{
+				if (s_frame_trace.first_hash == 0)
+				{
+					s_frame_trace.first_hash = draw_kick_hash;
+				}
+				else if (draw_kick_hash != s_frame_trace.first_hash)
+				{
+					++s_frame_trace.not_first;
+
+					if (s_frame_trace.second_hash == 0)
+						s_frame_trace.second_hash = draw_kick_hash;
+				}
+			}
+			else
+			{
+				// Counted and nothing else. The ring's contract is that a miss means fall back to
+				// the frame camera and never guess (RemixVU1Capture.h:127-129); this sampler places
+				// nothing at all, so all it can honestly report is that the ring was empty here.
+				++s_frame_trace.misses;
+			}
+		}
+
+		// PCSX2_REMIX_WORLDPROBE: accumulate this draw's world-space placement under its material
+		// content hash. See worldprobe_frames() for the question this answers.
+		//
+		// Placed here, beside the FRAMETRACE sampler, for the same two reasons: this is the SHARED
+		// section above the batch early return -- a diagnostic on the far side of that return is
+		// unreachable under PCSX2_REMIX_BATCH = 1, which is this title's deployed setting and which
+		// silently produced an empty per-draw dump once already -- and it counts only draws that
+		// cleared every gate and are actually being submitted.
+		//
+		// world_mode only: with no world camera the vertex loop wrote VIEW-space positions, which
+		// are camera-relative by construction and would answer the probe's question "yes" for a
+		// reason that has nothing to do with the defect. Sky is excluded because a sky draw is
+		// deliberately solved with the bias-zeroed (eye-free) solver, so it is not evidence about
+		// world geometry either way.
+		//
+		// s_scratch_vertices still holds world positions at this point: the stable-identity path
+		// rewrites them to local coordinates further down, past the batch branch.
+		if (s_worldprobe_left > 0 && world_mode && !ds.is_sky)
+			worldprobe_sample(material.content_hash, static_cast<u32>(s_scratch_indices.size() / 3));
+
+		// PCSX2_REMIX_WORLDFIX rides the same gate for the same three reasons -- shared section
+		// above the batch early return, world positions still in s_scratch_vertices, and only
+		// draws that cleared every gate -- but keys on (material, vertex count, index count)
+		// rather than the material alone, so a window whose merged set changed does not pair.
+		if (s_worldfix_active > 0 && world_mode && !ds.is_sky)
+			worldfix_sample(material.content_hash, static_cast<u32>(s_scratch_vertices.size()),
+				static_cast<u32>(s_scratch_indices.size()));
+
+		// PCSX2_REMIX_CAMTEST rides the same gate for the same three reasons, and adds the clipping
+		// defence its whole result depends on: the draw's screen box must be strictly inside the
+		// viewport. It stores CLIP samples rather than the world positions beside them -- clip is the
+		// guest's own output and carries no camera, so the same samples can be un-projected with
+		// every candidate. The constants below are the ones the vertex loop above used, handed over
+		// rather than recomputed so the two cannot disagree.
+		if (s_camtest_active > 0 && world_mode && !ds.is_sky)
+		{
+			camtest_clip_map map{};
+			map.scale_x = sx;
+			map.scale_y = sy;
+			map.offset_x = offset_x;
+			map.offset_y = offset_y;
+			map.z_scale = zfit_scale;
+			map.z_a = fst_z_a;
+			map.z_b = fst_z_b;
+			map.screen_ui = fallback_screen_ui;
+			map.z_depth = z_depth;
+
+			camtest_screen_box box{};
+			box.min_x = min_px;
+			box.max_x = max_px;
+			box.min_y = min_py;
+			box.max_y = max_py;
+			box.width = rt_unscaled_width;
+			box.height = rt_unscaled_height;
+
+			camtest_sample(material.content_hash, vertex_count,
+				static_cast<u32>(s_scratch_indices.size()), verts, map, box);
+		}
+
+		// Built once and used twice. PCSX2_REMIX_DRAWDUMP's per-frame dump wants it, and so do the
+		// hyperextension offenders: bucketing an explosion by class needs the same fields the sky
+		// rule was derived from -- FST, world or view space, whether the texture is a render target,
+		// and the w range -- so duplicating a shortened field set for them would be strictly worse.
+		//
+		// MOVED HERE 2026-08-15, from after DrawInstance -- i.e. from the far side of the batch
+		// early return below -- because that made it UNREACHABLE under PCSX2_REMIX_BATCH = 1, which
+		// is this title's deployed setting (SCUS-97545.conf). MEASURED on the clip run: the log
+		// carries `PCSX2_REMIX_DRAWDUMP = 4 (PCSX2 toggle)`, drawdump_write's own "writing per-draw
+		// state to ..." line never appears, and logs\remix_draws.txt is two days older than the run.
+		// The knob was accepted, reported applied, and wrote nothing -- which is the worst failure
+		// mode a diagnostic has, and it blocked the sky work that needs the dome's draw ordinal.
+		//
+		// The one behavioural difference on the non-batch path, stated so it is not re-diagnosed as
+		// a bug: a draw is now dumped when it is accepted for submission rather than after
+		// DrawInstance returned, so draws later dropped by the instance budget or by a poisoned
+		// handle appear in the dump too. Both counters read 0 on this title (instbudget-skip 0,
+		// poisoned 0), and "what the frame asked to submit" is the more useful set for a dump whose
+		// whole job is to describe the frame. None of the printed fields change between here and
+		// there; they are all final by this point.
+		const float far_limit = far_dump_limit();
+		const bool far_hit = (far_limit > 0.f) && (draw_max_pos > far_limit);
+
+		if (s_drawdump_frames_left > 0 || explode_ratio > 0.f || far_hit)
+		{
+			// The camera this draw was actually built under, from the per-kick ring, identified by
+			// content hash. Diagnostic for now -- nothing is placed with it yet. If cm varies
+			// across the draws of one frame, the title renders with more than one view matrix and
+			// the single frame camera is provably wrong for some of them; if it is constant, the
+			// door welded to the screen has some other cause.
+			float kick_m[16];
+			u32 kick_offset = 0;
+			u64 kick_hash = 0;
+
+			if (RemixVU1Capture::LookupKickCamera(RemixVU1Capture::GSKickSeq(), kick_m, kick_offset))
+			{
+				kick_hash = 0xCBF29CE484222325ULL;
+				for (u32 i = 0; i < 16; ++i)
+				{
+					u32 bits = 0;
+					std::memcpy(&bits, &kick_m[i], sizeof(bits));
+					kick_hash = (kick_hash ^ bits) * 0x100000001B3ULL;
+				}
+			}
+			else
+			{
+				kick_offset = 0xFFFFFFFFu;
+			}
+
+			// One line per distinct camera the ring reports, the first time it is seen, as the 16
+			// floats sit in VU1 memory. Uninterpreted on purpose: row- versus column-major is the
+			// GS side's guess, and the point of this dump is to read the structure off the raw
+			// values rather than through that guess. A backdrop/sky transform carries no
+			// translation; a shadow transform is anchored at the light rather than the eye.
+			if (kick_hash != 0 &&
+				s_logged_kick_cam_count < (sizeof(s_logged_kick_cams) / sizeof(s_logged_kick_cams[0])))
+			{
+				bool seen = false;
+				for (u32 i = 0; i < s_logged_kick_cam_count; ++i)
+					seen = seen || (s_logged_kick_cams[i] == kick_hash);
+
+				if (!seen)
+				{
+					s_logged_kick_cams[s_logged_kick_cam_count++] = kick_hash;
+
+					drawdump_write(fmt::format(
+						"CAMERA {:016X} off=0x{:04x} f={} d={} | "
+						"[{: .6g} {: .6g} {: .6g} {: .6g}] [{: .6g} {: .6g} {: .6g} {: .6g}] "
+						"[{: .6g} {: .6g} {: .6g} {: .6g}] [{: .6g} {: .6g} {: .6g} {: .6g}]",
+						kick_hash, kick_offset, s_frame_counter, s_submitted_this_frame,
+						kick_m[0], kick_m[1], kick_m[2], kick_m[3],
+						kick_m[4], kick_m[5], kick_m[6], kick_m[7],
+						kick_m[8], kick_m[9], kick_m[10], kick_m[11],
+						kick_m[12], kick_m[13], kick_m[14], kick_m[15]));
+				}
+			}
+
+			const std::string draw_state_line = fmt::format(
+				// pdc: 1 = this draw was un-projected with its OWN kick camera (cm), 0 = with the
+				// frame-latched one. It is the per-draw witness for the stats line's placed/match/
+				// fallback totals, and the only place the two can be checked against each other.
+				"f={} d={} k={} kf={} kt={} cm={:016X} co=0x{:08x} pdc={} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
+				"ATE={} ATST={} AREF={} AFAIL={} ABE={} ALPHA(A={} B={} C={} D={} FIX={}) | fpsm=0x{:02x} fbmsk=0x{:08x} | "
+				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
+				// w to six significant figures, not one decimal. At one decimal every draw whose w
+				// spread is under 0.1 reads as perfectly flat, and the minw gate sits at 0.01 --
+				// so the printed value could not resolve the very range the gate acts on, nor tell
+				// a w of exactly 0 (where the un-projection is undefined) from a small one.
+				"w=[{:.6g},{:.6g}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
+				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
+				s_frame_counter, s_submitted_this_frame,
+				RemixVU1Capture::KickSeq(), s_latched_kick_seq, RemixVU1Capture::GSKickSeq(),
+				kick_hash, kick_offset, (draw_camera != nullptr) ? 1 : 0,
+				vertex_count, s_scratch_indices.size() / 3,
+				fst_draw ? 1 : 0, world_mode ? 1 : 0,
+				ds.is_sky ? 1 : 0,
+				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),
+				static_cast<u32>(r.m_cached_ctx.ZBUF.ZMSK), static_cast<u32>(r.m_cached_ctx.ZBUF.PSM),
+				r.m_cached_ctx.DepthRead() ? 1 : 0, r.m_cached_ctx.DepthWrite() ? 1 : 0,
+				static_cast<u32>(r.m_cached_ctx.TEST.ATE), static_cast<u32>(r.m_cached_ctx.TEST.ATST),
+				static_cast<u32>(r.m_cached_ctx.TEST.AREF), static_cast<u32>(r.m_cached_ctx.TEST.AFAIL),
+				static_cast<u32>(r.PRIM->ABE),
+				// The GS blend equation (A-B)*C+D, verbatim. ABE=1 is set on 100% of this title's
+				// draws, so it says nothing about whether a draw actually blends -- the equation
+				// does. Without these fields there is no way to tell an opaque-equivalent setting
+				// from a real blend, and ALPHASTATE=2 therefore turned the whole world translucent.
+				static_cast<u32>(r.m_context->ALPHA.A), static_cast<u32>(r.m_context->ALPHA.B),
+				static_cast<u32>(r.m_context->ALPHA.C), static_cast<u32>(r.m_context->ALPHA.D),
+				static_cast<u32>(r.m_context->ALPHA.FIX),
+				static_cast<u32>(r.m_cached_ctx.FRAME.PSM), static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK),
+				static_cast<u32>(r.m_cached_ctx.TEX0.TBP0), static_cast<u32>(r.m_cached_ctx.TEX0.TBW),
+				static_cast<u32>(r.m_cached_ctx.TEX0.PSM), static_cast<u32>(r.m_cached_ctx.TEX0.TW),
+				static_cast<u32>(r.m_cached_ctx.TEX0.TH), static_cast<u32>(r.m_cached_ctx.TEX0.TCC),
+				static_cast<u32>(r.m_cached_ctx.TEX0.TFX),
+				(source && (source->m_target || source->m_from_target)) ? 1 : 0,
+				min_w, max_w, min_z, max_z, min_px, max_px, min_py, max_py,
+				rt_unscaled_width, rt_unscaled_height, min_u, max_u, min_v, max_v,
+				material.content_hash);
+
+			if (s_drawdump_frames_left > 0)
+				drawdump_write(draw_state_line);
+
+			// Offender detail behind the 'explode' counter on the stats line. Capped, because a
+			// title that misplaces every draw would otherwise fill the 40k-line dump with the same
+			// finding: a hundred lines is plenty to name the class, and the counter stays exact
+			// regardless of the cap. Deliberately NOT gated on PCSX2_REMIX_DRAWDUMP -- the counter is
+			// meant to be readable from a default run, and drawdump_write only creates the file on
+			// its first call, so a session with no offenders still writes nothing at all.
+			if (explode_ratio > 0.f && s_explode_dumped < 100)
+			{
+				++s_explode_dumped;
+				drawdump_write(fmt::format("EXPLODE ratio={:.1f}x limit={:g}x extent={:.2f} | {}",
+					explode_ratio, explode_ratio_limit(), draw_bounds.diagonal(), draw_state_line));
+			}
+
+			// Absolute-placement offenders. Same cap and the same reasoning as EXPLODE above: the
+			// point is to name the class the far draws belong to, not to log every one. The extent
+			// is printed alongside the distance on purpose -- a compact draw sitting 100k units out
+			// is a placement bug, a draw whose own extent is 100k is a stretched one, and the two
+			// want completely different fixes.
+			if (far_hit && s_fardump_written < 200)
+			{
+				++s_fardump_written;
+				drawdump_write(fmt::format("FARDRAW maxpos={:.0f} limit={:g} extent={:.2f} "
+										   "w=[{:.2f}..{:.2f}] | {}",
+					draw_max_pos, far_limit, draw_bounds.diagonal(), min_w, max_w, draw_state_line));
+			}
+		}
+
 		if (batch_mode() != 0)
 		{
 			batch_append(group_key, ds, material);
@@ -5172,129 +10295,6 @@ namespace RemixSubmit
 		if (ds.is_cutout)
 			++s_stats.cutout_tagged;
 
-		// Built once and used twice. PCSX2_REMIX_DRAWDUMP's per-frame dump wants it, and so do the
-		// hyperextension offenders: bucketing an explosion by class needs the same fields the sky
-		// rule was derived from -- FST, world or view space, whether the texture is a render target,
-		// and the w range -- so duplicating a shortened field set for them would be strictly worse.
-		const float far_limit = far_dump_limit();
-		const bool far_hit = (far_limit > 0.f) && (draw_max_pos > far_limit);
-
-		if (s_drawdump_frames_left > 0 || explode_ratio > 0.f || far_hit)
-		{
-			// The camera this draw was actually built under, from the per-kick ring, identified by
-			// content hash. Diagnostic for now -- nothing is placed with it yet. If cm varies
-			// across the draws of one frame, the title renders with more than one view matrix and
-			// the single frame camera is provably wrong for some of them; if it is constant, the
-			// door welded to the screen has some other cause.
-			float kick_m[16];
-			u32 kick_offset = 0;
-			u64 kick_hash = 0;
-
-			if (RemixVU1Capture::LookupKickCamera(RemixVU1Capture::GSKickSeq(), kick_m, kick_offset))
-			{
-				kick_hash = 0xCBF29CE484222325ULL;
-				for (u32 i = 0; i < 16; ++i)
-				{
-					u32 bits = 0;
-					std::memcpy(&bits, &kick_m[i], sizeof(bits));
-					kick_hash = (kick_hash ^ bits) * 0x100000001B3ULL;
-				}
-			}
-			else
-			{
-				kick_offset = 0xFFFFFFFFu;
-			}
-
-			// One line per distinct camera the ring reports, the first time it is seen, as the 16
-			// floats sit in VU1 memory. Uninterpreted on purpose: row- versus column-major is the
-			// GS side's guess, and the point of this dump is to read the structure off the raw
-			// values rather than through that guess. A backdrop/sky transform carries no
-			// translation; a shadow transform is anchored at the light rather than the eye.
-			if (kick_hash != 0 &&
-				s_logged_kick_cam_count < (sizeof(s_logged_kick_cams) / sizeof(s_logged_kick_cams[0])))
-			{
-				bool seen = false;
-				for (u32 i = 0; i < s_logged_kick_cam_count; ++i)
-					seen = seen || (s_logged_kick_cams[i] == kick_hash);
-
-				if (!seen)
-				{
-					s_logged_kick_cams[s_logged_kick_cam_count++] = kick_hash;
-
-					drawdump_write(fmt::format(
-						"CAMERA {:016X} off=0x{:04x} f={} d={} | "
-						"[{: .6g} {: .6g} {: .6g} {: .6g}] [{: .6g} {: .6g} {: .6g} {: .6g}] "
-						"[{: .6g} {: .6g} {: .6g} {: .6g}] [{: .6g} {: .6g} {: .6g} {: .6g}]",
-						kick_hash, kick_offset, s_frame_counter, s_submitted_this_frame,
-						kick_m[0], kick_m[1], kick_m[2], kick_m[3],
-						kick_m[4], kick_m[5], kick_m[6], kick_m[7],
-						kick_m[8], kick_m[9], kick_m[10], kick_m[11],
-						kick_m[12], kick_m[13], kick_m[14], kick_m[15]));
-				}
-			}
-
-			const std::string draw_state_line = fmt::format(
-				"f={} d={} k={} kf={} kt={} cm={:016X} co=0x{:08x} verts={} tris={} fst={} world={} sky={} | ZTE={} ZTST={} ZMSK={} zpsm=0x{:02x} depth(r={} w={}) | "
-				"ATE={} ATST={} AREF={} AFAIL={} ABE={} | fpsm=0x{:02x} fbmsk=0x{:08x} | "
-				"tex tbp0=0x{:04x} tbw={} psm=0x{:02x} tw={} th={} tcc={} tfx={} target={} | "
-				// w to six significant figures, not one decimal. At one decimal every draw whose w
-				// spread is under 0.1 reads as perfectly flat, and the minw gate sits at 0.01 --
-				// so the printed value could not resolve the very range the gate acts on, nor tell
-				// a w of exactly 0 (where the un-projection is undefined) from a small one.
-				"w=[{:.6g},{:.6g}] z=[{},{}] | px=[{:.0f},{:.0f}]x[{:.0f},{:.0f}] rt={}x{} | "
-				"uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | mat={:016X}",
-				s_frame_counter, s_submitted_this_frame,
-				RemixVU1Capture::KickSeq(), s_latched_kick_seq, RemixVU1Capture::GSKickSeq(),
-				kick_hash, kick_offset,
-				vertex_count, s_scratch_indices.size() / 3,
-				fst_draw ? 1 : 0, world_mode ? 1 : 0,
-				ds.is_sky ? 1 : 0,
-				static_cast<u32>(r.m_cached_ctx.TEST.ZTE), static_cast<u32>(r.m_cached_ctx.TEST.ZTST),
-				static_cast<u32>(r.m_cached_ctx.ZBUF.ZMSK), static_cast<u32>(r.m_cached_ctx.ZBUF.PSM),
-				r.m_cached_ctx.DepthRead() ? 1 : 0, r.m_cached_ctx.DepthWrite() ? 1 : 0,
-				static_cast<u32>(r.m_cached_ctx.TEST.ATE), static_cast<u32>(r.m_cached_ctx.TEST.ATST),
-				static_cast<u32>(r.m_cached_ctx.TEST.AREF), static_cast<u32>(r.m_cached_ctx.TEST.AFAIL),
-				static_cast<u32>(r.PRIM->ABE),
-				static_cast<u32>(r.m_cached_ctx.FRAME.PSM), static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK),
-				static_cast<u32>(r.m_cached_ctx.TEX0.TBP0), static_cast<u32>(r.m_cached_ctx.TEX0.TBW),
-				static_cast<u32>(r.m_cached_ctx.TEX0.PSM), static_cast<u32>(r.m_cached_ctx.TEX0.TW),
-				static_cast<u32>(r.m_cached_ctx.TEX0.TH), static_cast<u32>(r.m_cached_ctx.TEX0.TCC),
-				static_cast<u32>(r.m_cached_ctx.TEX0.TFX),
-				(source && (source->m_target || source->m_from_target)) ? 1 : 0,
-				min_w, max_w, min_z, max_z, min_px, max_px, min_py, max_py,
-				rt_unscaled_width, rt_unscaled_height, min_u, max_u, min_v, max_v,
-				material.content_hash);
-
-			if (s_drawdump_frames_left > 0)
-				drawdump_write(draw_state_line);
-
-			// Offender detail behind the 'explode' counter on the stats line. Capped, because a
-			// title that misplaces every draw would otherwise fill the 40k-line dump with the same
-			// finding: a hundred lines is plenty to name the class, and the counter stays exact
-			// regardless of the cap. Deliberately NOT gated on PCSX2_REMIX_DRAWDUMP -- the counter is
-			// meant to be readable from a default run, and drawdump_write only creates the file on
-			// its first call, so a session with no offenders still writes nothing at all.
-			if (explode_ratio > 0.f && s_explode_dumped < 100)
-			{
-				++s_explode_dumped;
-				drawdump_write(fmt::format("EXPLODE ratio={:.1f}x limit={:g}x extent={:.2f} | {}",
-					explode_ratio, explode_ratio_limit(), draw_bounds.diagonal(), draw_state_line));
-			}
-
-			// Absolute-placement offenders. Same cap and the same reasoning as EXPLODE above: the
-			// point is to name the class the far draws belong to, not to log every one. The extent
-			// is printed alongside the distance on purpose -- a compact draw sitting 100k units out
-			// is a placement bug, a draw whose own extent is 100k is a stretched one, and the two
-			// want completely different fixes.
-			if (far_hit && s_fardump_written < 200)
-			{
-				++s_fardump_written;
-				drawdump_write(fmt::format("FARDRAW maxpos={:.0f} limit={:g} extent={:.2f} "
-										   "w=[{:.2f}..{:.2f}] | {}",
-					draw_max_pos, far_limit, draw_bounds.diagonal(), min_w, max_w, draw_state_line));
-			}
-		}
-
 		// Only now that the draw is committed does its extent count towards the frame's, and
 		// sky geometry is deliberately excluded: a skybox is huge by construction and would
 		// dominate the scene radius the debug light is scaled from.
@@ -5319,15 +10319,71 @@ namespace RemixSubmit
 		if (!s_live)
 			return;
 
+		// FIRST, before anything in this window has referenced a light handle. Rebuilds the fill
+		// lights if a knob behind them has moved since the ones that exist were built -- which is
+		// the only way a per-game .conf value can ever reach them, the conf being applied 234 ms
+		// after create_debug_scene() built the originals. Costs one struct compare per window when
+		// nothing changed. See refresh_fill_lights() for why this point in the frame is the safe
+		// one to free a handle at.
+		refresh_fill_lights();
+
+		// Whether this window holds is decided HERE, ahead of submit_camera(), because under
+		// HOLDEMPTY = 2 it changes which camera that call submits. Everything it reads is already
+		// final for the window; see decide_hold_window().
+		const bool hold_now = decide_hold_window();
+		const int hold_mode = hold_empty_mode();
+		const bool hold_camera = hold_now && (hold_mode == 2) && s_held_camera.valid;
+
+		// Mode 3: this window is not presented at all. Every Remix API call below is suppressed --
+		// camera, geometry, beacon, lights, Present -- so nothing is left accumulated in the runtime
+		// awaiting a Present that never comes. Everything AFTER Present still runs, because none of
+		// it is present-driven; see hold_empty_mode() for the full audit.
+		const bool skip_present = hold_now && (hold_mode == 3);
+
+		if (skip_present)
+		{
+			++s_stats.hold_skipped_presents;
+			note_hold_cadence();
+
+			// Consumed exactly as a hold consumes it, and for the more important reason: this is
+			// what makes it impossible to skip two presents in a row. A real drought presents
+			// normally from its second window on, so the screen can never go stale.
+			s_held_used = true;
+			s_hold_pending = false;
+		}
+
 		// Frame order mirrors RPCS3's flip(): camera -> Present -> latch -> reap -> stats.
 		// The camera submitted here was resolved at the previous VSync, which is the same one
 		// this frame's draws un-projected against -- geometry and camera always reference one
 		// matrix, at the cost of a bounded one-frame lag under motion.
+		//
+		// ...except on a held window under mode 2, which submits the PREVIOUS window's camera so
+		// that the geometry batch_flush is about to repeat is repeated from the eye it was built
+		// for. One SetupCamera per present either way -- the camera changes, the call does not.
+		// s_active_camera itself is untouched, so resolve, the extent refutation and the FRAME
+		// trace all still see the real resolved camera.
 		refresh_window_size();
-		submit_camera();
+
+		if (!skip_present)
+		{
+			submit_camera(hold_camera ? s_held_camera : s_active_camera);
+
+			if (hold_camera)
+				++s_stats.hold_cameras;
+		}
 
 		// Before Present, and before the beacon's empty-frame test, because a batched frame's
 		// geometry has not been instanced until this runs.
+		//
+		// This is also where an EMPTY window re-presents the previous one (PCSX2_REMIX_HOLDEMPTY,
+		// step 4B): it is the last point before Present at which anything can still reach the
+		// screen. Whether it holds was decided above, before submit_camera(), and under mode 2 that
+		// call has already submitted the held camera -- so these instances are drawn against the
+		// eye they were built for and the window is a true duplicate. See hold_empty_mode() for the
+		// measurement, for the age=2 reasoning it refutes, and for what it still does not prove.
+		// The beacon's streak below is intentionally left counting raw empty windows: a held
+		// window still submitted nothing of its own, and the streak resets on the next real window
+		// long before the beacon threshold, so a sustained drought still reports as one.
 		batch_flush();
 
 		// The beacon only appears when nothing of the guest's own geometry survived the gates,
@@ -5341,21 +10397,31 @@ namespace RemixSubmit
 		else
 			s_empty_frame_streak = 0;
 
-		if (s_empty_frame_streak >= s_beacon_after_empty_frames)
-			submit_debug_triangle();
+		// The streak itself keeps counting on a skipped window -- it IS an empty window, and the
+		// drought accounting has to stay honest -- but nothing is submitted for it.
+		if (!skip_present)
+		{
+			if (s_empty_frame_streak >= s_beacon_after_empty_frames)
+				submit_debug_triangle();
 
-		if (s_debug_light)
-			remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_debug_light);
+			if (s_debug_light)
+				remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_debug_light);
 
-		if (s_sun_light)
-			remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_sun_light);
+			if (s_sun_light)
+				remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_sun_light);
 
-		if (s_dome_light)
-			remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_dome_light);
+			if (s_dome_light)
+				remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_dome_light);
 
-		const u32 status = remix_ps2::guarded_present(s_remix.api().Present, nullptr);
-		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
-			ERROR_LOG("Remix: Present failed ({})", remix_ps2::error_name(status));
+			remixapi_PresentInfo present_info{};
+			present_info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
+			present_info.pNext = nullptr;
+			present_info.hwndOverride = s_hwnd;
+
+			const u32 status = remix_ps2::guarded_present(s_remix.api().Present, &present_info);
+			if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+				ERROR_LOG("Remix: Present failed ({})", remix_ps2::error_name(status));
+		}
 
 		// The frame that just presented is the one whose un-projection constants the world
 		// tier has to normalise against.
@@ -5430,13 +10496,211 @@ namespace RemixSubmit
 		s_frame_bounds_world = false;
 		s_frame_max_w = 0.f;
 
+		// FRAMETRACE reads the contract this function's own comment states -- "the camera resolved
+		// here is the one both the next frame's draws and the next frame's SetupCamera use" -- so
+		// the camera the window that just ended actually drew with has to be sampled BEFORE resolve
+		// replaces it. Its age is how many presented frames it has been the active one.
+		// The per-window camera census, read out before resolve_world_camera replaces the camera it
+		// was accumulated against. `solvers` is the decisive number: 1 means every draw of the
+		// window that just ended shared one un-projection and per-draw placement cannot change the
+		// picture; 2+ means the window straddled cameras and it can. `rings` is the same count over
+		// raw ring hashes -- rings > solvers is the "one camera, two column scales" case.
+		if (s_window_cameras.solver_count > 0)
+		{
+			++s_stats.perdraw_windows;
+			s_stats.perdraw_solvers_last = s_window_cameras.solver_count;
+			s_stats.perdraw_solvers_peak = std::max(s_stats.perdraw_solvers_peak, s_window_cameras.solver_count);
+			s_stats.perdraw_rings_last = s_window_cameras.ring_count;
+			s_stats.perdraw_rings_peak = std::max(s_stats.perdraw_rings_peak, s_window_cameras.ring_count);
+
+			if (s_window_cameras.solver_count > 1)
+				++s_stats.perdraw_multi_windows;
+
+			if (s_window_cameras.overflowed)
+				++s_stats.perdraw_census_overflow;
+		}
+
+		const u32 trace_census_solvers = s_window_cameras.solver_count;
+		const u32 trace_census_rings = s_window_cameras.ring_count;
+		s_window_cameras = window_camera_census{};
+
+		const u64 trace_used_hash = s_active_camera.matrix_hash;
+
+		// The same sample for the WORLDPROBE line, taken here for the same reason and at the same
+		// instant: this is the eye the window that just ended un-projected its geometry against.
+		// Reading it after resolve_world_camera() below would pair this window's recovered world
+		// positions with the NEXT window's camera, and a probe whose whole job is to say whether
+		// geometry moves with the eye cannot afford to be one frame out on which eye it means.
+		worldprobe_camera probe_camera{};
+		probe_camera.valid = s_active_camera.valid;
+		probe_camera.hash = s_active_camera.matrix_hash;
+		probe_camera.position[0] = s_active_camera.position[0];
+		probe_camera.position[1] = s_active_camera.position[1];
+		probe_camera.position[2] = s_active_camera.position[2];
+		// Camera forward in world space, exactly as submit_camera() computes it for
+		// place_sun_light: p_view = p_world * V is row-vector, so the gradient of view z with
+		// respect to world position is V's third column.
+		probe_camera.forward[0] = s_active_camera.view.m[0][2];
+		probe_camera.forward[1] = s_active_camera.view.m[1][2];
+		probe_camera.forward[2] = s_active_camera.view.m[2][2];
+
+		// PCSX2_REMIX_WORLDFIX consumes the SAME sample, and must be called here rather than after
+		// resolve_world_camera() for the identical reason: the eye it pairs this window's recovered
+		// positions with has to be the eye those positions were un-projected against. This is also
+		// the one place the knob is read from the environment each window; the draw path reads the
+		// cached s_worldfix_active instead.
+		worldfix_window(worldfix_mode(), probe_camera);
+
+		// Guarded rather than subtracted blind: OnGSClose zeroes s_frame_counter, and an unsigned
+		// wrap would print an age of 18 quintillion in the one file this trace exists to be
+		// trusted in.
+		const u64 trace_used_age = (s_frame_counter >= s_frametrace_cam_since)
+									   ? (s_frame_counter - s_frametrace_cam_since)
+									   : 0;
+
 		resolve_world_camera();
+
+		if (s_frametrace_cam_hash != s_active_camera.matrix_hash)
+		{
+			s_frametrace_cam_hash = s_active_camera.matrix_hash;
+			s_frametrace_cam_since = s_frame_counter;
+		}
+
+		// One line per presented window. Armed on the same condition the per-draw dump uses -- a
+		// frame that submitted something with a world camera live -- so the budget is spent
+		// in-mission rather than on the deploy menu, which never solves a camera at all.
+		//
+		// The frame that arms it emits nothing: the draw-side sampler was off while its draws were
+		// being built, so its counters would read as an empty window and look exactly like the
+		// defect being hunted.
+		if (!s_frametrace_started)
+		{
+			if (frametrace_frames() > 0 && s_submitted_this_frame > 0 && s_active_camera.valid)
+			{
+				// ...but "the first window that qualifies" is still startup, not gameplay. Count
+				// those qualifying windows off first so FRAMETRACEAFTER can put the measurement
+				// where the symptom is -- see frametrace_after_frames() for the session this cost.
+				if (s_frametrace_skipped < frametrace_after_frames())
+				{
+					++s_frametrace_skipped;
+				}
+				else
+				{
+					s_frametrace_started = true;
+					s_frametrace_left = frametrace_frames();
+				}
+			}
+		}
+		else if (s_frametrace_left > 0)
+		{
+			--s_frametrace_left;
+
+			// Rides dump_write so the FRAME lines land in remix_matrices.txt beside the per-frame
+			// candidate lines the analysis scripts already parse, and can be joined to them on f=.
+			// (dump_write opens that file on its first call whatever PCSX2_REMIX_DUMP says, so a
+			// trace-only run still produces one -- with FRAME lines and nothing else.)
+			//
+			// fresh=1 means resolve_world_camera ACCEPTED a camera for the window that follows,
+			// rather than leaving the previous one standing. It is the direct test of the
+			// stale-hold story: on the 2026-08-15 run accept climbed by the full frame count, so
+			// this is expected to read 1 on essentially every line -- and a period-3 pattern in it
+			// would overturn that, which is the only reason it is printed.
+			// sol= and rings= are the census: DISTINCT NORMALISED SOLVERS and distinct raw ring
+			// hashes among this window's world-mode draws. sol=1 with rings=2 is one camera emitted
+			// at two column scales; sol>=2 is a genuine multi-camera window. ringN above counts
+			// draws, not cameras, and cannot tell those apart -- which is why these two exist.
+			dump_write(fmt::format(
+				"FRAME f={} sub={} used={:016X} age={} ring1={:016X} ringN={} ring2={:016X} "
+				"miss={} draws={} sol={} rings={} cand={} next={:016X} fresh={}",
+				s_frame_counter, s_submitted_this_frame, trace_used_hash, trace_used_age,
+				s_frame_trace.first_hash, s_frame_trace.not_first, s_frame_trace.second_hash,
+				s_frame_trace.misses, s_frame_trace.draws, trace_census_solvers, trace_census_rings,
+				s_stats.cam_last_candidates, s_active_camera.matrix_hash,
+				(s_camera_last_accept_frame == s_frame_counter && s_active_camera.valid) ? 1 : 0));
+		}
+
+		s_frame_trace = frame_trace_state{};
+
+		// PCSX2_REMIX_WORLDPROBE, armed on exactly the shape the window trace above uses: a window
+		// that submitted something with a world camera live, then WORLDPROBEAFTER of those counted
+		// off first so the measurement lands in gameplay rather than on mission start. See
+		// worldprobe_after_frames() for the two diagnostics this session that armed at frame one
+		// and measured the loading phase.
+		//
+		// The arming window itself emits nothing -- the draw-side sampler was off while its draws
+		// were built, so it has no samples to report. The windows after it SURVEY: they pick the
+		// hashes to follow and are deliberately not emitted, both because the survey spans several
+		// windows (so it has no single window's centroid to report) and because the tracked slots
+		// do not exist yet.
+		if (!s_worldprobe_started)
+		{
+			if (worldprobe_frames() > 0 && s_submitted_this_frame > 0 && probe_camera.valid)
+			{
+				if (s_worldprobe_skipped < worldprobe_after_frames())
+				{
+					++s_worldprobe_skipped;
+				}
+				else
+				{
+					s_worldprobe_started = true;
+					s_worldprobe_left = worldprobe_frames();
+
+					// The complement of the selection line: if the survey never finds a window
+					// with world geometry in it, THIS is the only evidence that the knob was ever
+					// applied, and its absence says the arming condition itself never fired.
+					if (!s_worldprobe_logged_arm)
+					{
+						s_worldprobe_logged_arm = true;
+						INFO_LOG("Remix: WORLDPROBE armed at frame {} for {} window(s) after "
+								 "skipping {} -- surveying up to {} non-empty windows to choose "
+								 "the draws to follow; a 'WORLDPROBE selected' line must follow "
+								 "this one or nothing was measured",
+							s_frame_counter, s_worldprobe_left, s_worldprobe_skipped,
+							worldprobe_survey_windows);
+					}
+				}
+			}
+		}
+		else if (s_worldprobe_left > 0)
+		{
+			if (!s_worldprobe_selected)
+			{
+				// SELECTION RETRIES, and the budget is deliberately untouched until it lands.
+				//
+				// MEASURED 2026-08-15: selecting once, on the arming window, produced 1,417 lines
+				// of `slots=0` and a wasted capture. This title under PCSX2_REMIX_HOLDEMPTY = 2
+				// submits nothing at all in one presented window out of three (57 of 171, gap
+				// exactly 3 in 56 of 56), so a one-shot choice had a 1-in-3 chance of freezing an
+				// empty set for the whole run -- and it fired. An empty window now simply costs
+				// another look.
+				//
+				// Not spending the budget here matters for the same reason: a survey that takes a
+				// dozen windows must not eat a dozen lines out of the capture the user is standing
+				// there performing.
+				worldprobe_survey_window();
+			}
+			else
+			{
+				--s_worldprobe_left;
+				worldprobe_emit(probe_camera);
+			}
+		}
+
+		worldprobe_reset_frame();
 
 		// The per-draw dump follows the frames that actually submitted something, so it never
 		// burns its budget on the loading screens before the mission starts.
-		if (s_submitted_this_frame > 0)
+		if (s_submitted_this_frame > 0 &&
+			(!drawdump_world_only() || (s_drawdump_world_armed && s_active_camera.valid)))
 		{
-			if (!s_drawdump_started)
+			// ...but "first frames that submit" is still mission start, not gameplay. Count those
+			// qualifying frames off first so DRAWDUMPAFTER can put the dump where the player
+			// actually is -- see drawdump_after_frames() for what that cost us once already.
+			if (!s_drawdump_started && s_drawdump_skipped < drawdump_after_frames())
+			{
+				++s_drawdump_skipped;
+			}
+			else if (!s_drawdump_started)
 			{
 				s_drawdump_started = true;
 				s_drawdump_frames_left = drawdump_frames();
@@ -5578,6 +10842,15 @@ namespace RemixSubmit
 		s_camera_last_accept_frame = 0;
 		s_logged_world_camera = false;
 
+		// Same reason as the camera above, and the same failure if it is skipped: a cached
+		// per-draw solver describes a world the load just replaced, and the cache is keyed on
+		// matrix CONTENT, so a hash that recurs after the load would place the new scene's draws
+		// through the old scene's transform.
+		for (per_draw_camera_entry& entry : s_per_draw_cameras)
+			entry = per_draw_camera_entry{};
+		s_kick_camera_memo = kick_camera_memo{};
+		s_window_cameras = window_camera_census{};
+
 		s_frame_viewport = viewport_constants{};
 		s_last_viewport = viewport_constants{};
 		s_frame_bounds = scene_bounds{};
@@ -5588,6 +10861,29 @@ namespace RemixSubmit
 		s_frame_max_extent = 0.f;
 		s_frame_min_extent = std::numeric_limits<float>::max();
 		s_refuted_matrices.clear();
+		s_light_placed = false;
+		s_sun_placed = false;
+		s_drawdump_started = false;
+		s_drawdump_frames_left = 0;
+		s_drawdump_skipped = 0;
+		s_drawdump_world_armed = false;
+
+		// Same reasoning as the per-draw dump above: the window trace's budget has to be spent on
+		// the world the user just loaded into, not on the one the state replaced.
+		s_frametrace_started = false;
+		s_frametrace_left = 0;
+		s_frametrace_skipped = 0;
+		s_frame_trace = frame_trace_state{};
+		s_frametrace_cam_hash = 0;
+		s_frametrace_cam_since = s_frame_counter;
+
+		// And the world probe, for a reason stronger than budget: its four tracked hashes name
+		// geometry in the world the load just replaced. Following them across a state load would
+		// either report ABSENT forever or, worse, re-acquire the same texture on different level
+		// pieces and compare two unrelated objects.
+		worldprobe_reset_all();
+		worldfix_reset_all();
+		camtest_reset_all();
 
 		// The beacon must not fire just because the first frames after a load submit nothing.
 		s_empty_frame_streak = 0;
@@ -5601,6 +10897,31 @@ namespace RemixSubmit
 		// second Startup after Shutdown is unproven in dxvk-remix and the window-loss guard
 		// depends on the singleton staying alive.
 		const remixapi_Interface& api = s_remix.api();
+		if (s_debug_light)
+		{
+			remix_ps2::guarded_destroy_light(api.DestroyLight, s_debug_light);
+			s_debug_light = nullptr;
+		}
+
+		if (s_sun_light)
+		{
+			remix_ps2::guarded_destroy_light(api.DestroyLight, s_sun_light);
+			s_sun_light = nullptr;
+		}
+
+		if (s_dome_light)
+		{
+			remix_ps2::guarded_destroy_light(api.DestroyLight, s_dome_light);
+			s_dome_light = nullptr;
+		}
+
+		// The fill's rebuild check compares against the parameters the EXISTING lights were built
+		// from, so tearing the lights down without clearing it would leave the next resolve reading
+		// "nothing changed" and rebuilding nothing -- an unlit scene with nothing in the log to
+		// explain it.
+		s_fill_params = fill_light_params{};
+		s_fill_params_resolved = false;
+
 		const size_t dropped = s_meshes.size();
 
 		for (const auto& [hash, entry] : s_meshes)
@@ -5650,6 +10971,10 @@ namespace RemixSubmit
 		s_frame_max_extent = 0.f;
 		s_frame_min_extent = std::numeric_limits<float>::max();
 		s_refuted_matrices.clear();
+		for (per_draw_camera_entry& entry : s_per_draw_cameras)
+			entry = per_draw_camera_entry{};
+		s_kick_camera_memo = kick_camera_memo{};
+		s_window_cameras = window_camera_census{};
 		s_camera_last_accept_frame = 0;
 		s_logged_world_camera = false;
 		s_logged_sky_camera = false;
@@ -5658,6 +10983,18 @@ namespace RemixSubmit
 		s_sun_placed = false;
 		s_drawdump_started = false;
 		s_drawdump_frames_left = 0;
+		s_drawdump_skipped = 0;
+		s_drawdump_world_armed = false;
+		s_frametrace_started = false;
+		s_frametrace_left = 0;
+		s_frametrace_skipped = 0;
+		s_frame_trace = frame_trace_state{};
+		s_frametrace_cam_hash = 0;
+		// Paired with the s_frame_counter = 0 at the end of this function.
+		s_frametrace_cam_since = 0;
+		worldprobe_reset_all();
+		worldfix_reset_all();
+		camtest_reset_all();
 		s_logged_kick_cam_count = 0;
 		s_stable_frames = 0;
 		s_last_startup_rect = RECT{};
@@ -5707,6 +11044,11 @@ namespace RemixSubmit
 			remix_ps2::guarded_destroy_light(api.DestroyLight, s_dome_light);
 			s_dome_light = nullptr;
 		}
+
+		// Same reason as the close path: the rebuild check must not describe lights that no longer
+		// exist, or the next session's first resolve reads "nothing changed" and builds nothing.
+		s_fill_params = fill_light_params{};
+		s_fill_params_resolved = false;
 
 		// One last counter block, so a short session still reports what it saw. Emitted before
 		// the material cache is torn down, because its counters are half the answer.

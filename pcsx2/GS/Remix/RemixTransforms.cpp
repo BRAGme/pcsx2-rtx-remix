@@ -566,6 +566,56 @@ namespace remix_ps2
 		return result;
 	}
 
+	float clip_w_scale(const mat4& fused)
+	{
+		// Column 3's spatial part is the world-space gradient of clip w. For a rigid view
+		// transform composed with a projection whose m[2][3] is +-1 it is a unit vector, which
+		// is exactly why the depth-scale gate expects an un-projected w = 1 to land one unit
+		// from the eye. Its magnitude IS the factor by which the guest's w departs from that.
+		const float x = fused.m[0][3];
+		const float y = fused.m[1][3];
+		const float z = fused.m[2][3];
+
+		const float length = std::sqrt((x * x) + (y * y) + (z * z));
+		return (std::isfinite(length) && length > 1e-20f) ? length : 1.f;
+	}
+
+	float snap_power_of_two(float value, float tolerance)
+	{
+		if (!std::isfinite(value) || !(value > 0.f) || !(tolerance > 0.f))
+			return value;
+
+		const float snapped = std::exp2(std::round(std::log2(value)));
+		if (!std::isfinite(snapped) || !(snapped > 0.f))
+			return value;
+
+		return (std::abs((value / snapped) - 1.f) <= tolerance) ? snapped : value;
+	}
+
+	mat4 normalize_clip_depth(const mat4& fused, float scale_w, bool swap_zw)
+	{
+		mat4 result = fused;
+
+		if (swap_zw)
+		{
+			for (u32 i = 0; i < 4; ++i)
+				std::swap(result.m[i][2], result.m[i][3]);
+		}
+
+		if (std::isfinite(scale_w) && std::abs(scale_w) > 1e-20f && scale_w != 1.f)
+		{
+			const float inv = 1.f / scale_w;
+
+			for (u32 i = 0; i < 4; ++i)
+			{
+				for (u32 j = 0; j < 4; ++j)
+					result.m[i][j] *= inv;
+			}
+		}
+
+		return result;
+	}
+
 	bool make_clip_solver(const mat4& fused, clip_solver& out)
 	{
 		// Row-vector: clip_j = x*m[0][j] + y*m[1][j] + z*m[2][j] + m[3][j]. Take j in
@@ -875,13 +925,14 @@ namespace remix_ps2
 
 	bool dump_enabled()
 	{
-		static const bool value = env_flag(L"PCSX2_REMIX_DUMP");
-		return value;
+		return env_flag(L"PCSX2_REMIX_DUMP");
 	}
 
 	bool nocam_enabled()
 	{
-		static const bool value = env_flag(L"PCSX2_REMIX_NOCAM");
-		return value;
+		// Per-game .conf entries are applied after the first loading-screen draws. Unlike
+		// immutable launch overrides, this diagnostic must therefore observe later config
+		// application instead of caching the pre-config value forever.
+		return env_flag(L"PCSX2_REMIX_NOCAM");
 	}
 } // namespace remix_ps2
