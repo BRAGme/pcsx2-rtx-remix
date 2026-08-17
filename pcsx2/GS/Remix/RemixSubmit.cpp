@@ -6607,7 +6607,9 @@ namespace RemixSubmit
 		//                           universal -- a title that draws its sky with Z testing on can
 		//                           never be caught by mode 1, no matter what SKYORDER is set to.
 		// PCSX2_REMIX_SKYORDER: how many leading gate-passing draws of the frame are eligible.
-		//                       Narrows mode 1; REQUIRED by mode 2.
+		//                       Narrows mode 1; REQUIRED by mode 2. STOPS BINDING in modes 1/3/4
+		//                       once SKYMINW is armed -- see sky_min_w().
+		// PCSX2_REMIX_SKYMINW:  minimum eye depth a draw must sit entirely beyond. 0 = off.
 		int sky_mode()
 		{
 			static live_int value(L"PCSX2_REMIX_SKY", 1, 0, 4);
@@ -6618,6 +6620,62 @@ namespace RemixSubmit
 		{
 			static live_int value(L"PCSX2_REMIX_SKYORDER", 0, 0, 100000);
 			return static_cast<u32>(value.get());
+		}
+
+		// PCSX2_REMIX_SKYMINW -- the far-distance requirement on sky classification, in w (eye
+		// depth) units. 0 = OFF, the default, and with it off every mode behaves exactly as it did
+		// before this knob existed, on every title.
+		//
+		// ARMING THIS CHANGES THE PICTURE, and it must: a classified draw stops being placed in
+		// the world. It is un-projected with the bias-zeroed sky solver and rendered through the
+		// translation-stripped sky camera instead. That IS the fix being asked for, and nothing
+		// about it is cosmetic or invisible.
+		//
+		// WHY IT EXISTS -- the draw ORDINAL was measured to be the wrong discriminator, and the
+		// measurement is what retracted the previous attempt. Combined Assault (SCUS-97545),
+		// gameplay dump, frames 1992-1996, mode 4 with SKYORDER = 20: what it tagged was
+		// near-field terrain -- chunks drawn as an opaque pass immediately followed by a
+		// render-target overlay pass at the SAME screen rect and the SAME depth:
+		//
+		//   d=16,17 opaque + d=18,19 overlay     px=[476,567]x[217,332]   w=[45,103]
+		//   d=20,21 opaque + d=22,23 overlay     px=[479,783]x[237,332]   w=[30,54]
+		//   d=24,25 opaque + d=26,27 overlay     px=[479,783]x[328,470]   w=[23,45]
+		//   d=28,29 opaque + d=30,31,32 overlay  px=[409,476]x[217,259]   w=[103,194]
+		//
+		// Everything mode 4 caught sat at eye depth 23..194. The same frame's genuinely far-field
+		// draws reach w = 4021, 4175, 6220, and SOCOM 1's backdrop dome (SCUS-97134, d=202, 144
+		// verts, 48 tris, covering over twice the framebuffer) sits at max w = 5615. So the dome
+		// was never classified and the terrain overlays were -- which is WORSE than doing nothing:
+		// handing a near-field overlay to the sky camera anchors it at the origin, detached from
+		// the terrain it belongs to, and a bright camera-relative overlay is exactly the reported
+		// "light behind me that follows me". Turning SKY on is what introduced it.
+		//
+		// Note the ordering, because it is the whole argument against the ordinal: the harmful
+		// draws are d=16..32 and the dome is d=202. The ordinal is not merely redundant here, it
+		// is ANTI-CORRELATED -- any SKYORDER large enough to admit the dome admits every terrain
+		// overlay first, and any SKYORDER small enough to exclude the overlays excludes the dome.
+		// No value of it separates the two. w does: 194 and 4021 are a factor of 20 apart.
+		//
+		// READ LIVE, and cached per presented frame rather than per call. Not `static const` -- the
+		// renderer goes live ~0.2 s before the per-game .conf is applied, so a latched value is the
+		// pre-conf value forever. Not live_int either -- that re-parses only when
+		// paths::knob_generation() moves, and the per-game .conf never moves it (it calls
+		// SetEnvironmentVariableW directly). Both are separately-diagnosed silent no-ops on this
+		// project; see env_int_live. The per-frame cache exists because classify_sky IS the
+		// per-draw path and a GetEnvironmentVariableW there is not free -- this is
+		// refresh_user_pin() (RemixVU1Capture.cpp:108) applied to a hot-path value, refreshed from
+		// OnVSync immediately after refresh_game_config() so a conf-delivered value lands on the
+		// very next frame's draws.
+		float s_sky_min_w = 0.f;
+
+		void refresh_sky_min_w()
+		{
+			s_sky_min_w = static_cast<float>(std::max(0, env_int_live(L"PCSX2_REMIX_SKYMINW", 0)));
+		}
+
+		float sky_min_w()
+		{
+			return s_sky_min_w;
 		}
 
 		// Whether a draw's texture source is a render target. Same test RemixMaterials uses, kept
@@ -6633,13 +6691,60 @@ namespace RemixSubmit
 		// (GSRendererHW.h:62-79), evaluated by the caller because only OnDrawPrims is a friend
 		// of GSRendererHW. Reading the registers here instead would be a second, drifting
 		// interpretation of the same state.
-		bool classify_sky(bool depth_read, bool depth_write, u64 draw_ordinal, bool samples_target)
+		//
+		// 'draw_min_w' is the draw's NEAREST vertex in eye depth, w = 1/Q. Passed in rather than
+		// derived here because the two call sites reach it from different places: the submission
+		// path has to classify BEFORE the vertex loop (the classification picks the solver that
+		// loop un-projects with) and so scans for it, while build_draw_state has the loop's own
+		// min_w already. Both feed the same number in, so both readings agree.
+		bool classify_sky(bool depth_read, bool depth_write, u64 draw_ordinal, bool samples_target,
+			float draw_min_w)
 		{
 			const int mode = sky_mode();
 			if (mode == 0)
 				return false;
 
-			const u32 limit = sky_order_limit();
+			// The far-distance requirement, applied first and to EVERY mode. See sky_min_w() for
+			// the measurement that made it necessary.
+			//
+			// MIN w, not max w and not the w RANGE, and that choice is load-bearing:
+			//
+			//   * min_w > limit means "every vertex of this draw is beyond the limit", i.e. the
+			//     draw lies entirely in the far field. This is the same reading of the same
+			//     variable the far-field submission gate already uses (`min_w > max_submitted_w()`
+			//     at the eye-plane gate), so the two cannot drift into disagreeing about what
+			//     "entirely beyond X" means.
+			//   * max_w would admit any draw that merely REACHES the far field. A ground sheet
+			//     running from under the player's feet out to the skyline has a huge max w, and
+			//     detaching THAT from the world is the precise failure this knob exists to stop.
+			//   * the range (max - min) describes a draw's SHAPE, not its distance. A near overlay
+			//     spanning w=[23,45] and a far one spanning w=[4021,4175] have comparable ranges,
+			//     so a range test cannot separate them at all.
+			//
+			// A dome does span depth -- its rim is nearer than its crown -- which is why this is a
+			// floor to clear rather than a band to sit in. SOCOM 1's dome runs out to max w 5615
+			// and Combined Assault's far field to 4021..6220, so a limit in 1000..2000 clears the
+			// whole backdrop while excluding the 23..194 terrain overlays by a factor of five.
+			// If a dome fails to tag, its own `w=[min,max]` is on its DRAWDUMP line: retune from
+			// that, do not guess.
+			const float min_w_required = sky_min_w();
+			if (min_w_required > 0.f && !(draw_min_w > min_w_required))
+				return false;
+
+			// SKYORDER, and whether it still binds.
+			//
+			// KEPT, not deleted. Mode 2 IS the ordinal rule -- it is dxvk-remix's own
+			// rtx.skyDrawcallIdThreshold and has no other test -- and confs already in the field
+			// set it (SLES-51180 = 3, SLUS-20820 = 6, SCUS-97545 = 20). Removing the knob would
+			// silently change those titles.
+			//
+			// But it must STOP BINDING in the depth modes as soon as a distance test is armed, or
+			// arming SKYMINW on a title whose conf already carries SKYORDER = 20 is a guaranteed
+			// no-op: the dome is d=202 and would be cut on the ordinal before the distance test
+			// ever ran. A knob that reports itself applied and does nothing is the failure mode
+			// this file has paid for most often. Mode 2 keeps the ordinal because mode 2 has
+			// nothing else to be.
+			const u32 limit = (min_w_required > 0.f && mode != 2) ? 0u : sky_order_limit();
 
 			// Mode 3: no depth WRITE and the draw samples a render target. Depth READ is allowed,
 			// which is the whole point -- mode 1 demands neither read nor write, and SOCOM's sky is
@@ -6670,9 +6775,12 @@ namespace RemixSubmit
 			// :4656, so no material hash exists yet at the point the solver is picked. Geometry has
 			// to be classified by geometry.
 			//
-			// SKYORDER is the whole safety margin here: it is the only thing stopping this from
-			// tagging every depth-write-off draw in the frame, so tune it down until the horizon
-			// stops moving and nothing in the world joins it.
+			// SKYORDER WAS the whole safety margin here, and it was the wrong one. REFUTED
+			// 2026-08-16 on Combined Assault: mode 4 + SKYORDER = 20 tagged near-field terrain
+			// overlays at w = 23..194 and never reached the backdrop at all, because the ordinal
+			// puts the harmful draws (d=16..32) BEFORE the dome (d=202). The safety margin is now
+			// SKYMINW, a far-distance floor, and when it is armed the ordinal above is released to
+			// 0 so it cannot cut the dome off first. Full measurement at sky_min_w().
 			if (mode == 4)
 				return !depth_write && ((limit == 0) || (draw_ordinal < limit));
 
@@ -7705,6 +7813,11 @@ namespace RemixSubmit
 			// Whether this draw's texture is a render target. Sky mode 3 keys on it; see
 			// classify_sky.
 			bool samples_target = false;
+			// The draw's nearest vertex in eye depth, w = 1/Q. The far-distance requirement on sky
+			// classification reads it; see sky_min_w(). Left 0 by a caller that has not computed
+			// it, which reads as "at the eye" and can only ever fail the requirement -- never pass
+			// it by accident.
+			float min_w = 0.f;
 			GIFRegALPHA alpha{};
 		};
 
@@ -7725,7 +7838,8 @@ namespace RemixSubmit
 		{
 			const bool depth_read = regs.depth_read;
 			const bool depth_write = regs.depth_write;
-			const bool is_sky = classify_sky(depth_read, depth_write, draw_ordinal, regs.samples_target);
+			const bool is_sky = classify_sky(depth_read, depth_write, draw_ordinal, regs.samples_target,
+				regs.min_w);
 
 			// The user's own tags, from the Remix conf layers. dxvk-remix only applies its hash
 			// lists on the native D3D9 path (setupCategoriesForTexture, rtx_types.cpp:348, whose one
@@ -9157,16 +9271,52 @@ namespace RemixSubmit
 		sky_solver.bias[1] = 0.f;
 		sky_solver.bias[2] = 0.f;
 
+		const GSVertex* const verts = r.m_vertex->buff;
+
+		// Z -> w calibration scale for this draw. Hoisted above the sky classification because the
+		// far-distance scan below needs it too, and computing it twice would be two expressions
+		// that have to be kept in step by hand. Its other reader is draw_zfit further down.
+		const double zfit_scale = 1.0 / static_cast<double>(
+			0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_cached_ctx.ZBUF.PSM].fmt * 8));
+
+		// The draw's nearest vertex in eye depth, for the far-distance requirement on sky
+		// classification (PCSX2_REMIX_SKYMINW). It has to be known HERE, before the vertex loop,
+		// because the classification chooses the solver that loop un-projects with -- so it cannot
+		// wait for the loop's own min_w.
+		//
+		// Walked only when the requirement is armed. With SKYMINW = 0 (the default) this is one
+		// float compare per draw and no vertex traffic at all.
+		//
+		// Computed with the SAME q/w expression the loop uses, deliberately. A second
+		// interpretation of the same state is how the two would drift into classifying a draw one
+		// way here and reporting it the other way on the dump line, and the loop's min_w likewise
+		// covers every vertex (a vertex that fails its finite/limit check drops the whole draw),
+		// so the two are the same number by construction.
+		float sky_gate_min_w = 0.f;
+		if (sky_min_w() > 0.f)
+		{
+			float scan_min_w = std::numeric_limits<float>::max();
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				const GSVertex& v = verts[i];
+				const float q = fallback_screen_ui ? 1.f : (z_depth ?
+					static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
+					v.RGBAQ.Q);
+				scan_min_w = std::min(scan_min_w, 1.0f / q);
+			}
+
+			sky_gate_min_w = scan_min_w;
+		}
+
 		// classify_sky is evaluated again by build_draw_state below; it reads only the cached
-		// depth bits and s_submitted_this_frame, neither of which moves between here and there,
-		// so the two agree by construction.
+		// depth bits, s_submitted_this_frame and the draw's min w, none of which moves between
+		// here and there -- the min w passed there is the vertex loop's own, which the scan above
+		// reproduces exactly -- so the two agree by construction.
 		const bool sky_draw = sky_camera_enabled() &&
 			classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(), s_submitted_this_frame,
-				draw_samples_render_target(tex_source));
+				draw_samples_render_target(tex_source), sky_gate_min_w);
 
 		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : base_solver;
-
-		const GSVertex* const verts = r.m_vertex->buff;
 
 		s_scratch_vertices.clear();
 		s_scratch_vertices.resize(vertex_count);
@@ -9209,8 +9359,6 @@ namespace RemixSubmit
 		// FST=0 draws contribute: they are the ones carrying both Z and a trustworthy w, and
 		// feeding recovered values back into the fit would make it self-confirming.
 		z_fit draw_zfit{};
-		const double zfit_scale = 1.0 / static_cast<double>(
-			0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_cached_ctx.ZBUF.PSM].fmt * 8));
 
 		vcolor_stats draw_vcolor{};
 		u32 first_vcolor = 0;
@@ -9752,6 +9900,10 @@ namespace RemixSubmit
 		regs.abe = r.PRIM->ABE;
 		regs.tfx = r.m_cached_ctx.TEX0.TFX;
 		regs.samples_target = draw_samples_render_target(tex_source);
+		// The vertex loop's own value, which is the same number the pre-loop scan above fed to the
+		// first classify_sky call. Both readings must agree or the dump's sky= field would describe
+		// a different classification than the one the solver was picked on.
+		regs.min_w = min_w;
 		regs.alpha = r.m_context->ALPHA;
 
 		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame, untex_draw);
@@ -10783,6 +10935,14 @@ namespace RemixSubmit
 		// that one applies the per-game .conf, and a title's .conf should outrank the GUI's
 		// global values the same way it outranks everything else.
 		remix_ps2::paths::apply_live_knobs();
+
+		// The sky far-distance requirement. Re-read here, once per presented frame, rather than in
+		// classify_sky itself: that one is the per-draw path and cannot afford a
+		// GetEnvironmentVariableW, while a value latched at first call would be the pre-conf value
+		// forever (the renderer goes live ~0.2 s before the per-game .conf is applied). Placed
+		// after both config layers above so a value either of them just delivered is in force for
+		// the next frame's draws. See sky_min_w().
+		refresh_sky_min_w();
 
 		// A knob that changes the GEOMETRY has to invalidate the mesh cache, or it only takes
 		// effect on meshes created after it -- which is what turning the crease angle on looked
