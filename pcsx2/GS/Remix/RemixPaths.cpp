@@ -16,7 +16,12 @@
 
 #include "fmt/format.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cwchar>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 #ifdef _WIN32
@@ -89,6 +94,8 @@ namespace remix_ps2
 			// once, before we set anything ourselves, because after that we could not tell our own
 			// writes apart from the caller's.
 			std::unordered_set<std::string> s_external_env;
+			std::unordered_set<std::string> s_title_env;
+			std::unordered_map<std::string, std::wstring> s_title_previous_env;
 
 			// Bumped by apply_knob whenever a knob's environment value actually changes. The
 			// backend caches its knob reads against this instead of re-reading the environment.
@@ -96,7 +103,59 @@ namespace remix_ps2
 
 			bool externally_set(const knob& k)
 			{
-				return s_external_env.find(k.env) != s_external_env.end();
+				return s_external_env.find(k.env) != s_external_env.end() ||
+					s_title_env.find(k.env) != s_title_env.end();
+			}
+
+			std::string normalized_env_name(std::string_view name)
+			{
+				std::string normalized(name);
+				std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+					[](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+				return normalized;
+			}
+
+			std::string short_env_name(std::string_view name)
+			{
+				constexpr std::string_view prefix = "PCSX2_REMIX_";
+				std::string normalized = normalized_env_name(name);
+				return (normalized.substr(0, prefix.size()) == prefix) ? normalized.substr(prefix.size()) : normalized;
+			}
+
+			void capture_external_env()
+			{
+				s_external_env.clear();
+
+#ifdef _WIN32
+				constexpr std::string_view prefix = "PCSX2_REMIX_";
+				wchar_t* block = GetEnvironmentStringsW();
+				if (!block)
+					return;
+
+				for (const wchar_t* entry = block; *entry; entry += std::wcslen(entry) + 1)
+				{
+					const wchar_t* equals = std::wcschr(entry, L'=');
+					if (!equals)
+						continue;
+
+					const std::wstring_view wide_name(entry, static_cast<size_t>(equals - entry));
+					const std::string name = normalized_env_name(StringUtil::WideStringToUTF8String(wide_name));
+					if (name.substr(0, prefix.size()) != prefix)
+						continue;
+
+					s_external_env.insert(name.substr(prefix.size()));
+				}
+
+				FreeEnvironmentStringsW(block);
+#else
+				size_t count = 0;
+				const knob* table = knobs(count);
+				for (size_t i = 0; i < count; ++i)
+				{
+					if (!read_env((L"PCSX2_REMIX_" + widen(table[i].env)).c_str()).empty())
+						s_external_env.insert(table[i].env);
+				}
+#endif
 			}
 
 			std::wstring env_name_for(const knob& k)
@@ -147,6 +206,7 @@ namespace remix_ps2
 					return;
 
 				SetEnvironmentVariableW(name.c_str(), wide.c_str());
+				INFO_LOG("Remix: PCSX2_REMIX_{} = {} (PCSX2 GUI)", k.env, text);
 				++s_knob_generation;
 			}
 		} // namespace
@@ -154,6 +214,91 @@ namespace remix_ps2
 		u64 knob_generation()
 		{
 			return s_knob_generation;
+		}
+
+		void bump_knob_generation()
+		{
+			++s_knob_generation;
+		}
+
+		bool is_external_env(std::string_view name)
+		{
+			return s_external_env.find(short_env_name(name)) != s_external_env.end();
+		}
+
+		std::string env_value(std::string_view name)
+		{
+			return StringUtil::WideStringToUTF8String(read_env(widen(normalized_env_name(name)).c_str()));
+		}
+
+		const char* env_source(std::string_view name)
+		{
+			const std::string short_name = short_env_name(name);
+			if (s_external_env.find(short_name) != s_external_env.end())
+				return "external process";
+			if (s_title_env.find(short_name) != s_title_env.end())
+				return "per-game conf";
+			return env_value(name).empty() ? "backend default" : "PCSX2 GUI";
+		}
+
+		bool apply_title_env(std::string_view name, std::string_view value)
+		{
+			const std::string short_name = short_env_name(name);
+			if (s_external_env.find(short_name) != s_external_env.end())
+				return false;
+
+			const std::string normalized_name = normalized_env_name(name);
+			const std::wstring wname = widen(normalized_name);
+			const std::wstring wvalue = widen(std::string(value));
+			const auto [previous_it, inserted] =
+				s_title_previous_env.emplace(short_name, read_env(wname.c_str()));
+			if (read_env(wname.c_str()) != wvalue)
+			{
+				if (!SetEnvironmentVariableW(wname.c_str(), wvalue.c_str()))
+				{
+					if (inserted)
+						s_title_previous_env.erase(previous_it);
+					return false;
+				}
+				++s_knob_generation;
+			}
+
+			s_title_env.insert(short_name);
+			INFO_LOG("Remix: {} = {} (per-game conf)", name, value);
+			return true;
+		}
+
+		bool clear_title_env()
+		{
+			bool changed = false;
+			for (auto it = s_title_previous_env.begin(); it != s_title_previous_env.end(); )
+			{
+				const std::string& short_name = it->first;
+				const std::wstring& previous = it->second;
+				const std::wstring name = L"PCSX2_REMIX_" + widen(short_name);
+				if (read_env(name.c_str()) == previous)
+				{
+					s_title_env.erase(short_name);
+					it = s_title_previous_env.erase(it);
+					continue;
+				}
+
+				if (!SetEnvironmentVariableW(name.c_str(), previous.empty() ? nullptr : previous.c_str()))
+				{
+					WARNING_LOG("Remix: failed to restore {} after per-game config; will retry", short_name);
+					++it;
+					continue;
+				}
+
+				changed = true;
+				s_title_env.erase(short_name);
+				it = s_title_previous_env.erase(it);
+			}
+
+			if (changed)
+				++s_knob_generation;
+
+			return s_title_previous_env.empty();
 		}
 
 		bool per_game_enabled()
@@ -271,12 +416,7 @@ namespace remix_ps2
 			size_t count = 0;
 			const knob* table = knobs(count);
 
-			s_external_env.clear();
-			for (size_t i = 0; i < count; ++i)
-			{
-				if (!read_env(env_name_for(table[i]).c_str()).empty())
-					s_external_env.insert(table[i].env);
-			}
+			capture_external_env();
 
 			// Every knob, latched or not. The latched ones are read through `static const` locals
 			// in RemixSubmit, so they are captured the first time that code runs and this is the

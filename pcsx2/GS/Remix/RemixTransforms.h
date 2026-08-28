@@ -38,6 +38,11 @@ namespace remix_ps2
 	// Row-vector transform of a homogeneous point: out = p * m.
 	void transform_point(const mat4& m, const float (&p)[4], float (&out)[4]);
 
+	// Rotate a recovered point about the camera using the view basis. Mode 0 copies the point,
+	// mode 1 uses the basis rows, and mode 2 uses their transpose for diagnostic comparison.
+	void apply_world_basis_rotation(const mat4& view, const float (&camera)[3], int mode,
+		const float (&point)[3], float (&out)[3]);
+
 	// ---------------------------------------------------------------------------------------
 	// Converters -- the only two places the row/column-vector difference exists
 	// ---------------------------------------------------------------------------------------
@@ -71,8 +76,36 @@ namespace remix_ps2
 
 	bool describe_projection(const mat4& m, projection_params& out);
 
+	// How the two SIGN terms of score_perspective are weighted. See PCSX2_REMIX_CAMYFLIP in
+	// RemixSubmit.cpp: the knob selects the policy, and 0 is byte-identical to what shipped.
+	//
+	// The two signs are NOT the same kind of quantity, which is why they were never worth the
+	// same dock:
+	//   m[0][0] < 0 is the recovered world's HANDEDNESS. It is a property of the normalised
+	//     fused matrix (negating column 0 flips it) and therefore of the recovered world that
+	//     lighting and shadows are computed in. WORLDFIX exists to decide it and CAMTEST can
+	//     measure it. 0.5 of a score whose spread is 1..6 and which the +100 source bonus
+	//     swamps is not a decision, it is noise.
+	//   m[1][1] < 0 is a FACTORISATION choice, not a property of the matrix. try_split_once
+	//     derives `up` from column 1, so up . col1 > 0 identically and no input matrix can
+	//     produce a negative m[1][1] -- only split_view_projection_direct's flip_up can. The
+	//     shipped -1.f therefore never fired on any title, and the moment flip_up makes it
+	//     fire it is penalising the very hypothesis it was added to test.
+	enum : int
+	{
+		// Exactly as shipped: m[0][0] < 0 docks 0.5, m[1][1] < 0 docks 1.0.
+		sign_policy_shipped = 0,
+		// Neither sign is scored. Handedness and factorisation parity stop being tie-breaks and
+		// the shape score is fov + aspect + near alone -- which is all it ever measured.
+		sign_policy_neutral = 1,
+		// A POSITIVE m[1][1] docks 1.0 instead. The reading under which the guest's clip y is
+		// screen-down and the Y-flipped factorisation is the correct one, so the ":yf" twins
+		// outrank their parents. m[0][0] is left unscored, as at sign_policy_neutral.
+		sign_policy_prefer_flipped_y = 2,
+	};
+
 	// Aspect-vs-viewport main camera pick. Higher is better; <= 0 means reject.
-	float score_perspective(const mat4& m, float reference_aspect);
+	float score_perspective(const mat4& m, float reference_aspect, int sign_policy = sign_policy_shipped);
 
 	// Perspective row (column 3) is 0,0,0,1 - i.e. the matrix is a plain affine transform.
 	bool is_affine(const mat4& m, float tol = 1e-3f);
@@ -118,7 +151,45 @@ namespace remix_ps2
 
 	const char* split_stage_name(split_stage stage);
 
-	bool split_view_projection_direct(const mat4& fused, vp_split& out, split_stage* stage = nullptr);
+	// `flip_up` is THE Y-FLIP DEGREE OF FREEDOM, and it lives here rather than in the hypothesis
+	// matrix because that is the only place it can live. Proof, from try_split_once itself:
+	//
+	//   m[1][1] of the recovered projection is up . col1, where col1 is column 1 of the matrix
+	//   handed in and `up` is forward x (up_hint x forward) -- the component of up_hint
+	//   perpendicular to forward. up_hint is unprojected from ndc (0, +1, 0.5) minus ndc
+	//   (0, 0, 0.5), so up_hint . col1 = clip_w of the upper point > 0 for any matrix a guest
+	//   actually draws with. Hence up . col1 > 0 IDENTICALLY, for every input.
+	//
+	// So no matrix can produce m[1][1] < 0, and the three routes that look like they might do
+	// not, each for a reason that is arithmetic rather than empirical:
+	//   * negating scale_y in normalize_screen_clip forms M . diag(1,-1,1,1). Column 1 flips,
+	//     but ndc (0,+1,0.5) now unprojects to the point that WAS at ndc (0,-1,0.5), so up_hint
+	//     flips with it, hence right and up. m[1][1] = (-up).(-col1) is unchanged; what flips is
+	//     m[0][0] = (-right).col0. That is the whole of the 0.5 gap between the `ndc` and `ndcY`
+	//     rows in this project's own dump (5.00 vs 4.50) -- the m[0][0] dock, nothing else.
+	//   * negating column 1 of the normalised matrix after the fact IS that same product, so it
+	//     is the same no-op for m[1][1]. It is not a no-op for the recovered WORLD (it mirrors
+	//     it about the plane normal to up) -- but the world is not what m[1][1] reads.
+	//   * negating up_hint inside the split flips right AND up together, i.e. m[0][0] and
+	//     m[1][1] together: a 180 degree roll about forward. It reaches (-,-) but never (+,-),
+	//     and it is exactly the composition of this flag with the scale_y sign the family
+	//     already spans -- so it adds no reachable sign combination and makes m[0][0] ambiguous.
+	//
+	// What is left is the basis: take `up` with the opposite sign (equivalently up = right x
+	// forward rather than forward x right). right and forward are untouched, so m[0][0] and
+	// m[2][3] are untouched and ONLY row 1 of the projection negates. viewToWorld becomes
+	// improper (determinant -1) -- the published camera is a vertical mirror of the elected one,
+	// and the projection's negated m[1][1] is exactly its compensation.
+	//
+	// SAY WHAT THIS CANNOT DO. The fused matrix is not touched, so make_clip_solver's inverse is
+	// bit-identical and the recovered world does not move one float. view * projection == fused
+	// still holds identically. A CAMTEST row for a flipped hypothesis therefore carries the SAME
+	// alpha as its unflipped parent by construction, and that equality is the check that this
+	// flag does what this comment says. What it does change is the camera matrices published to
+	// Remix -- and whether the runtime composes them faithfully or reads a handedness out of
+	// them is a question about the runtime, not about this file.
+	bool split_view_projection_direct(const mat4& fused, vp_split& out, split_stage* stage = nullptr,
+		bool flip_up = false);
 
 	// ---------------------------------------------------------------------------------------
 	// PS2 joint: screen-clip normalisation and the world un-projection

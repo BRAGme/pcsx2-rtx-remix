@@ -124,7 +124,8 @@ namespace remix_ps2
 			return true;
 		}
 
-		bool try_split_once(const mat4& fused, vp_split& out, split_stage* stage = nullptr)
+		bool try_split_once(const mat4& fused, vp_split& out, split_stage* stage = nullptr,
+			bool flip_up = false)
 		{
 			const auto fail = [&](split_stage reason) {
 				if (stage)
@@ -165,6 +166,25 @@ namespace remix_ps2
 			cross3(forward, right, up);
 			if (!normalize3(up))
 				return fail(split_stage::basis);
+
+			// THE Y-FLIP. `up` above is the component of up_hint perpendicular to forward, and
+			// up_hint is by definition the world direction in which clip y increases -- so
+			// up . col1 > 0 for every input matrix and m[1][1] of the projection below is
+			// POSITIVE BY CONSTRUCTION. Negating it here is the only place that fact can be
+			// changed; see split_view_projection_direct's note in the header for why negating
+			// scale_y, negating column 1, and negating up_hint all fail to.
+			//
+			// Only row 1 of the projection moves: right and forward are untouched, so m[0][0]
+			// (the recovered world's handedness) and m[2][3] (the projection's own handedness)
+			// read exactly as they did. viewToWorld becomes improper, which is the point --
+			// the published camera is a vertical mirror and the negated m[1][1] is its
+			// compensation, so view * projection == fused still holds identically.
+			if (flip_up)
+			{
+				up[0] = -up[0];
+				up[1] = -up[1];
+				up[2] = -up[2];
+			}
 
 			// viewToWorld: rows are right / up / forward / position (Remix's own layout).
 			mat4 view_to_world = mat4_identity();
@@ -335,6 +355,26 @@ namespace remix_ps2
 			out[j] = (p[0] * m.m[0][j]) + (p[1] * m.m[1][j]) + (p[2] * m.m[2][j]) + (p[3] * m.m[3][j]);
 	}
 
+	void apply_world_basis_rotation(const mat4& view, const float (&camera)[3], int mode,
+		const float (&point)[3], float (&out)[3])
+	{
+		if (mode == 0)
+		{
+			std::copy(std::begin(point), std::end(point), std::begin(out));
+			return;
+		}
+
+		const float relative[3] = {
+			point[0] - camera[0], point[1] - camera[1], point[2] - camera[2]};
+		for (u32 axis = 0; axis < 3; ++axis)
+		{
+			const float r0 = (mode == 1) ? view.m[axis][0] : view.m[0][axis];
+			const float r1 = (mode == 1) ? view.m[axis][1] : view.m[1][axis];
+			const float r2 = (mode == 1) ? view.m[axis][2] : view.m[2][axis];
+			out[axis] = camera[axis] + (r0 * relative[0]) + (r1 * relative[1]) + (r2 * relative[2]);
+		}
+	}
+
 	// -------------------------------------------------------------------------------------------
 	// Converters
 	// -------------------------------------------------------------------------------------------
@@ -470,7 +510,7 @@ namespace remix_ps2
 		return std::isfinite(out.fov_y_degrees) && std::isfinite(out.aspect);
 	}
 
-	float score_perspective(const mat4& mat, float reference_aspect)
+	float score_perspective(const mat4& mat, float reference_aspect, int sign_policy)
 	{
 		if (classify_perspective(mat) != 1)
 			return 0.f;
@@ -499,11 +539,39 @@ namespace remix_ps2
 		if (params.near_plane > 0.001f && params.near_plane < 100.f)
 			score += 1.f;
 
-		if (mat.m[0][0] < 0.f)
-			score -= 0.5f;
+		// --- the two sign terms ---------------------------------------------------------------
+		//
+		// WHAT WAS WRONG WITH THEM, measured rather than argued. The `m[1][1] < 0` dock below was
+		// UNREACHABLE for the whole life of this file: try_split_once derives `up` from column 1,
+		// so up . col1 > 0 identically and no candidate matrix, under any hypothesis, could ever
+		// present a negative m[1][1] to be docked. It fires for the first time now, and only for a
+		// hypothesis carrying split_view_projection_direct's flip_up -- i.e. only for the twin that
+		// exists to test it. Scoring it at -1.f would guarantee the twin loses to its parent, which
+		// makes the test unable to produce the answer it was added to look for.
+		//
+		// The `m[0][0] < 0` dock IS reachable -- the sign of scale_x or scale_y flips it, which is
+		// exactly the 0.5 gap between this project's own `ndc/R=5.00` and `ndcY/R=4.50` dump rows.
+		// But 0.5 on a 1..6 scale, under a +100 source bonus, is not a decision about the recovered
+		// world's handedness; it is a tie-break that looks like one. WORLDFIX and CAMTEST are the
+		// instruments for that question.
+		//
+		// So the weights are a POLICY, selected by PCSX2_REMIX_CAMYFLIP, and policy 0 is what
+		// shipped, term for term.
+		if (sign_policy == sign_policy_prefer_flipped_y)
+		{
+			// The guest's clip y is screen-down, so the vertically mirrored factorisation is the
+			// correct one and a POSITIVE m[1][1] is the defect. Handedness left unscored.
+			if (mat.m[1][1] > 0.f)
+				score -= 1.f;
+		}
+		else if (sign_policy != sign_policy_neutral)
+		{
+			if (mat.m[0][0] < 0.f)
+				score -= 0.5f;
 
-		if (mat.m[1][1] < 0.f)
-			score -= 1.f;
+			if (mat.m[1][1] < 0.f)
+				score -= 1.f;
+		}
 
 		return score;
 	}
@@ -537,7 +605,7 @@ namespace remix_ps2
 		}
 	}
 
-	bool split_view_projection_direct(const mat4& fused, vp_split& out, split_stage* stage)
+	bool split_view_projection_direct(const mat4& fused, vp_split& out, split_stage* stage, bool flip_up)
 	{
 		if (!mat4_is_finite(fused))
 		{
@@ -547,7 +615,7 @@ namespace remix_ps2
 			return false;
 		}
 
-		return try_split_once(fused, out, stage);
+		return try_split_once(fused, out, stage, flip_up);
 	}
 
 	mat4 normalize_screen_clip(const mat4& fused, float scale_x, float offset_x, float scale_y, float offset_y)

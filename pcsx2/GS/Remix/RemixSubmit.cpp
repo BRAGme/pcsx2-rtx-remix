@@ -8,6 +8,7 @@
 #include "GS/Remix/RemixTransforms.h"
 #include "GS/Remix/RemixVU1Capture.h"
 
+#include "MemoryTypes.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
 
 #include "Config.h"
@@ -100,6 +101,7 @@ namespace RemixSubmit
 			// Draws whose relative w spread is below w_flat_limit(): 2D the exact const-Q test
 			// missed because their Q varies in the last few bits. See w_flat_limit().
 			u64 skip_w_flat = 0;
+			u64 skip_clear_alpha = 0; // every vertex alpha 0: the guest drew nothing
 			u64 warn_inaccurate_stq = 0; // m_vt.m_accurate_stq: Q precision already suspect
 			u64 skip_no_target = 0; // no colour target, so no viewport to un-project against
 			u64 skip_empty = 0;
@@ -150,6 +152,12 @@ namespace RemixSubmit
 			u64 meshes_created_frame = 0;
 			u64 meshes_created_peak = 0;
 			u64 sky_tagged = 0; // instances categorised REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
+			// Draws forced to the sky solver by a rtx.skyBoxTextures hash tag rather than by
+			// classify_sky's geometry rules. Separate from sky_tagged because that one counts
+			// instances that ended up with the SKY bit however they got it -- this counts the
+			// draws the hash path is responsible for, which is the number that says whether the
+			// tag list is doing anything. Expect ~1-2 per frame on a title with one backdrop draw.
+			u64 sky_hash = 0;
 			u64 cutout_tagged = 0; // instances categorised ALPHA_BLEND_TO_CUTOUT
 			u64 skip_submit_delay = 0; // withheld by PCSX2_REMIX_SUBMITDELAY
 			u64 skip_inst_budget = 0; // over the per-frame DrawInstance budget
@@ -219,6 +227,8 @@ namespace RemixSubmit
 			u64 skip_all_degenerate = 0; // draws where every triangle was degenerate
 			u64 cam_world = 0;
 			u64 cam_fallback = 0;
+			u64 cam_held_gap = 0;  // frames that reused the last resolved camera instead of the origin
+			u64 cam_hold_expired = 0; // holds abandoned because the solve stayed broken, not gapped
 			// SetupCamera calls that came back non-SUCCESS (or faulted through the SEH guard).
 			//
 			// cam_world/cam_fallback/cam_sky/cam_viewmodel count *attempts*: they are incremented
@@ -519,6 +529,8 @@ namespace RemixSubmit
 		// Reused across draws to keep the hot path allocation free.
 		std::vector<remixapi_HardcodedVertex> s_scratch_vertices;
 		std::vector<u32> s_scratch_indices;
+		// NDC x/y per scratch vertex, kept for the 2D overlay rasteriser.
+		std::vector<float> s_scratch_ndc;
 
 		// Un-projection constants: accumulating for the frame in flight, and the finished
 		// frame's winner that resolve_world_camera() normalises against.
@@ -649,6 +661,249 @@ namespace RemixSubmit
 		int light_mode()
 		{
 			static live_int value(L"PCSX2_REMIX_LIGHTMODE", 1, 0, 2);
+			return value.get();
+		}
+
+		// PCSX2_REMIX_WORLDROT -- the world-anchor correction.
+		//
+		// This remains diagnostic until MESHTRACK proves that one stable mesh moves with the view.
+		// Aggregate scene bounds cannot prove that on SOCOM because the game frustum-culls draws.
+		//
+		//   0 = off (shipped behaviour, geometry stays view-aligned)
+		//   1 = rotate by the view->world rotation, about the camera
+		//   2 = rotate by its transpose, about the camera
+		//
+		// Mode 2 exists because the row-vector convention here is asserted, not proven: for an
+		// orthonormal basis the transpose is the inverse, so if 1 over-rotates (the scene centre
+		// swings twice as far instead of going flat) 2 is the answer, with no second build.
+		// VERIFY WITH CAMTRACK: stand still, turn 360. Correct = scene centre goes CONSTANT.
+		int world_rot_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_WORLDROT", 0, 0, 2);
+			return value.get();
+		}
+
+		// MESHTRACK. The un-confounded world-anchor test.
+		//
+		// The scene-bounds centroid CANNOT answer "is our geometry world-anchored?", because
+		// SOCOM frustum-culls on the EE: turning changes WHICH objects are submitted, so the
+		// aggregate centre swings with view direction even when every object is perfectly
+		// anchored. That confound produced a spurious r = 0.994 and a retracted root cause.
+		//
+		// This follows ONE object instead. Latch the first sufficiently large stable-identity
+		// mesh, then report that same mesh's world centroid every time it is resubmitted. Stand
+		// still and turn: a world-anchored mesh's centroid is CONSTANT, full stop. Culling can
+		// only stop it updating (which `seen` reveals) -- it can never move it.
+		u64 s_meshtrack_hash = 0;
+		float s_meshtrack_centroid[3] = {0.f, 0.f, 0.f};
+		u64 s_meshtrack_seen = 0;
+		u32 s_meshtrack_verts = 0;
+		float s_meshtrack_dist = 0.f;
+
+		// PCSX2_REMIX_UIMODE -- make menus and HUD render.
+		//
+		// The screen-UI path already existed, but `fallback_screen_ui` required
+		// !s_active_camera.valid -- it only opened when NO world camera had been elected. In a
+		// menu the camera from the last gameplay frame is still latched and still "valid", so
+		// the gate stays shut, the const-Q gate then rejects every 2D draw (measured: constq
+		// 40,626 in one session, wflat 0) and the menu is simply absent. That is why the game
+		// can only be driven from save states.
+		//
+		//   0 = off: screen UI only when no camera exists (shipped behaviour)
+		//   1 = treat a 2D draw as screen UI whatever the camera is doing
+		//
+		// Under mode 1 such draws take the VIEW-SPACE tier (w = 1, positions straight from NDC)
+		// and are placed with the camera's own view->world transform, so they land in front of
+		// the eye as an overlay instead of being un-projected into the world at w = 1, which
+		// would bury them in the camera's face.
+		int ui_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_UIMODE", 0, 0, 1);
+			return value.get();
+		}
+
+		// --- 2D overlay rasteriser -----------------------------------------------------------
+		//
+		// SOCOM's menus and HUD are 2D draws. Every route through the geometry pipeline is wrong
+		// for them: un-projected they land in the world, and view-space they still need a camera
+		// to place them. The runtime exposes remixapi_DrawScreenOverlay(pixels, w, h, format,
+		// opacity), which composites a CPU bitmap over the final image -- which is what a HUD
+		// actually is. So rasterise the 2D draws ourselves and hand over one buffer per frame.
+		//
+		// Deliberately minimal: nearest sampling, source-alpha blending, no perspective
+		// correction (a 2D draw has none to correct). That is enough for text, icons and menus.
+		std::vector<u8> s_overlay;         // BGRA8, matching the decoded material payload
+		u32 s_overlay_w = 0, s_overlay_h = 0;
+		bool s_overlay_used = false;
+		u64 s_overlay_draws = 0;      // draws that reached the rasteriser
+		u64 s_overlay_nopixels = 0;   // ... but had no CPU texture to sample
+		u64 s_overlay_texels = 0;     // texels actually written
+		u64 s_overlay_presents = 0;   // frames handed to DrawScreenOverlay
+		u64 s_overlay_fullscreen = 0; // sprites refused as full-target blits, not UI
+		u64 s_screen_ui_seen = 0;     // draws classified as screen UI
+		u64 s_screen_ui_nomat = 0;    // ... dropped: no material bound
+		u64 s_screen_ui_nondc = 0;    // ... dropped: no NDC captured
+		// Frame the overlay was last rebuilt on. The HUD is NOT submitted every frame -- it rides
+		// the same 1-in-3 empty-window cadence that HOLDEMPTY exists for -- so clearing at end of
+		// frame presented an empty buffer on every gap and the HUD strobed. Clear lazily instead:
+		// on the first UI draw OF A FRAME. A frame with no UI draws then keeps the previous
+		// content and is presented again, which is exactly what the geometry path already does.
+		u64 s_overlay_frame = ~0ull;
+
+		int ui_raster_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_UIRASTER", 0, 0, 1);
+			return value.get();
+		}
+
+		void overlay_reset(u32 w, u32 h)
+		{
+			if (w == 0 || h == 0)
+				return;
+
+			if (w != s_overlay_w || h != s_overlay_h || s_overlay.size() != (size_t)w * h * 4)
+			{
+				s_overlay_w = w;
+				s_overlay_h = h;
+				s_overlay.assign((size_t)w * h * 4, 0);
+			}
+			else if (s_overlay_used)
+			{
+				std::fill(s_overlay.begin(), s_overlay.end(), (u8)0);
+			}
+
+			s_overlay_used = false;
+		}
+
+		// Rasterise the current scratch draw (positions in s_scratch_ndc, UVs and colour in
+		// s_scratch_vertices, triangles in s_scratch_indices) into the overlay.
+		void overlay_raster(u64 content_hash)
+		{
+			const u8* px = nullptr;
+			u32 tw = 0, th = 0;
+			if (!remix_ps2::materials::cpu_pixels(content_hash, px, tw, th))
+			{
+				++s_overlay_nopixels;
+				return;
+			}
+			if (s_overlay.empty() || s_scratch_ndc.size() < s_scratch_vertices.size() * 2)
+				return;
+
+			const float fw = (float)s_overlay_w;
+			const float fh = (float)s_overlay_h;
+
+			for (size_t tri = 0; tri + 2 < s_scratch_indices.size(); tri += 3)
+			{
+				const u32 i0 = s_scratch_indices[tri], i1 = s_scratch_indices[tri + 1],
+						  i2 = s_scratch_indices[tri + 2];
+				if (i0 >= s_scratch_vertices.size() || i1 >= s_scratch_vertices.size() ||
+					i2 >= s_scratch_vertices.size())
+					continue;
+
+				// NDC -> pixel. ndc_y is +up (the vertex loop negates it), screen y is +down.
+				const float x0 = (s_scratch_ndc[i0 * 2] * 0.5f + 0.5f) * fw;
+				const float y0 = (0.5f - s_scratch_ndc[i0 * 2 + 1] * 0.5f) * fh;
+				const float x1 = (s_scratch_ndc[i1 * 2] * 0.5f + 0.5f) * fw;
+				const float y1 = (0.5f - s_scratch_ndc[i1 * 2 + 1] * 0.5f) * fh;
+				const float x2 = (s_scratch_ndc[i2 * 2] * 0.5f + 0.5f) * fw;
+				const float y2 = (0.5f - s_scratch_ndc[i2 * 2 + 1] * 0.5f) * fh;
+
+				const float area = ((x1 - x0) * (y2 - y0)) - ((x2 - x0) * (y1 - y0));
+				if (!std::isfinite(area) || std::abs(area) < 1e-6f)
+					continue;
+
+				const float inv_area = 1.0f / area;
+				int minx = (int)std::floor(std::min(std::min(x0, x1), x2));
+				int maxx = (int)std::ceil(std::max(std::max(x0, x1), x2));
+				int miny = (int)std::floor(std::min(std::min(y0, y1), y2));
+				int maxy = (int)std::ceil(std::max(std::max(y0, y1), y2));
+				minx = std::max(minx, 0); miny = std::max(miny, 0);
+				maxx = std::min(maxx, (int)s_overlay_w - 1);
+				maxy = std::min(maxy, (int)s_overlay_h - 1);
+
+				for (int y = miny; y <= maxy; ++y)
+				{
+					for (int x = minx; x <= maxx; ++x)
+					{
+						const float pxc = (float)x + 0.5f, pyc = (float)y + 0.5f;
+						float w0 = (((x1 - pxc) * (y2 - pyc)) - ((x2 - pxc) * (y1 - pyc))) * inv_area;
+						float w1 = (((x2 - pxc) * (y0 - pyc)) - ((x0 - pxc) * (y2 - pyc))) * inv_area;
+						float w2 = 1.0f - w0 - w1;
+						if (w0 < 0.f || w1 < 0.f || w2 < 0.f)
+							continue;
+
+						const float u = (w0 * s_scratch_vertices[i0].texcoord[0]) +
+										(w1 * s_scratch_vertices[i1].texcoord[0]) +
+										(w2 * s_scratch_vertices[i2].texcoord[0]);
+						const float v = (w0 * s_scratch_vertices[i0].texcoord[1]) +
+										(w1 * s_scratch_vertices[i1].texcoord[1]) +
+										(w2 * s_scratch_vertices[i2].texcoord[1]);
+						if (!std::isfinite(u) || !std::isfinite(v))
+							continue;
+
+						// Wrap, matching the GS default.
+						int su = (int)(u * (float)tw); su %= (int)tw; if (su < 0) su += (int)tw;
+						int sv = (int)(v * (float)th); sv %= (int)th; if (sv < 0) sv += (int)th;
+
+						const u8* texel = px + (((size_t)sv * tw) + su) * 4;
+
+						// Vertex colour modulates, and PS2 alpha already scaled to 0..255.
+						const u32 vc = s_scratch_vertices[i0].color;
+						const u32 va = (vc >> 24) & 0xFF;
+						const u32 a = (texel[3] * va) / 255u;
+						if (a == 0)
+							continue;
+
+						u8* dst = s_overlay.data() + (((size_t)y * s_overlay_w) + x) * 4;
+						for (u32 k = 0; k < 3; ++k)
+						{
+							const u32 src = ((u32)texel[k] * ((vc >> (k * 8)) & 0xFF)) / 255u;
+							dst[k] = (u8)(((src * a) + ((u32)dst[k] * (255u - a))) / 255u);
+						}
+						dst[3] = (u8)std::min(255u, (u32)dst[3] + a);
+						s_overlay_used = true;
+						++s_overlay_texels;
+					}
+				}
+			}
+
+			++s_overlay_draws;
+		}
+
+		// PCSX2_REMIX_UIWMAX -- separates real screen UI from world-space billboards.
+		//
+		// UIMODE treats any constant-Q textured draw as screen UI, and that is too broad: smoke,
+		// dirt and muzzle-flash billboards are camera-facing quads at ONE depth, so they satisfy
+		// the same test and get rasterised into the HUD overlay. Mortar dirt filling the screen
+		// was exactly this.
+		//
+		// The discriminator is depth. This title's genuine UI draws sit at w = 6.0 (measured while
+		// calibrating WFLAT: menu quads reported w = [6.0, 6.0]); a world billboard's w is its
+		// real distance from the eye, orders of magnitude larger. So cap it.
+		// 0 disables the cap and restores the over-broad behaviour.
+		float ui_w_max()
+		{
+			static live_float value(L"PCSX2_REMIX_UIWMAX", 50.f);
+			return value.get();
+		}
+
+		// PCSX2_REMIX_DROPCLEAR -- discard draws the guest authored as fully transparent.
+		//
+		// Found from the developer menu's own debug views: a large polygon reads BLACK in Vertex
+		// Alpha (alpha 0 on every vertex) and PURE WHITE in Diffuse Albedo. The game intended it
+		// to be invisible; we render it opaque white because ALPHASTATE = 0 forces opacity. The
+		// result is a giant white bounce card in the middle of the level, which is what made
+		// everything read as uniformly, emissively bright.
+		//
+		// ALPHASTATE cannot fix this: mode 2 attaches the real per-draw blend and, because this
+		// title sets ABE=1 on 100% of its draws, turns the entire world translucent; mode 0 is
+		// what we have. Rather than pick a bad global, drop only the draws that contribute
+		// NOTHING in the original -- alpha 0 across every vertex is unambiguous.
+		//
+		// 1 = drop them (default), 0 = keep the shipped behaviour.
+		int drop_clear_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_DROPCLEAR", 1, 0, 1);
 			return value.get();
 		}
 
@@ -1649,6 +1904,226 @@ namespace RemixSubmit
 		float camera_anisotropy_limit();
 		float camera_extent_limit();
 
+		// --- authored level lights ------------------------------------------------------------
+		//
+		// R6 3's levels are Unreal packages: Maps/Alcatraz.rsm (v118, licensee 21) carries 212
+		// light actors -- 211 Light + 1 Sunlight -- with real world Locations, LightBrightness,
+		// LightRadius, LightHue and LightSaturation. Extracted offline (the .rsm lives on the Xbox
+		// release, not in the PS2 install, so runtime parsing is not an option) into
+		//   RemixGames\<SERIAL>\lights_<LEVEL>.txt
+		//
+		// OFF by default. LIGHTMODE stays exactly as it was so the single distant fill remains
+		// available for A/B -- 212 uncalibrated lights will not be right on the first try.
+		int level_lights_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_LEVELLIGHTS", 0), 0, 1);
+		}
+
+		// Brightness scale. UE2 brightness is ~0-255 and Remix wants radiance, so the conversion
+		// needs one calibration constant. Live so it can be tuned without a rebuild.
+		float level_light_scale()
+		{
+			static live_float value(L"PCSX2_REMIX_LEVELLIGHTSCALE", 1.f);
+			return std::max(0.f, value.get());
+		}
+
+		// The map's lights are at TRUE world scale (hundreds of units apart, radius 42-128),
+		// but the un-projection submits geometry compressed to a ~6 unit blob at roughly the
+		// right world centre. Measured 2026-08-27: `scene r 6` with `maxpos 20559`, lights
+		// spread over ~12,000 units. So every bulb sits astronomically far from the geometry
+		// with a radius far too small to reach it -- accepted by the runtime (Light Statistics
+		// showed 174 sphere lights live) and contributing nothing.
+		//
+		// Shrink the rig about the eye by the same factor the world is compressed by, radius
+		// included. 1.0 is the raw map scale.
+		float level_light_pos_scale()
+		{
+			static live_float value(L"PCSX2_REMIX_LEVELLIGHTPOSSCALE", 1.f);
+			return std::max(1e-6f, value.get());
+		}
+
+		std::vector<remixapi_LightHandle> s_level_lights;
+		bool s_level_lights_built = false;
+
+		// UE2 hue/saturation -> linear RGB. Saturation is INVERTED in UE2: 255 is white and 0 is
+		// fully saturated, which is the opposite of every other engine and easy to get backwards.
+		void ue2_hue_sat_to_rgb(u32 hue, u32 sat, float (&rgb)[3])
+		{
+			const float h = (static_cast<float>(hue & 0xFF) / 255.f) * 6.f;
+			const float s = 1.f - (static_cast<float>(sat & 0xFF) / 255.f);
+			const int i = static_cast<int>(h) % 6;
+			const float f = h - std::floor(h);
+			const float q = 1.f - (s * f);
+			const float t = 1.f - (s * (1.f - f));
+			const float n = 1.f - s;
+			switch (i)
+			{
+				case 0:  rgb[0]=1.f; rgb[1]=t;   rgb[2]=n;   break;
+				case 1:  rgb[0]=q;   rgb[1]=1.f; rgb[2]=n;   break;
+				case 2:  rgb[0]=n;   rgb[1]=1.f; rgb[2]=t;   break;
+				case 3:  rgb[0]=n;   rgb[1]=q;   rgb[2]=1.f; break;
+				case 4:  rgb[0]=t;   rgb[1]=n;   rgb[2]=1.f; break;
+				default: rgb[0]=1.f; rgb[1]=n;   rgb[2]=q;   break;
+			}
+		}
+
+		void build_level_lights()
+		{
+			if (s_level_lights_built || level_lights_mode() == 0)
+				return;
+
+			// Anchor the rig on the eye, so wait for a camera. Without one there is nothing to
+			// shrink about and every light would land in the wrong place permanently.
+			if (!s_active_camera.valid)
+				return;
+			s_level_lights_built = true;
+
+			const float pscale = level_light_pos_scale();
+			const float ax = s_active_camera.position[0];
+			const float ay = s_active_camera.position[1];
+			const float az = s_active_camera.position[2];
+
+			const std::string dir = remix_ps2::paths::game_dir();
+			if (dir.empty())
+			{
+				INFO_LOG("Remix: LEVELLIGHTS on but no per-game dir -- nothing loaded");
+				return;
+			}
+			const std::string path = Path::Combine(dir, "lights_ALCATRAZ.txt");
+			std::FILE* f = FileSystem::OpenCFile(path.c_str(), "r");
+			if (!f)
+			{
+				INFO_LOG("Remix: LEVELLIGHTS on but '{}' not found -- no authored lights loaded", path);
+				return;
+			}
+
+			const remixapi_Interface& api = s_remix.api();
+			const float scale = level_light_scale();
+			u32 made = 0, failed = 0, suns = 0;
+			char line[512];
+			while (std::fgets(line, sizeof(line), f))
+			{
+				if (line[0] == '#' || line[0] == 0x0A || line[0] == 0x0D)
+					continue;
+
+				float x, y, z, dx, dy, dz, bright, radius;
+				u32 hue = 0, sat = 255;
+				remixapi_LightInfo info{};
+				info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+				info.isDynamic = 1; // MUST be set or the runtime sleeps analytical lights
+
+				remixapi_LightInfoSphereEXT sphere{};
+				remixapi_LightInfoDistantEXT distant{};
+				float rgb[3] = {1.f, 1.f, 1.f};
+
+				if (std::sscanf(line, "SUN %f %f %f %f %f %f %f %u %u",
+						&x, &y, &z, &dx, &dy, &dz, &bright, &hue, &sat) == 9)
+				{
+					ue2_hue_sat_to_rgb(hue, sat, rgb);
+					distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
+					distant.direction = {dx, dy, dz};
+					distant.angularDiameterDegrees = 0.5f;
+					info.pNext = &distant;
+					info.hash = 0x9C5241B210000000ull + suns;
+					++suns;
+				}
+				else if (std::sscanf(line, "LIGHT %f %f %f %f %f %u %u",
+						&x, &y, &z, &bright, &radius, &hue, &sat) == 7)
+				{
+					ue2_hue_sat_to_rgb(hue, sat, rgb);
+					sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+					sphere.position = {ax + (x - ax) * pscale,
+					                   ay + (y - ay) * pscale,
+					                   az + (z - az) * pscale};
+					sphere.radius = std::max(0.01f, radius * pscale);
+					sphere.shaping_hasvalue = 0;
+					info.pNext = &sphere;
+					info.hash = 0x9C5241B220000000ull + made;
+				}
+				else
+					continue;
+
+				const float r = (bright / 255.f) * scale;
+				info.radiance = {rgb[0] * r, rgb[1] * r, rgb[2] * r};
+
+				remixapi_LightHandle h = nullptr;
+				if (remix_ps2::guarded_create_light(api.CreateLight, &info, &h) ==
+						REMIXAPI_ERROR_CODE_SUCCESS && h)
+				{
+					s_level_lights.push_back(h);
+					++made;
+				}
+				else
+					++failed;
+			}
+			std::fclose(f);
+
+			INFO_LOG("Remix: LEVELLIGHTS loaded '{}' -- created {} ({} distant) failed {} scale {:.3f} posscale {:.5f} anchor {:.0f} {:.0f} {:.0f}",
+				path, made, suns, failed, scale, pscale, ax, ay, az);
+		}
+		// --- EE-resident camera ---------------------------------------------------------------
+		// FOUND 2026-08-27 by diffing three save states (still / turn in place / walk+turn):
+		//   VIEW  Location @ 0x00F0F670   Rotation @ 0x00F0F680  (FRotator, 3 x int32)
+		//   PAWN  Location @ 0x019AE190   Rotation @ 0x019AE1A0
+		// They differ by exactly 75 units of Z (BaseEyeHeight); the view carries a -12.1 degree
+		// pitch and the pawn none -- the standard Unreal pawn/view split. Verified over all three
+		// states: position frozen standing still, moved when walking, yaw tracking +99.0 then +85.4.
+		// This is the transform VU1 never contains: VIFMAP (7.8M unpacks, 360 shapes, dropped=0)
+		// proved no standalone camera is ever uploaded there.
+		// 0 = off, 1 = read and LOG only, 2 = also submit as the world camera.
+		int ee_cam_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_EECAM", 0), 0, 2);
+		}
+		u32 ee_cam_loc_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMLOC", 0x00F0F670)); }
+		u32 ee_cam_rot_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMROT", 0x00F0F680)); }
+
+		// Location + FRotator -> row-vector world->view. Unreal is Z-up, X forward, 65536 == 360 deg.
+		bool read_ee_camera(float (&pos)[3], remix_ps2::mat4& view, float (&angles_deg)[3])
+		{
+			if (!eeMem)
+				return false;
+			const u32 loc = ee_cam_loc_addr() & 0x01FFFFFCu;
+			const u32 rot = ee_cam_rot_addr() & 0x01FFFFFCu;
+			if ((loc + 12u) > Ps2MemSize::MainRam || (rot + 12u) > Ps2MemSize::MainRam)
+				return false;
+			float p[3];
+			s32 r[3];
+			std::memcpy(p, eeMem->Main + loc, sizeof(p));
+			std::memcpy(r, eeMem->Main + rot, sizeof(r));
+			for (float v : p)
+			{
+				if (!std::isfinite(v) || std::abs(v) > 1e7f)
+					return false;
+			}
+			constexpr float k = 6.2831853f / 65536.f;
+			const float pitch = static_cast<float>(r[0]) * k;
+			const float yaw   = static_cast<float>(r[1]) * k;
+			const float roll  = static_cast<float>(r[2]) * k;
+			angles_deg[0] = static_cast<float>(r[0]) * (360.f / 65536.f);
+			angles_deg[1] = static_cast<float>(r[1]) * (360.f / 65536.f);
+			angles_deg[2] = static_cast<float>(r[2]) * (360.f / 65536.f);
+			const float cp = std::cos(pitch), sp = std::sin(pitch);
+			const float cy = std::cos(yaw),   sy = std::sin(yaw);
+			const float cr = std::cos(roll),  sr = std::sin(roll);
+			const float fwd[3]   = { cp * cy, cp * sy, sp };
+			const float right[3] = { (sr * sp * cy) - (cr * sy), (sr * sp * sy) + (cr * cy), -sr * cp };
+			const float up[3]    = { -((cr * sp * cy) + (sr * sy)), (cy * sr) - (cr * sp * sy), cr * cp };
+			pos[0] = p[0]; pos[1] = p[1]; pos[2] = p[2];
+			view = remix_ps2::mat4_identity();
+			for (u32 i = 0; i < 3; ++i)
+			{
+				view.m[i][0] = right[i];
+				view.m[i][1] = up[i];
+				view.m[i][2] = fwd[i];
+				view.m[i][3] = 0.f;
+			}
+			view.m[3][0] = -((p[0]*right[0]) + (p[1]*right[1]) + (p[2]*right[2]));
+			view.m[3][1] = -((p[0]*up[0])    + (p[1]*up[1])    + (p[2]*up[2]));
+			view.m[3][2] = -((p[0]*fwd[0])   + (p[1]*fwd[1])   + (p[2]*fwd[2]));
+			view.m[3][3] = 1.f;
+			return true;
+		}
 		void place_debug_light(const float (&position)[3], float scene_radius)
 		{
 			if (no_debug_scene())
@@ -1705,7 +2180,16 @@ namespace RemixSubmit
 			remixapi_LightInfo light_info{};
 			light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 			light_info.pNext = &sphere_light;
-			light_info.hash = 0x3;
+			light_info.hash = 0x9C5241B200000003ull; // sphere (debug/LIGHTMODE=2)
+
+			// MUST be set. remixapi_CreateLight does `rtLight->isDynamic = info->isDynamic`,
+			// and a light left static is put to sleep after getNumFramesToPutLightsToSleep()
+			// frames -- it leaves the active list and LIGHT STATISTICS drops to 0 with no error
+			// anywhere. The fork documents this on its own sun (rtx_fork_atmosphere.cpp:
+			// "Without this the light is treated as static and put to sleep"). Dome lights are
+			// unaffected because they never enter the RtLight sleep path, which is exactly why
+			// the dome lit the scene while the key and the sphere silently vanished.
+			light_info.isDynamic = 1;
 			// Neutral white; the runtime gives radiance no per-channel semantics.
 			light_info.radiance = {radiance, radiance, radiance};
 
@@ -1759,7 +2243,16 @@ namespace RemixSubmit
 			remixapi_LightInfo light_info{};
 			light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 			light_info.pNext = &distant;
-			light_info.hash = 0x4;
+			light_info.hash = 0x9C5241B200000004ull; // distant (place_sun_light)
+
+			// MUST be set. remixapi_CreateLight does `rtLight->isDynamic = info->isDynamic`,
+			// and a light left static is put to sleep after getNumFramesToPutLightsToSleep()
+			// frames -- it leaves the active list and LIGHT STATISTICS drops to 0 with no error
+			// anywhere. The fork documents this on its own sun (rtx_fork_atmosphere.cpp:
+			// "Without this the light is treated as static and put to sleep"). Dome lights are
+			// unaffected because they never enter the RtLight sleep path, which is exactly why
+			// the dome lit the scene while the key and the sphere silently vanished.
+			light_info.isDynamic = 1;
 			light_info.radiance = {radiance, radiance, radiance};
 
 			const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_sun_light);
@@ -1924,11 +2417,16 @@ namespace RemixSubmit
 		// GS thread only, like every other light call and every knob read in this file.
 		void refresh_fill_lights()
 		{
+			const remixapi_Interface& api = s_remix.api();
+			if (light_mode() != 2 && s_debug_light)
+			{
+				remix_ps2::guarded_destroy_light(api.DestroyLight, s_debug_light);
+				s_debug_light = nullptr;
+			}
+
 			const fill_light_params want = resolve_fill_light_params();
 			if (s_fill_params_resolved && want == s_fill_params)
 				return;
-
-			const remixapi_Interface& api = s_remix.api();
 
 			// Both are torn down whichever one moved. They are two lights, not two independent
 			// features, and a partial rebuild is how you end up with a dome from one conf and a key
@@ -1959,7 +2457,16 @@ namespace RemixSubmit
 				remixapi_LightInfo light_info{};
 				light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 				light_info.pNext = &dome;
-				light_info.hash = 0x5;
+				light_info.hash = 0x9C5241B200000005ull; // dome (fill)
+
+				// MUST be set. remixapi_CreateLight does `rtLight->isDynamic = info->isDynamic`,
+				// and a light left static is put to sleep after getNumFramesToPutLightsToSleep()
+				// frames -- it leaves the active list and LIGHT STATISTICS drops to 0 with no error
+				// anywhere. The fork documents this on its own sun (rtx_fork_atmosphere.cpp:
+				// "Without this the light is treated as static and put to sleep"). Dome lights are
+				// unaffected because they never enter the RtLight sleep path, which is exactly why
+				// the dome lit the scene while the key and the sphere silently vanished.
+				light_info.isDynamic = 1;
 				light_info.radiance = {want.dome_radiance[0], want.dome_radiance[1], want.dome_radiance[2]};
 
 				const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_dome_light);
@@ -1982,7 +2489,16 @@ namespace RemixSubmit
 				remixapi_LightInfo light_info{};
 				light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 				light_info.pNext = &distant;
-				light_info.hash = 0x6;
+				light_info.hash = 0x9C5241B200000006ull; // distant key (fill)
+
+				// MUST be set. remixapi_CreateLight does `rtLight->isDynamic = info->isDynamic`,
+				// and a light left static is put to sleep after getNumFramesToPutLightsToSleep()
+				// frames -- it leaves the active list and LIGHT STATISTICS drops to 0 with no error
+				// anywhere. The fork documents this on its own sun (rtx_fork_atmosphere.cpp:
+				// "Without this the light is treated as static and put to sleep"). Dome lights are
+				// unaffected because they never enter the RtLight sleep path, which is exactly why
+				// the dome lit the scene while the key and the sphere silently vanished.
+				light_info.isDynamic = 1;
 				light_info.radiance = {want.key_radiance[0], want.key_radiance[1], want.key_radiance[2]};
 
 				const u32 status = remix_ps2::guarded_create_light(api.CreateLight, &light_info, &s_sun_light);
@@ -2303,8 +2819,98 @@ namespace RemixSubmit
 		// new viewpoint onto stale geometry. Passed rather than read from the global so there is
 		// exactly one SetupCamera per present and no ordering question against DrawInstance; see
 		// hold_empty_mode() for the measurement that made this necessary.
-		void submit_camera(const world_camera& cam)
+		// Taken BY VALUE so an unresolved camera can be replaced with the last resolved one
+		// before the body runs; every use of `cam` below then refers to the substitute.
+		static world_camera s_last_good_camera{};
+
+		void submit_camera(world_camera cam)
 		{
+			// A frame the solver could not resolve is a GAP, not a new viewpoint. The origin
+			// fallback (0,0,0 down +Z, FOV 70, left-handed) is a completely different viewpoint
+			// from the real one, and it also skips the sky and view-model cameras entirely, so
+			// alternating between them flashes the whole screen. Measured at 26% of frames on
+			// R6 3 (cam world 7338 / fallback 2562), concentrated where the shadow
+			// render-target passes perturb the camera solve -- which is exactly where the user
+			// reported violent flicker. Re-submitting the last camera we resolved is at worst
+			// one frame stale, which is imperceptible next to a full-screen viewpoint change.
+			// The origin fallback is kept for the genuine cold start, before any camera exists.
+			// BOUNDED (2026-08-26). Holding without a bound was a mistake: this title refuses 97%
+			// of its camera solves (solves 849 / refused 827, singular 1,062,494), so an unbounded
+			// hold latched ONE stale camera and re-submitted it for essentially every frame
+			// (held 8439 of world 15187 and climbing 1:1). The world then moves while the eye does
+			// not, which reads as the screen going black for longer the further you play, and it
+			// survived a mission restart because the static never cleared.
+			//
+			// A hold is only honest across a SHORT gap. Past that the solve is not gapping, it is
+			// broken, and the origin fallback -- ugly but self-correcting every frame -- is the
+			// truthful thing to show. Clearing the cache as well stops a stale eye reappearing
+			// later as though it were fresh.
+			static u32 s_consecutive_holds = 0;
+			constexpr u32 k_max_consecutive_holds = 4;
+
+			if (cam.valid)
+			{
+				s_last_good_camera = cam;
+				s_consecutive_holds = 0;
+			}
+			else if (s_last_good_camera.valid && s_consecutive_holds < k_max_consecutive_holds)
+			{
+				cam = s_last_good_camera;
+				++s_consecutive_holds;
+				++s_stats.cam_held_gap;
+			}
+			else if (s_consecutive_holds >= k_max_consecutive_holds)
+			{
+				s_last_good_camera = world_camera{};
+				++s_stats.cam_hold_expired;
+			}
+			// CAMTRACK. Decides whether the light "following the camera" is a light bug or a SPACE
+			// bug, and those need opposite fixes. If the submitted camera's forward vector CHANGES
+			// as the player turns, the camera is real and our positions are world-anchored -- so a
+			// world-fixed distant light cannot track the view and the fault is elsewhere. If
+			// forward is CONSTANT while the player turns, the view transform is baked into the
+			// geometry (which is exactly why the camera search was falsified), our "world" is
+			// eye-relative, and EVERY world-space light will appear welded to the camera by
+			// construction. No amount of light tuning fixes the second case.
+			{
+				static u32 s_camtrack_n = 0;
+				if ((s_camtrack_n++ % 120) == 0)
+				{
+					// THE WORLD-ANCHOR TEST. `centre` is the midpoint of everything submitted this
+					// window, in the space we hand Remix. Stand still and TURN:
+					//   centre CONSTANT  -> geometry is world-anchored. A fixed-direction distant
+					//                       light then physically cannot change shading as you
+					//                       turn, and the fault is downstream of us.
+					//   centre ORBITS the camera -> the un-projection carries the camera's
+					//                       translation but NOT its rotation. The world spins with
+					//                       the view, so EVERY world-space light sweeps across the
+					//                       scene as you turn. That is a space bug, not a light bug,
+					//                       and it also explains why MOONFIT returned azimuth 137
+					//                       in one session and 59 in another.
+					float cx = 0.f, cy = 0.f, cz = 0.f;
+					if (s_last_bounds.valid)
+					{
+						cx = (s_last_bounds.min[0] + s_last_bounds.max[0]) * 0.5f;
+						cy = (s_last_bounds.min[1] + s_last_bounds.max[1]) * 0.5f;
+						cz = (s_last_bounds.min[2] + s_last_bounds.max[2]) * 0.5f;
+					}
+
+					INFO_LOG("Remix: CAMTRACK fwd {:+.4f} {:+.4f} {:+.4f} | right {:+.4f} {:+.4f} {:+.4f} "
+							 "| pos {:.1f} {:.1f} {:.1f} | scene centre {:.1f} {:.1f} {:.1f}"
+							 " | MESHTRACK id {:08X} {} verts seen {} centroid {:.1f} {:.1f} {:.1f} dist {:.0f}",
+						cam.view.m[0][2], cam.view.m[1][2], cam.view.m[2][2],
+						cam.view.m[0][0], cam.view.m[1][0], cam.view.m[2][0],
+						cam.position[0], cam.position[1], cam.position[2],
+						cx, cy, cz,
+						static_cast<u32>(s_meshtrack_hash & 0xFFFFFFFFull),
+						s_meshtrack_verts, s_meshtrack_seen,
+						s_meshtrack_centroid[0], s_meshtrack_centroid[1], s_meshtrack_centroid[2],
+						s_meshtrack_dist);
+					// Re-elect next window so the biggest CURRENTLY VISIBLE mesh is reported.
+					s_meshtrack_verts = 0;
+				}
+			}
+
 			// The extent the previous frame actually submitted, in whichever space is in use.
 			// Both tiers get the same treatment: view-space positions are in guest eye-depth
 			// units, which are just as far from "near 0.1" as world-space ones are.
@@ -2440,23 +3046,40 @@ namespace RemixSubmit
 			// so a hypothesis written with the old five-field initialiser is unchanged.
 			float scale_w = 1.f; // divides all sixteen terms; see normalize_clip_depth
 			bool swap_zw = false; // exchanges columns 2 and 3 before anything else
+
+			// --- the Y-flip half, added 2026-08-17 --------------------------------------------
+			// NOT a matrix term, and that is the finding rather than an implementation detail:
+			// there is no matrix that produces a projection with m[1][1] < 0, because
+			// try_split_once builds `up` out of column 1 (see split_view_projection_direct's
+			// header note for the arithmetic). So this rides on the hypothesis but is consumed by
+			// the SPLIT, not by apply_camera_hypothesis -- the normalised matrix a flipped
+			// hypothesis produces is bit-identical to its parent's.
+			bool flip_y = false;
 		};
 
 		// Four fixed, plus at most three derived.
 		constexpr u32 hypothesis_slots = 7;
 
-		// Two depth families at most, never more (see build_camera_hypotheses).
-		inline constexpr u32 max_camera_hypotheses = 2 * hypothesis_slots;
+		// Two depth families at most, never more (see build_camera_hypotheses), each optionally
+		// doubled by the Y-flip twin (PCSX2_REMIX_CAMYFLIP). 4 x 7 = 28.
+		inline constexpr u32 max_camera_hypotheses = 4 * hypothesis_slots;
 
 		// One name per (depth family, slot). The name IS part of the CAMTEST identity --
 		// camtest_identity folds the string in -- so these must be distinct per family and
 		// STABLE across runs. Family 0's entries are the exact literals that shipped, which is
 		// what makes PCSX2_REMIX_CAMDEPTH = 0 bit-identical to the behaviour before this
 		// existed, accumulated drift histories included.
-		constexpr const char* hypothesis_names[3][hypothesis_slots] = {
+		//
+		// Rows 3..5 are rows 0..2 with ":yf" appended -- the Y-flipped twin of each. A twin has to
+		// carry its own name or camtest_identity folds to the same key as its parent and the two
+		// share one drift history, which would destroy exactly the comparison the twin exists for.
+		constexpr const char* hypothesis_names[6][hypothesis_slots] = {
 			{"gs", "px", "ndc", "ndcY", "auto", "autoY", "r6"},
 			{"gs:w", "px:w", "ndc:w", "ndcY:w", "auto:w", "autoY:w", "r6:w"},
 			{"gs:zw", "px:zw", "ndc:zw", "ndcY:zw", "auto:zw", "autoY:zw", "r6:zw"},
+			{"gs:yf", "px:yf", "ndc:yf", "ndcY:yf", "auto:yf", "autoY:yf", "r6:yf"},
+			{"gs:w:yf", "px:w:yf", "ndc:w:yf", "ndcY:w:yf", "auto:w:yf", "autoY:w:yf", "r6:w:yf"},
+			{"gs:zw:yf", "px:zw:yf", "ndc:zw:yf", "ndcY:zw:yf", "auto:zw:yf", "autoY:zw:yf", "r6:zw:yf"},
 		};
 
 		// PCSX2_REMIX_CAMDEPTH -- the w-column half of the hypothesis set
@@ -2534,6 +3157,84 @@ namespace RemixSubmit
 			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMDEPTHSNAP", 0), 0, 1);
 		}
 
+		// PCSX2_REMIX_CAMYFLIP -- the Y-flip half of the hypothesis set, and the sign policy that
+		// makes it scorable
+		//
+		// WHAT WAS MISSING, and it is a proof rather than a hunch. m[1][1] of the recovered
+		// projection is up . col1, and try_split_once builds `up` as the component of up_hint
+		// perpendicular to forward, where up_hint is unprojected from ndc (0, +1, 0.5) -- i.e. it
+		// IS the world direction in which clip y increases. So up . col1 > 0 identically, for every
+		// matrix, under every hypothesis. m[1][1] < 0 was unreachable, and so was the -1.f dock
+		// score_perspective applies to it. The three routes that look like they should reach it do
+		// not, each for an arithmetic reason (all three are worked through in
+		// split_view_projection_direct's header note):
+		//   * negating scale_y forms M . diag(1,-1,1,1), which flips up_hint along with column 1;
+		//     the two cancel in m[1][1] and what actually flips is m[0][0]. THIS PROJECT'S OWN DUMP
+		//     IS THE EVIDENCE: `ndc/R=5.00 ndcY/R=4.50`, a gap of exactly the 0.5 that
+		//     score_perspective docks for m[0][0] < 0 and nothing else.
+		//   * negating column 1 of the normalised matrix after the fact is that same product.
+		//   * negating up_hint flips right and up together, so m[0][0] and m[1][1] together -- the
+		//     composition of the flip below with a sign the family already spans, adding nothing.
+		// The one mechanism left is the BASIS: take `up` with the opposite sign. That is what
+		// split_view_projection_direct's flip_up does and what a ":yf" hypothesis carries.
+		//
+		// WHAT MOVES AND WHAT CANNOT, written before the run:
+		//   * the recovered WORLD             -- CANNOT MOVE. flip_up does not touch the fused
+		//     matrix, so make_clip_solver's inverse is bit-identical to the parent's and every
+		//     un-projected vertex lands on the same float. A ":yf" CAMTEST row must therefore
+		//     report the SAME alpha as its parent, to the last digit. That equality is the check
+		//     on this whole change: if a ":yf" alpha differs from its twin's, this comment is
+		//     wrong about the code.
+		//   * the published CAMERA            -- moves. The view becomes a vertical mirror
+		//     (viewToWorld determinant -1) and the projection's m[1][1] negates to compensate.
+		//     view * projection == fused still holds identically, so what the runtime does with a
+		//     mirrored camera pair is a question about the runtime.
+		//   * score_perspective               -- moves at modes 2 and 3 only, and for every
+		//     hypothesis rather than just the twins. See sign_policy_* in RemixTransforms.h.
+		//
+		//   0 = OFF, THE DEFAULT. No twin is enumerated, the family is exactly what it was, and
+		//       score_perspective is called with sign_policy_shipped -- the same two docks, the
+		//       same weights, term for term.
+		//   1 = enumerate the ":yf" twins, keep the shipped sign weights. AUDIT ONLY: a twin is
+		//       refused by the election outright at this mode (see election_eligible in
+		//       resolve_world_camera, and the matching guard in solve_per_draw_clip). The twin also
+		//       scores exactly 1.0 below its parent -- the m[1][1] dock, reachable for the first
+		//       time -- but that gap is NOT what makes this safe and must not be relied on: under
+		//       PCSX2_REMIX_CAMTEST = 2 the election ranks by measured drift, parent and twin hold
+		//       separate drift histories, and a twin whose history filled first would outrank its
+		//       parent by four orders of magnitude on a race rather than on a measurement.
+		//       What this mode buys: the twins appear in the CAMTEST table with their own rows.
+		//   2 = enumerate the twins, and score NEITHER sign. Handedness and parity stop being
+		//       tie-breaks. CAN CHANGE THE PICTURE: with the 0.5 m[0][0] dock gone, two
+		//       hypotheses that differed only by that dock now tie, and the tie goes to whichever
+		//       comes first in the family -- which is not necessarily the one that was winning.
+		//   3 = enumerate the twins, and dock a POSITIVE m[1][1] instead. The reading under which
+		//       PS2 screen-down clip y makes the mirrored factorisation the correct one. CHANGES
+		//       THE PICTURE BY DESIGN: every ":yf" twin now outranks its parent by 1.0, so the
+		//       elected camera is published vertically mirrored.
+		//
+		// Read LIVE, once per camera resolve, and NOT through live_int -- see env_int_live.
+		int camyflip_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMYFLIP", 0), 0, 3);
+		}
+
+		// The sign weighting a given CAMYFLIP mode selects. One function so the frame election, the
+		// per-draw solver and the CAMTESTALL probe sweep cannot disagree about how a candidate is
+		// scored -- the same reason build_camera_hypotheses is shared rather than copied.
+		int camyflip_sign_policy(int mode)
+		{
+			switch (mode)
+			{
+				case 2:
+					return remix_ps2::sign_policy_neutral;
+				case 3:
+					return remix_ps2::sign_policy_prefer_flipped_y;
+				default:
+					return remix_ps2::sign_policy_shipped;
+			}
+		}
+
 		// The mode in force for the window being resolved, refreshed once per resolve by
 		// resolve_world_camera and read by the per-draw solver. The per-draw path must NOT read
 		// the environment (this title submits ~830 draws a window) and must NOT disagree with the
@@ -2542,6 +3243,14 @@ namespace RemixSubmit
 		int s_camdepth_active = 0;
 		int s_camdepth_snap_active = 0;
 		int s_camdepth_logged_mode = -1;
+
+		// PCSX2_REMIX_CAMYFLIP, cached beside them and for exactly the same two reasons: the draw
+		// path must not touch the environment, and a per-draw camera enumerated or scored
+		// differently from the frame camera places its draws in a different world than the rest of
+		// the frame. s_camyflip_sign_active is derived once here so no call site re-derives it.
+		int s_camyflip_active = 0;
+		int s_camyflip_sign_active = remix_ps2::sign_policy_shipped;
+		int s_camyflip_logged_mode = -1;
 
 		// PCSX2_REMIX_CAMSCALE, cached the same way and for a second reason.
 		//
@@ -2650,19 +3359,65 @@ namespace RemixSubmit
 			return count;
 		}
 
-		// The full family: up to two depth treatments of the seven screen hypotheses above.
+		// The full family: up to two depth treatments of the seven screen hypotheses above, each
+		// optionally doubled by its Y-flipped twin.
 		//
 		// ORDER IS STILL LOAD-BEARING for exactly the reason recorded above -- every caller ranks
 		// with a strict `>` and therefore keeps the FIRST hypothesis achieving the best score --
 		// so the baseline family, when present, is emitted first and the depth-corrected family
 		// after it. At PCSX2_REMIX_CAMDEPTH = 0 the emitted list is byte-for-byte what it was
 		// before this parameter existed.
+		//
+		// The Y-flip twins are collected separately and appended AFTER every unflipped hypothesis,
+		// so (a) the index of every existing entry is unchanged, and (b) at CAMYFLIP = 2, where the
+		// neutral sign policy makes a twin score exactly EQUAL to its parent, the parent is reached
+		// first and the strict `>` keeps it. At CAMYFLIP = 3 the twin outscores its parent
+		// outright, which is that mode's whole purpose. At CAMYFLIP = 1 the ordering is not what
+		// protects the parent -- an explicit election gate is; see the knob's own note.
 		u32 build_camera_hypotheses(const remix_ps2::mat4& oriented, const viewport_constants& vp,
 			float reference_aspect, bool column_major, u8 source, u64 ucode_hash, int depth_mode,
-			int snap_mode, camera_hypothesis (&out)[max_camera_hypotheses])
+			int snap_mode, int yflip_mode, camera_hypothesis (&out)[max_camera_hypotheses])
 		{
 			const int mode = std::clamp(depth_mode, 0, 3);
+			const bool want_flipped = std::clamp(yflip_mode, 0, 3) > 0;
 			u32 count = 0;
+
+			// The twins, held back until every unflipped hypothesis has been emitted.
+			camera_hypothesis flipped[max_camera_hypotheses];
+			u32 flipped_count = 0;
+
+			// One emitted hypothesis, plus its twin when armed. `variant` is the depth family
+			// (0 = baseline, 1 = ":w", 2 = ":zw") and `slot` indexes the name table -- which is why
+			// build_screen_hypotheses emits in slot order and never derives a name from `count`.
+			const auto take = [&](const camera_hypothesis& hyp, u32 variant, u32 slot,
+								  float divisor, bool swap) {
+				if (count < max_camera_hypotheses)
+				{
+					out[count] = hyp;
+					out[count].scale_w = divisor;
+					out[count].swap_zw = swap;
+					++count;
+				}
+
+				if (want_flipped && flipped_count < max_camera_hypotheses)
+				{
+					flipped[flipped_count] = hyp;
+					flipped[flipped_count].name = hypothesis_names[variant + 3][slot];
+					flipped[flipped_count].scale_w = divisor;
+					flipped[flipped_count].swap_zw = swap;
+					flipped[flipped_count].flip_y = true;
+					++flipped_count;
+				}
+			};
+
+			// Appends the held-back twins. Called at every return path, because a family with no
+			// twins behind it is not the family this function was asked for.
+			const auto finish = [&]() {
+				for (u32 i = 0; i < flipped_count && count < max_camera_hypotheses; ++i)
+					out[count++] = flipped[i];
+
+				return count;
+			};
 
 			// Family 0: the columns exactly as published. Present at modes 0, 1 and 2.
 			if (mode != 3)
@@ -2672,11 +3427,11 @@ namespace RemixSubmit
 					source, ucode_hash, 0, base);
 
 				for (u32 i = 0; i < n; ++i)
-					out[count++] = base[i];
+					take(base[i], 0, i, 1.f, false);
 			}
 
 			if (mode == 0)
-				return count;
+				return finish();
 
 			// Family 1 (":w"), at modes 1 and 3: same columns, whole matrix divided by the
 			// MEASURED |column 3 xyz| so the recovered w is eye-space depth in guest units.
@@ -2710,13 +3465,8 @@ namespace RemixSubmit
 				const u32 n = build_screen_hypotheses(corrected, vp, reference_aspect, column_major,
 					source, ucode_hash, variant, base);
 
-				for (u32 i = 0; i < n && count < max_camera_hypotheses; ++i)
-				{
-					out[count] = base[i];
-					out[count].scale_w = divisor;
-					out[count].swap_zw = swap;
-					++count;
-				}
+				for (u32 i = 0; i < n; ++i)
+					take(base[i], variant, i, divisor, swap);
 			};
 
 			if (want_plain_scaled)
@@ -2725,7 +3475,7 @@ namespace RemixSubmit
 			if (want_swapped)
 				emit(true, 2);
 
-			return count;
+			return finish();
 		}
 
 		// The one place a hypothesis is turned into a matrix. Three call sites compose these two
@@ -2735,6 +3485,13 @@ namespace RemixSubmit
 		// set places its draws in a slightly different world than the frame camera places the
 		// rest. The depth correction runs FIRST; normalize_screen_clip's offsets are expressed
 		// against the column 3 that normalize_clip_depth has already settled.
+		//
+		// hyp.flip_y is DELIBERATELY NOT READ HERE. There is no matrix that produces a projection
+		// with m[1][1] < 0 -- try_split_once derives `up` from column 1, so up . col1 > 0 for every
+		// input -- so the Y-flip is consumed by split_view_projection_direct's flip_up instead. The
+		// consequence is worth stating where someone will hit it: a ":yf" hypothesis and its parent
+		// produce the SAME normalised matrix, hence the same clip solver, hence the same recovered
+		// world and the same CAMTEST alpha. Only the published camera differs.
 		remix_ps2::mat4 apply_camera_hypothesis(const remix_ps2::mat4& oriented, const camera_hypothesis& hyp)
 		{
 			return remix_ps2::normalize_screen_clip(
@@ -2876,23 +3633,29 @@ namespace RemixSubmit
 		//
 		//   published candidates            32   (RemixVU1Capture::max_candidates)
 		//   x majorness                      2
-		//   x hypotheses                    14   (max_camera_hypotheses)
-		//                                = 896   triples per window under CAMTESTALL = 1
+		//   x hypotheses                    28   (max_camera_hypotheses)
+		//                               = 1792   triples per window under CAMTESTALL = 1
 		//   + probe windows                 61   (64-qword snapshot, 4-qword sliding window)
-		//     x 2 x 14                  = 1708   additional triples under CAMTESTALL = 2
-		//                                = 2604  worst case
+		//     x 2 x 28                  = 3416   additional triples under CAMTESTALL = 2
+		//                               = 5208   worst case
 		//
-		// RAISED 2048 -> 8192 alongside PCSX2_REMIX_CAMDEPTH, and not merely to clear 2604. The
-		// last session's own heartbeat read "Candidates 2048 of 2048, 5721 evicted with history"
-		// -- the table was ALREADY full and thrashing at the old capacity, because the identity
-		// folds mem_offset and start_pc and the scan/slice sources churn both. Every one of those
-		// 5721 evictions reset a drift history, which is the measurement that is supposed to be
-		// judging the hypotheses. Doubling the family on top of a table that was already
-		// overflowing would have corrupted the very reading this change exists to take. 8192 is
-		// 3.1x the new worst case and 4x the old capacity, so the churn has somewhere to go.
+		// RAISED 2048 -> 8192 alongside PCSX2_REMIX_CAMDEPTH, and not merely to clear the 2604 that
+		// was the worst case then. That session's own heartbeat read "Candidates 2048 of 2048, 5721
+		// evicted with history" -- the table was ALREADY full and thrashing at the old capacity,
+		// because the identity folds mem_offset and start_pc and the scan/slice sources churn both.
+		// Every one of those 5721 evictions reset a drift history, which is the measurement that is
+		// supposed to be judging the hypotheses.
 		//
-		// ~4 MB of zero-initialised BSS; pages are only touched by the slots actually used.
-		constexpr u32 camtest_candidate_slots = 8192;
+		// RAISED AGAIN 8192 -> 16384 alongside PCSX2_REMIX_CAMYFLIP, for that same reason and not
+		// for comfort. The Y-flip twins double max_camera_hypotheses from 14 to 28, which doubles
+		// the worst case from 2604 to 5208 -- against 8192 that is only 1.6x of headroom, where the
+		// figure judged sufficient last time was 3.1x, and the churn the eviction counter measured
+		// is unchanged. Adding hypotheses on top of a table that cannot hold them corrupts the very
+		// drift measurement the new hypotheses exist to be judged by. 16384 restores 3.1x.
+		//
+		// ~8.5 MB of zero-initialised BSS; pages are only touched by the slots actually used, so at
+		// CAMYFLIP = 0 (the default, no twins) the resident cost is what it was.
+		constexpr u32 camtest_candidate_slots = 16384;
 
 		// Per-pair medians retained per candidate; the reported score is the median of these, so one
 		// bad pair cannot decide a ranking.
@@ -3416,7 +4179,8 @@ namespace RemixSubmit
 		// hypothesis) triple, i.e. O(triples x used) per window -- quadratic in exactly the two
 		// numbers this change increases. At the old 2048 slots and ~1300 triples it was already
 		// touching ~170 KB per call; at 8192 slots and 2604 triples it would have been ~3.5 GB of
-		// pointer-chasing per window, tens of milliseconds on the GS thread. That is not merely
+		// pointer-chasing per window, tens of milliseconds on the GS thread -- and at today's
+		// 16384 slots against 5208 triples, four times that again. That is not merely
 		// slow: CAMTESTALL's own note says GS-thread cost moves frame pacing, frame pacing moves
 		// how far the eye turns between two windows, and the turn is alpha's denominator. The
 		// instrument would have been perturbing its own input.
@@ -3439,8 +4203,10 @@ namespace RemixSubmit
 		// another O(used) scan. The hand advances one slot per allocation and takes the first slot
 		// it lands on that was not written during the window being resolved, which is the property
 		// that actually matters (evicting a slot this window already noted would destroy the `now`
-		// half of a pair that is half-formed). At 8192 slots against 2604 triples the hand cannot
-		// lap a window, so that guard never has to fire more than a few steps.
+		// half of a pair that is half-formed). At 16384 slots against 5208 triples the hand cannot
+		// lap a window, so that guard never has to fire more than a few steps -- the ratio is 3.1x,
+		// unchanged from the 8192-against-2604 it was sized at, which is why doubling the family
+		// and doubling the table had to happen together.
 		u32 s_camtest_hand = 0;
 
 		void camtest_index_reset()
@@ -3710,7 +4476,7 @@ namespace RemixSubmit
 					camera_hypothesis hypotheses[max_camera_hypotheses];
 					const u32 hypothesis_count = build_camera_hypotheses(oriented, vp,
 						reference_aspect, major != 0, synthetic.source, synthetic.ucode_hash,
-						s_camdepth_active, s_camdepth_snap_active, hypotheses);
+						s_camdepth_active, s_camdepth_snap_active, s_camyflip_active, hypotheses);
 
 					for (u32 h = 0; h < hypothesis_count; ++h)
 					{
@@ -3834,8 +4600,10 @@ namespace RemixSubmit
 				bool frozen;
 			};
 
-			// static, not a local: at camtest_candidate_slots = 8192 this is a 128 KB array and the
-			// GS thread's stack is not the place for it. Called from one thread, once per round.
+			// static, not a local: camtest_row is 32 bytes after padding, so at
+			// camtest_candidate_slots = 16384 this is a 512 KB array and the GS thread's stack is
+			// not the place for it. Called from one thread, once per round. (The figure here read
+			// "128 KB at 8192 slots" and was wrong in both terms even then -- 8192 x 32 is 256 KB.)
 			static camtest_row rows[camtest_candidate_slots];
 			u32 count = 0;
 
@@ -3918,14 +4686,22 @@ namespace RemixSubmit
 			// Read 'distinct matrices' first. 1 or 2 means the ranked table below is one matrix
 			// under several hypotheses and the true view-projection is not in the set at all --
 			// go to the probe sweep (PCSX2_REMIX_CAMTESTALL = 2), not to more re-ranking.
-			INFO_LOG("Remix: CAMTEST set -- PCSX2_REMIX_CAMDEPTH = {} ({} hypotheses per candidate x "
-					 "majorness), PCSX2_REMIX_CAMTESTALL = {} ({}). {} ranked rows over {}{} "
+			// The family actually enumerated this window. Was
+			// `(s_camdepth_active == 0) ? hypothesis_slots : max_camera_hypotheses`, which stopped
+			// being the emitted count the moment max_camera_hypotheses grew a Y-flip dimension --
+			// a header that overstates the family makes the "scored per window approaches capacity"
+			// warning below unreadable, which is the one line that says the table is thrashing.
+			const u32 camtest_family_size = ((s_camdepth_active == 0) ? 1u : 2u) *
+											hypothesis_slots * ((s_camyflip_active > 0) ? 2u : 1u);
+
+			INFO_LOG("Remix: CAMTEST set -- PCSX2_REMIX_CAMDEPTH = {} / CAMYFLIP = {} ({} hypotheses "
+					 "per candidate x majorness), PCSX2_REMIX_CAMTESTALL = {} ({}). {} ranked rows over {}{} "
 					 "distinct matrices at {}{} distinct VU1 addresses. Scored per window: {:.0f} "
 					 "triples ({:.0f} published-candidate, {:.0f} probe-window); of those {:.0f} also "
 					 "cleared split+score, which is all the table held before CAMTESTALL. Table "
 					 "capacity {} -- if 'scored per window' approaches it, rows are being evicted and "
 					 "their histories reset.",
-				s_camdepth_active, (s_camdepth_active == 0) ? hypothesis_slots : max_camera_hypotheses,
+				s_camdepth_active, s_camyflip_active, camtest_family_size,
 				s_camtest_all_active,
 				(s_camtest_all_active == 0) ? "split+score survivors only" :
 					((s_camtest_all_active == 1) ? "every published candidate" :
@@ -4823,6 +5599,51 @@ namespace RemixSubmit
 				const float scale_limit = env_float_signed(L"PCSX2_REMIX_CAMSCALE", 8.f);
 				s_camera_scale_limit =
 					(std::isfinite(scale_limit) && scale_limit >= 1.f) ? scale_limit : 8.f;
+
+				// PCSX2_REMIX_CAMYFLIP, refreshed here and NOT anywhere on the draw path, for the
+				// same two reasons: the environment must not be touched per draw, and the frame
+				// election and the per-draw solver must enumerate and score the same family.
+				// env_int_live, never `static const` and never live_int -- the renderer goes live
+				// ~0.2 s before the per-game .conf is applied and live_int re-parses only on a
+				// generation counter the .conf does not bump. Six measurements on this project have
+				// been lost to that; this is not a place to be clever.
+				const int yflip_mode = camyflip_mode();
+
+				if (yflip_mode != s_camyflip_logged_mode)
+				{
+					s_camyflip_logged_mode = yflip_mode;
+					INFO_LOG("Remix: PCSX2_REMIX_CAMYFLIP = {} ({}). m[1][1] of the recovered "
+							 "projection was POSITIVE BY CONSTRUCTION: try_split_once builds `up` "
+							 "as the perpendicular component of up_hint, and up_hint is unprojected "
+							 "from ndc (0,+1,0.5), so up . col1 > 0 for EVERY matrix under EVERY "
+							 "hypothesis -- and score_perspective's m[1][1] < 0 dock had therefore "
+							 "never fired once. Negating scale_y does not reach it (it flips col1 "
+							 "and up_hint together, so what actually moves is m[0][0] -- that is "
+							 "the whole of the ndc/R=5.00 vs ndcY/R=4.50 gap in this project's own "
+							 "dump). The bit lives in the BASIS instead: a ':yf' twin takes `up` "
+							 "with the opposite sign, which negates row 1 of the projection and "
+							 "nothing else. WHAT CANNOT MOVE: the fused matrix is untouched, so a "
+							 "':yf' row's clip solver, recovered world and CAMTEST alpha are "
+							 "bit-identical to its parent's -- if they differ, this claim is wrong. "
+							 "WHAT DOES MOVE: the published camera becomes a vertical mirror with a "
+							 "negated m[1][1] compensating it. AT MODES 2 AND 3 THIS CAN CHANGE THE "
+							 "PICTURE -- 2 removes both sign docks so hypotheses that differed only "
+							 "by the 0.5 handedness dock now tie, and 3 makes every ':yf' twin "
+							 "outrank its parent by 1.0 and be elected.",
+						yflip_mode,
+						(yflip_mode == 0)
+							? "off -- no twins, shipped sign weights, family unchanged"
+							: ((yflip_mode == 1)
+									  ? "twins enumerated, shipped sign weights (a twin scores 1.0 "
+										"below its parent and provably cannot be elected)"
+									  : ((yflip_mode == 2)
+												? "twins enumerated, NEITHER sign scored"
+												: "twins enumerated, a POSITIVE m[1][1] docked 1.0 "
+												  "-- the twins win")));
+				}
+
+				s_camyflip_active = yflip_mode;
+				s_camyflip_sign_active = camyflip_sign_policy(yflip_mode);
 			}
 
 			RemixVU1Capture::Frame frame{};
@@ -4895,6 +5716,12 @@ namespace RemixSubmit
 			const char* best_name = "";
 			bool best_transposed = false;
 
+			// The elected hypothesis' Y-flip, carried so the WORLDFIX re-split below reproduces the
+			// SAME factorisation it is correcting. Re-splitting a flipped winner without it would
+			// silently un-flip the published camera while WORLDFIX's log claimed only handedness
+			// had moved.
+			bool best_flip_y = false;
+
 			// The quantity the election maximises. It IS best_score under every mode but
 			// PCSX2_REMIX_CAMTEST = 2, which replaces it with a measured-drift rank; best_score is
 			// still recorded either way, because the hysteresis and the logging read it.
@@ -4933,7 +5760,7 @@ namespace RemixSubmit
 					camera_hypothesis hypotheses[max_camera_hypotheses];
 					const u32 hypothesis_count = build_camera_hypotheses(oriented, vp, reference_aspect,
 						major != 0, candidate.source, candidate.ucode_hash, s_camdepth_active,
-						s_camdepth_snap_active, hypotheses);
+						s_camdepth_snap_active, s_camyflip_active, hypotheses);
 
 					for (u32 h = 0; h < hypothesis_count; ++h)
 					{
@@ -4956,7 +5783,7 @@ namespace RemixSubmit
 
 						remix_ps2::vp_split split{};
 						remix_ps2::split_stage stage = remix_ps2::split_stage::accepted;
-						if (!remix_ps2::split_view_projection_direct(normalized, split, &stage))
+						if (!remix_ps2::split_view_projection_direct(normalized, split, &stage, hyp.flip_y))
 						{
 							++s_stats.cam_reject_split;
 							++s_stats.cam_split_stage[static_cast<u32>(stage)];
@@ -4966,7 +5793,8 @@ namespace RemixSubmit
 							continue;
 						}
 
-						float score = remix_ps2::score_perspective(split.projection, reference_aspect);
+						float score = remix_ps2::score_perspective(split.projection, reference_aspect,
+							s_camyflip_sign_active);
 						if (dump)
 							fmt::format_to(std::back_inserter(detail), " {}/{}={:.2f}", hyp.name, major ? 'C' : 'R', score);
 
@@ -5036,7 +5864,20 @@ namespace RemixSubmit
 						// note and therefore the measured drift -- so they appear in the CAMTEST
 						// table with a real alpha and can be compared against the incumbent before
 						// anything is staked on them. They simply cannot win.
-						const bool election_eligible = (candidate.source < 6) || (divcam > 0);
+						//
+						// PCSX2_REMIX_CAMYFLIP = 1 is audit-only in the same sense, and it is gated
+						// EXPLICITLY here rather than left to the 1.0 score gap between a ":yf" twin
+						// and its parent. The gap does hold under shape ranking -- and it does NOT
+						// hold under PCSX2_REMIX_CAMTEST = 2, where `rank` above comes from the
+						// drift table (~1e6) instead of `score` (~100). Parent and twin are separate
+						// camtest identities with separate histories, so a window in which the twin
+						// has reached camtest_min_pairs and the parent has not (or has just been
+						// evicted by the CLOCK hand) hands the twin a 1e6 rank against the parent's
+						// 100 and elects it. That is a race, not a measurement, and CAMTEST = 2 is
+						// exactly the mode a CAMYFLIP = 1 audit would be run in. Modes 2 and 3 lift
+						// the gate: at those the twin is meant to be electable.
+						const bool election_eligible = ((candidate.source < 6) || (divcam > 0)) &&
+													   (!hyp.flip_y || s_camyflip_active >= 2);
 
 						if (election_eligible && rank > best_rank)
 						{
@@ -5049,6 +5890,7 @@ namespace RemixSubmit
 							best_source = candidate.source;
 							best_name = hyp.name;
 							best_transposed = (major != 0);
+							best_flip_y = hyp.flip_y;
 							best_camtest_key = camtest_key;
 						}
 					}
@@ -5085,19 +5927,25 @@ namespace RemixSubmit
 			// drawing with the previous camera, and so is still described by its row.
 			s_camtest_elected_key = best_camtest_key;
 
-			// --- PCSX2_REMIX_WORLDFIX: the one sign the hypothesis set cannot reach ---------------
+			// --- PCSX2_REMIX_WORLDFIX: the one sign the hypothesis MATRIX cannot reach -------------
 			//
-			// m[1][1] of the recovered projection is POSITIVE BY CONSTRUCTION and no hypothesis can
-			// change it. try_split_once takes up = forward x (up_hint x forward), which is just the
-			// component of up_hint perpendicular to forward, and up_hint is by definition the world
-			// direction in which clip y increases -- so up . col1 > 0 always. Negating scale_y does
-			// flip col1, but it also flips up_hint, hence right and up, and the two flips cancel
-			// there. What does NOT cancel is m[0][0]: the sign of scale_x or scale_y flips it either
-			// way. So the hypothesis set spans exactly TWO of the four sign combinations, m[0][0] is
-			// the only free bit, and score_perspective merely docks 0.5 for it
-			// (RemixTransforms.cpp:502-503) -- a penalty the +100 source bonus above swamps
-			// completely. (The `m[1][1] < 0` penalty on the next line there is unreachable from this
-			// path for the same reason.)
+			// m[1][1] of the recovered projection is POSITIVE BY CONSTRUCTION and no hypothesis
+			// MATRIX can change it. try_split_once takes up = forward x (up_hint x forward), which is
+			// just the component of up_hint perpendicular to forward, and up_hint is by definition
+			// the world direction in which clip y increases -- so up . col1 > 0 always. Negating
+			// scale_y does flip col1, but it also flips up_hint, hence right and up, and the two
+			// flips cancel there. What does NOT cancel is m[0][0]: the sign of scale_x or scale_y
+			// flips it either way. So the hypothesis set spans exactly TWO of the four sign
+			// combinations, m[0][0] is the only free bit here, and score_perspective merely docks
+			// 0.5 for it -- a penalty the +100 source bonus above swamps completely.
+			//
+			// AMENDED 2026-08-17: the `m[1][1] < 0` dock is no longer unreachable. The bit it needs
+			// is not in the matrix at all, it is in the BASIS -- split_view_projection_direct's
+			// flip_up takes `up` with the opposite sign, which negates row 1 of the projection and
+			// nothing else. PCSX2_REMIX_CAMYFLIP enumerates that as a ":yf" twin of every
+			// hypothesis. It is a different quantity from the flip below and the two compose: this
+			// one mirrors the recovered WORLD (a real change to every un-projected vertex), the
+			// Y-flip mirrors the published CAMERA and leaves the world untouched.
 			//
 			// That bit is the recovered world's HANDEDNESS. Getting it wrong mirrors the recovered
 			// world about the plane spanned by the camera's forward and up axes -- a plane whose
@@ -5126,8 +5974,11 @@ namespace RemixSubmit
 					for (u32 i = 0; i < 4; ++i)
 						flipped.m[i][0] = -flipped.m[i][0];
 
+					// best_flip_y, not `false`: the re-split has to reproduce the elected
+					// hypothesis' own factorisation, or a WORLDFIX correction applied to a ":yf"
+					// winner would quietly un-mirror the published camera as a side effect.
 					remix_ps2::vp_split reflected{};
-					if (remix_ps2::split_view_projection_direct(flipped, reflected))
+					if (remix_ps2::split_view_projection_direct(flipped, reflected, nullptr, best_flip_y))
 					{
 						best_normalized = flipped;
 						best_split = reflected;
@@ -5793,7 +6644,8 @@ namespace RemixSubmit
 				// refreshes s_camtest_active.
 				camera_hypothesis hypotheses[max_camera_hypotheses];
 				const u32 hypothesis_count = build_camera_hypotheses(oriented, vp, reference_aspect,
-					major != 0, 0, 0, s_camdepth_active, s_camdepth_snap_active, hypotheses);
+					major != 0, 0, 0, s_camdepth_active, s_camdepth_snap_active, s_camyflip_active,
+					hypotheses);
 
 				for (u32 h = 0; h < hypothesis_count; ++h)
 				{
@@ -5801,11 +6653,24 @@ namespace RemixSubmit
 
 					const remix_ps2::mat4 normalized = apply_camera_hypothesis(oriented, hyp);
 
-					remix_ps2::vp_split split{};
-					if (!remix_ps2::split_view_projection_direct(normalized, split))
+					// PCSX2_REMIX_CAMYFLIP = 1 is audit-only, and the frame election gates that
+					// explicitly rather than trusting the score gap. This path ranks by score alone,
+					// so the gap would in fact hold here -- but the two paths must not disagree
+					// about which hypotheses are installable, and an invariant that holds "for now,
+					// on this path" is what let the twin slip past the election under CAMTEST = 2.
+					if (hyp.flip_y && s_camyflip_active < 2)
 						continue;
 
-					const float score = remix_ps2::score_perspective(split.projection, reference_aspect);
+					remix_ps2::vp_split split{};
+					if (!remix_ps2::split_view_projection_direct(normalized, split, nullptr, hyp.flip_y))
+						continue;
+
+					// s_camyflip_sign_active, not camyflip_sign_policy(camyflip_mode()): same rule
+					// as s_camdepth_active above -- the draw path must not read the environment, and
+					// a per-draw camera scored under a different sign policy than the frame camera
+					// can prefer a different hypothesis and place its draws in a different world.
+					const float score = remix_ps2::score_perspective(split.projection, reference_aspect,
+						s_camyflip_sign_active);
 					if (!(score > 0.f))
 						continue;
 
@@ -6132,6 +6997,14 @@ namespace RemixSubmit
 				return;
 			}
 
+			// Load the title environment before create_debug_scene() creates any lights. The first
+			// frame used to build the GUI-default key, then apply SCUS-97545.conf only after Present;
+			// DestroyLight is asynchronous, so avoiding that transient handle entirely is safer than
+			// relying on its removal from the runtime's next scene.
+			remix_ps2::materials::refresh_categories();
+			remix_ps2::materials::refresh_game_config(s_remix);
+			remix_ps2::paths::apply_live_knobs();
+
 			if (no_debug_scene())
 			{
 				WARNING_LOG("Remix: PCSX2_REMIX_NODEBUGSCENE -- no debug mesh and no debug light "
@@ -6455,20 +7328,27 @@ namespace RemixSubmit
 			return value;
 		}
 
-		// PS2 ATST -> D3D9 D3DCMPFUNC, which is the vocabulary the D3D9-shaped Remix API uses.
+		// PS2 ATST -> VkCompareOp.
+		//
+		// NOT D3DCMPFUNC, despite the D3D9-shaped API. rtx_remix_api.cpp:946 casts this field
+		// STRAIGHT to VkCompareOp with no translation, and the two enums differ by one
+		// throughout (D3D NEVER=1 vs VK_COMPARE_OP_NEVER=0). Sending D3D values shifted every
+		// alpha test by one comparison.
 		// GS_ATST: NEVER 0, ALWAYS 1, LESS 2, LEQUAL 3, EQUAL 4, GEQUAL 5, GREATER 6, NOTEQUAL 7.
+		// VkCompareOp: NEVER 0, LESS 1, EQUAL 2, LESS_OR_EQUAL 3, GREATER 4, NOT_EQUAL 5,
+		//              GREATER_OR_EQUAL 6, ALWAYS 7.
 		u32 to_d3d_compare(u32 atst)
 		{
 			switch (atst)
 			{
-				case 0: return 1; // NEVER
-				case 1: return 8; // ALWAYS
-				case 2: return 2; // LESS
-				case 3: return 4; // LESSEQUAL
-				case 4: return 3; // EQUAL
-				case 5: return 7; // GREATEREQUAL
-				case 6: return 5; // GREATER
-				default: return 6; // NOTEQUAL
+				case 0: return 0; // NEVER
+				case 1: return 7; // ALWAYS
+				case 2: return 1; // LESS
+				case 3: return 3; // LESS_OR_EQUAL
+				case 4: return 2; // EQUAL
+				case 5: return 6; // GREATER_OR_EQUAL
+				case 6: return 4; // GREATER
+				default: return 5; // NOT_EQUAL
 			}
 		}
 
@@ -6478,11 +7358,32 @@ namespace RemixSubmit
 		// stated plainly because it is an approximation, not a translation.
 		void to_d3d_blend(const GIFRegALPHA& alpha, u32& src_factor, u32& dst_factor)
 		{
-			// D3DBLEND: ZERO 1, ONE 2, SRCALPHA 5, INVSRCALPHA 6, DESTALPHA 7, INVDESTALPHA 8.
-			const u32 c_factor = (alpha.C == 0) ? 5u : (alpha.C == 1) ? 7u : 2u; // As / Ad / FIX~ONE
-			const u32 inv_c_factor = (alpha.C == 0) ? 6u : (alpha.C == 1) ? 8u : 1u;
+			// VkBlendFactor, NOT D3DBLEND: rtx_remix_api.cpp:957-962 casts these fields straight to
+			// VkBlendFactor. ZERO 0, ONE 1, SRC_ALPHA 6, ONE_MINUS_SRC_ALPHA 7, DST_ALPHA 8,
+			// ONE_MINUS_DST_ALPHA 9. Sending D3D values turned every alpha blend in the game into
+			// a different equation entirely (D3D SRCALPHA=5 reads as ONE_MINUS_DST_COLOR).
+			const u32 c_factor = (alpha.C == 0) ? 6u : (alpha.C == 1) ? 8u : 1u; // As / Ad / FIX~ONE
+			const u32 inv_c_factor = (alpha.C == 0) ? 7u : (alpha.C == 1) ? 9u : 0u;
 
-			if (alpha.A == 0 && alpha.B == 1 && alpha.D == 1)
+			// A == B makes the (A - B) term identically zero, so the result is D alone and the
+			// C factor is irrelevant. R6 3's projected wall shadows draw with A0 B0 C0 D1, i.e.
+			// "output = destination" -- they contribute nothing and exist only to exercise the
+			// GS pipeline. Falling through to the alpha-blend default below rendered them as an
+			// opaque SRCALPHA lerp of an untextured (white) surface, which is the white bodies
+			// standing proud of the wall. Map the degenerate case faithfully instead.
+			// NARROWED (2026-08-25): only D == 1 is handled here. Mapping the other two D values
+			// faithfully -- D0 to an opaque source replacement, D2 to black -- flipped a large
+			// population of ordinary draws off alpha blending and made the image flicker hard.
+			// D1 is the case actually diagnosed (R6 3's shadow decals, A0 B0 C0 D1 = "output is
+			// the destination", a draw that contributes nothing), and it is unambiguous. The
+			// other two fall through to the historical default until someone measures them.
+			if (alpha.A == alpha.B && alpha.D == 1)
+			{
+				// (A - B) is identically zero, so the result is D alone: keep the destination.
+				src_factor = 0u; // VK_BLEND_FACTOR_ZERO
+				dst_factor = 1u; // VK_BLEND_FACTOR_ONE
+			}
+			else if (alpha.A == 0 && alpha.B == 1 && alpha.D == 1)
 			{
 				// Cs*C + Cd*(1-C): the standard blend.
 				src_factor = c_factor;
@@ -6492,13 +7393,13 @@ namespace RemixSubmit
 			{
 				// Cs*C + Cd: additive.
 				src_factor = c_factor;
-				dst_factor = 2u; // ONE
+				dst_factor = 1u; // VK_BLEND_FACTOR_ONE
 			}
 			else if (alpha.A == 0 && alpha.B == 2 && alpha.D == 2)
 			{
 				// Cs*C: modulate against nothing.
 				src_factor = c_factor;
-				dst_factor = 1u; // ZERO
+				dst_factor = 0u; // VK_BLEND_FACTOR_ZERO
 			}
 			else
 			{
@@ -6764,10 +7665,9 @@ namespace RemixSubmit
 			if (mode == 3)
 				return !depth_write && samples_target && ((limit == 0) || (draw_ordinal < limit));
 
-			// Mode 4: the whole backdrop BAND -- no depth WRITE, within the first SKYORDER draws,
-			// with no requirement on the texture. Mode 1 is this minus depth READ, which SOCOM's
-			// backdrop uses, and mode 3 additionally demands a render-target texture, which catches
-			// the cloud quad but not the sun sprite beside it (a plain 8x8 texture).
+			// Mode 4: the backdrop band. With a measured distance floor armed, the guest submits
+			// paired color/depth halves at the same screen bounds; both must use the sky solver.
+			// Without that floor, retain the historical depth-write guard for other titles/configs.
 			//
 			// Needed because a by-hash tag CANNOT do this job. rtx.skyBoxTextures sets the Remix
 			// instance CATEGORY, but the thing that actually anchors a backdrop is the sky_solver's
@@ -6782,7 +7682,16 @@ namespace RemixSubmit
 			// SKYMINW, a far-distance floor, and when it is armed the ordinal above is released to
 			// 0 so it cannot cut the dome off first. Full measurement at sky_min_w().
 			if (mode == 4)
+			{
+				// The floor check above already proved every vertex is in the measured far field.
+				// Highwire's textured depth-write=1 color half is immediately paired with a
+				// depth-write=0 half; leaving the former world-classified splits the backdrop and
+				// leaves its texture on the camera-relative path.
+				if (min_w_required > 0.f)
+					return true;
+
 				return !depth_write && ((limit == 0) || (draw_ordinal < limit));
+			}
 
 			if (mode == 2)
 			{
@@ -6795,6 +7704,94 @@ namespace RemixSubmit
 				return false;
 
 			return (limit == 0) || (draw_ordinal < limit);
+		}
+
+		// --- sky by texture hash, resolved BEFORE the solver is chosen -----------------------
+		//
+		// A rtx.skyBoxTextures tag already reaches the instance: build_draw_state ORs
+		// materials::categories_for(material_hash) into the category flags. But that is all it
+		// did, and it is not enough. The category is keyed on the material hash, and the material
+		// hash does not exist until materials::bind() runs -- which happens AFTER the solver has
+		// been picked. So a tagged backdrop still got the world solver, i.e. it still carried the
+		// eye translation, which is what "I tagged it as sky and it still follows me / it
+		// disappears at some angles" has meant on every title that tried it.
+		//
+		// classify_sky's mode 4 comment states that as a permanent constraint ("a by-hash tag
+		// CANNOT do this job"). It is not one. It is a description of the ORDERING, and
+		// materials::hash_only() exists precisely to compute bind()'s exact key without binding.
+		// Resolve the hash here instead, and let a SKY tag force classification the same way
+		// cloud_sky_draw already does.
+		//
+		// MEASURED, Rainbow Six 3, Alcatraz, logs\remix_draws.txt 2026-08-24, f=11090 d=0: the
+		// backdrop is mat 8A5CE8DF66AF2637, 50 verts, w [0.0192, 0.489], fullscreen 3100x1875 px,
+		// depth(r=1 w=1). EVERY geometric mode misses it -- mode 1 wants depth-neutral, mode 3
+		// wants a render-target source, mode 4's SKYMINW is a FAR floor while this backdrop sits
+		// NEARER than the world, and mode 2 (pure ordinal) also swept up the world draw d=1
+		// (mat C6D48D406868B228, 34x75 px). The same hash is the backdrop on save state 7 as well,
+		// so the tag list is the only rule here that both fits and survives a level change.
+		//
+		// COST, and why this is not on the hot path. hash_only() runs the same HashTextureLevel
+		// unswizzle-and-hash as bind(), which the materials stats line measures at 1.7-2.6 us per
+		// call. Two guards:
+		//
+		//   * the tag table must actually hold a SKY tag (tagged_category_mask(), one AND). A
+		//     title with no sky tag pays a single test per draw and nothing else. SOCOM is
+		//     unaffected twice over: it keeps mode 4 + SKYMINW, and its sky IS a render target,
+		//     for which hash_only() returns 0 by design.
+		//   * one memo entry per (source, frame), dropped when the frame or the tag generation
+		//     moves. Draws re-sample the same handful of Source objects, so this collapses to
+		//     roughly one hash per distinct texture per frame.
+		//
+		// The watchdog is the existing "hash N ms (x us/bind)" figure on the materials line --
+		// compare it before and after. Note also that this path calls categories_for(), so the
+		// "tags N hits M" counter now includes these probes; it was never a usable criterion for
+		// this title anyway (the view-model tag matches the weapon every single frame).
+		bool hash_tagged_sky(const GSTextureCache::Source* source)
+		{
+			const bool armed = (remix_ps2::materials::tagged_category_mask() &
+								   static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY)) != 0;
+
+			// Logged on CHANGE rather than at first use, for the PERDRAWCAM reason: the first call
+			// legitimately happens before the per-game conf has been applied, so a one-shot log
+			// would report "no sky tags" and be wrong in the file the user reads to check the tag
+			// list loaded. The tag lists are also re-read live, so this can flip mid-session.
+			static int logged_armed = -1;
+			if (const int now = armed ? 1 : 0; now != logged_armed)
+			{
+				logged_armed = now;
+				INFO_LOG("Remix: sky-by-hash {} -- {}", armed ? "ARMED" : "idle",
+					armed ? "a rtx.skyBoxTextures tag now forces the sky solver before the solver "
+							"is picked; count it on the stats line as sky_hash" :
+							"no texture carries the SKY category, so no draw is hashed for it");
+			}
+
+			if (!source || !armed)
+				return false;
+
+			static std::unordered_map<const void*, bool> cache;
+			static u64 cache_frame = ~0ull;
+			static u64 cache_generation = 0;
+
+			const u64 tag_generation = remix_ps2::materials::generation();
+			if (cache_frame != s_frame_counter || cache_generation != tag_generation)
+			{
+				cache.clear();
+				cache_frame = s_frame_counter;
+				cache_generation = tag_generation;
+			}
+
+			if (const auto found = cache.find(static_cast<const void*>(source)); found != cache.end())
+				return found->second;
+
+			// 0 for a render-target source by design, and categories_for(0) is 0 -- so an
+			// RT-sourced draw can never be tagged this way, which is correct: a render target has
+			// no stable content identity for a tag to key on.
+			const u64 content_hash = remix_ps2::materials::hash_only(source);
+			const bool sky = (remix_ps2::materials::categories_for(content_hash) &
+								 static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY)) != 0;
+
+			cache.emplace(static_cast<const void*>(source), sky);
+			return sky;
 		}
 
 		// --- per-draw state dump ------------------------------------------------------------
@@ -7834,12 +8831,12 @@ namespace RemixSubmit
 		};
 
 		draw_state build_draw_state(const draw_regs& regs, u64 material_hash, u64 draw_ordinal,
-			bool untextured)
+			bool untextured, bool force_sky)
 		{
 			const bool depth_read = regs.depth_read;
 			const bool depth_write = regs.depth_write;
-			const bool is_sky = classify_sky(depth_read, depth_write, draw_ordinal, regs.samples_target,
-				regs.min_w);
+			const bool is_sky = force_sky || classify_sky(depth_read, depth_write, draw_ordinal,
+				regs.samples_target, regs.min_w);
 
 			// The user's own tags, from the Remix conf layers. dxvk-remix only applies its hash
 			// lists on the native D3D9 path (setupCategoriesForTexture, rtx_types.cpp:348, whose one
@@ -7856,10 +8853,10 @@ namespace RemixSubmit
 			blend.alphaTestCompareOp = to_d3d_compare(regs.atst);
 			blend.alphaBlendEnabled = regs.abe ? 1 : 0;
 			to_d3d_blend(regs.alpha, blend.srcColorBlendFactor, blend.dstColorBlendFactor);
-			blend.colorBlendOp = 1; // D3DBLENDOP_ADD
+			blend.colorBlendOp = 0; // VK_BLEND_OP_ADD (D3DBLENDOP_ADD is 1; the runtime casts to VkBlendOp)
 			blend.srcAlphaBlendFactor = blend.srcColorBlendFactor;
 			blend.dstAlphaBlendFactor = blend.dstColorBlendFactor;
-			blend.alphaBlendOp = 1;
+			blend.alphaBlendOp = 0; // VK_BLEND_OP_ADD
 			// TFX: MODULATE 0, DECAL 1, HIGHLIGHT 2, HIGHLIGHT2 3. Only the first two are
 			// expressible as a fixed-function stage; the highlight modes degrade to modulate.
 			//
@@ -7877,12 +8874,22 @@ namespace RemixSubmit
 			if (texture_stage_mode() != 0)
 			{
 				const bool decal = (regs.tfx == 1);
-				blend.textureColorArg1Source = 2; // D3DTA_TEXTURE
-				blend.textureColorArg2Source = 0; // D3DTA_DIFFUSE
-				blend.textureColorOperation = decal ? 2u : 4u; // SELECTARG1 : MODULATE
-				blend.textureAlphaArg1Source = 2;
-				blend.textureAlphaArg2Source = 0;
-				blend.textureAlphaOperation = decal ? 2u : 4u;
+				// RtTextureArgSource { None 0, Texture 1, VertexColor0 2, TFactor 3 } and
+				// DxvkRtTextureOperation { Disable 0, SelectArg1 1, SelectArg2 2, Modulate 3,
+				// Modulate2x 4, ... } -- the fork's OWN enums, cast to directly at
+				// rtx_remix_api.cpp:948-954. They are NOT D3DTA_/D3DTOP_ values.
+				//
+				// This was the flat-albedo defect: D3DTA_TEXTURE (2) read as VertexColor0, so the
+				// runtime was told to take surface colour from vertex colour and ignore the texture
+				// entirely -- exactly the reported "textures bind but carry no detail, the colour
+				// comes from vertex colour". D3DTOP_MODULATE (4) read as Modulate2x also doubled
+				// every surface's brightness, which is the washed-out look on top of it.
+				blend.textureColorArg1Source = 1; // Texture
+				blend.textureColorArg2Source = 2; // VertexColor0
+				blend.textureColorOperation = decal ? 1u : 3u; // SelectArg1 : Modulate
+				blend.textureAlphaArg1Source = 1; // Texture
+				blend.textureAlphaArg2Source = 2; // VertexColor0
+				blend.textureAlphaOperation = decal ? 1u : 3u;
 
 				// An untextured draw has no D3DTA_TEXTURE to read. MODULATE then multiplies diffuse
 				// by a texture that is not there and SELECTARG1 selects it outright -- either way
@@ -7897,8 +8904,8 @@ namespace RemixSubmit
 				// untextured draw has. Alpha likewise.
 				if (untextured)
 				{
-					blend.textureColorOperation = 3u; // D3DTOP_SELECTARG2 -> diffuse
-					blend.textureAlphaOperation = 3u;
+					blend.textureColorOperation = 2u; // SelectArg2 -> vertex colour
+					blend.textureAlphaOperation = 2u;
 				}
 			}
 			blend.tFactor = 0xFFFFFFFFu;
@@ -8508,8 +9515,8 @@ namespace RemixSubmit
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
 					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} offscreenrt {} | "
-					 "warn stq {} | cam world {} fallback {} skycam {} vmcam {} REFUSED {} | "
-					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} cutout {} | degen tris {} alldegen {} | "
+					 "warn stq {} | cam world {} fallback {} held {} expired {} skycam {} vmcam {} REFUSED {} | "
+					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} sky_hash {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
 					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
 				 "batch: mode {} groups/frame avg {} peak {} | surfaces peak {} verts peak {} meshes {}",
@@ -8520,10 +9527,10 @@ namespace RemixSubmit
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
 				s_stats.skip_minw, s_stats.skip_min_vertex_w, s_stats.skip_offscreen_rt,
-				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_sky, s_stats.cam_viewmodel,
+				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_held_gap, s_stats.cam_hold_expired, s_stats.cam_sky, s_stats.cam_viewmodel,
 				s_stats.cam_failed,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
-				s_stats.sky_tagged, s_stats.cutout_tagged, s_stats.degenerate_triangles,
+				s_stats.sky_tagged, s_stats.sky_hash, s_stats.cutout_tagged, s_stats.degenerate_triangles,
 				s_stats.skip_all_degenerate, s_stats.meshes_created_peak,
 				s_stats.meshes_destroyed_peak, s_stats.skip_inst_budget,
 				(s_stats.distinct_instanced_frames > 0) ?
@@ -8672,6 +9679,16 @@ namespace RemixSubmit
 			// lags, a held window rendered stale geometry from a moved eye -- which is the smear the
 			// user reported on turns, and the reason mode 2 exists.
 			const int hold_mode_now = hold_empty_mode();
+			INFO_LOG("Remix: overlay {}x{} | screen-ui seen {} nomat {} nondc {} | "
+					 "raster draws {} nopixels {} texels {} fullscreen {} | presents {} | "
+					 "DrawScreenOverlay {} | uiraster {} uimode {}",
+				s_overlay_w, s_overlay_h,
+				s_screen_ui_seen, s_screen_ui_nomat, s_screen_ui_nondc,
+				s_overlay_draws, s_overlay_nopixels, s_overlay_texels, s_overlay_fullscreen,
+				s_overlay_presents,
+				(s_remix.api().DrawScreenOverlay != nullptr) ? "available" : "NULL IN INTERFACE",
+				ui_raster_mode(), ui_mode());
+
 			INFO_LOG("Remix: hold-empty {} | empty windows {} held {} cam-held {} skipped-present {} "
 					 "instances {} | "
 					 "gap3 {} offcadence {} (last gap {}) | skip: consec {} nocam {} stale {} | "
@@ -8799,6 +9816,207 @@ namespace RemixSubmit
 		{
 			static live_int value(L"PCSX2_REMIX_SMOOTHNORMALS", 0, 0, 180);
 			return value.get();
+		}
+
+		// --- MOONFIT: recover the game's own light direction from its baked lighting -------
+		//
+		// SOCOM ships NO light table -- verified against every archive in the game: the full
+		// section-tag inventory (.SIZ ACTN AIMi ... SKB_ UI__ UNIV VAGS VALV WEAP ZANM ZRDR ZSND)
+		// contains no LGHT/LITE/LAMP/SUN tag of any kind. But the lighting is not missing, it is
+		// BAKED -- per-vertex, which is exactly what PCSX2_REMIX_VCOLOR reads. So the moon/sun the
+		// artists lit each level with is still recoverable, from the shading itself.
+		//
+		// Model: luminance ~ a + b * dot(N, L). That is LINEAR in (a, b*Lx, b*Ly, b*Lz), so no
+		// iteration is needed -- accumulate the 4x4 normal equations over the basis [1, Nx, Ny, Nz]
+		// and solve once. The light direction falls out as normalize(c1, c2, c3) and `b` (the
+		// vector length) is the directional contrast, which doubles as the confidence: a level lit
+		// flatly returns a near-zero length and should not be trusted.
+		//
+		// L points TOWARD the light. Remix's fallbackLightDirection is the direction light TRAVELS,
+		// so the logged vector is negated for direct paste into user.conf.
+		double s_moonfit_m[4][4] = {};
+		double s_moonfit_rhs[4] = {};
+		u64 s_moonfit_verts = 0;
+		int s_moonfit_windows = 0;
+
+		// THE SIGN ANCHOR. The fit alone cannot tell a light above from a light below: our meshes
+		// are doubleSided and smooth_scratch_normals() picks its sign from the flat normal, whose
+		// winding this game never guaranteed. If every normal is consistently inverted the solved
+		// direction is exactly negated -- elevation flips sign, azimuth rotates 180 -- and the fit
+		// looks just as confident either way. So measure something that cannot be ambiguous:
+		// compare mean baked luminance on up-facing vs down-facing surfaces. Outdoors the sky is
+		// the dominant source, so up-facing MUST be brighter. If it is not, normals are inverted
+		// and the recovered direction is negated before it is reported.
+		double s_moonfit_up_lum = 0.0, s_moonfit_down_lum = 0.0;
+		u64 s_moonfit_up_n = 0, s_moonfit_down_n = 0;
+
+		int moonfit_window()
+		{
+			static live_int value(L"PCSX2_REMIX_MOONFIT", 900, 0, 100000);
+			return value.get();
+		}
+
+		void solve_and_log_moon_fit()
+		{
+			// Below this the fit is noise; a single small mesh can bias a direction wildly.
+			if (s_moonfit_verts < 20000)
+				return;
+
+			double a[4][5];
+			for (int i = 0; i < 4; ++i)
+			{
+				for (int j = 0; j < 4; ++j)
+					a[i][j] = s_moonfit_m[i][j];
+				a[i][4] = s_moonfit_rhs[i];
+			}
+
+			// Gauss-Jordan with partial pivoting. Each column's pivot row is swapped into that
+			// column's own row, so after elimination row i belongs to variable i.
+			bool ok = true;
+			for (int col = 0; col < 4 && ok; ++col)
+			{
+				int piv = col;
+				for (int r = col + 1; r < 4; ++r)
+				{
+					if (std::abs(a[r][col]) > std::abs(a[piv][col]))
+						piv = r;
+				}
+
+				if (std::abs(a[piv][col]) < 1e-9)
+				{
+					ok = false;
+					break;
+				}
+
+				if (piv != col)
+				{
+					for (int j = 0; j <= 4; ++j)
+						std::swap(a[col][j], a[piv][j]);
+				}
+
+				for (int r = 0; r < 4; ++r)
+				{
+					if (r == col)
+						continue;
+
+					const double f = a[r][col] / a[col][col];
+					for (int j = col; j <= 4; ++j)
+						a[r][j] -= f * a[col][j];
+				}
+			}
+
+			if (ok)
+			{
+				const double c1 = a[1][4] / a[1][1];
+				const double c2 = a[2][4] / a[2][2];
+				const double c3 = a[3][4] / a[3][3];
+				const double len = std::sqrt((c1 * c1) + (c2 * c2) + (c3 * c3));
+
+				if (std::isfinite(len) && len > 1e-6)
+				{
+					double lx = c1 / len;
+					double ly = c2 / len;
+					double lz = c3 / len;
+
+					const double up_mean = (s_moonfit_up_n > 0)
+						? (s_moonfit_up_lum / static_cast<double>(s_moonfit_up_n)) : 0.0;
+					const double down_mean = (s_moonfit_down_n > 0)
+						? (s_moonfit_down_lum / static_cast<double>(s_moonfit_down_n)) : 0.0;
+
+					// Only trust the anchor when both populations are actually present.
+					const bool anchored = (s_moonfit_up_n > 500) && (s_moonfit_down_n > 500);
+					const bool inverted = anchored && (up_mean < down_mean);
+					if (inverted)
+					{
+						lx = -lx;
+						ly = -ly;
+						lz = -lz;
+					}
+					const double to_deg = 180.0 / 3.14159265358979323846;
+					const double elev = std::asin(std::clamp(ly, -1.0, 1.0)) * to_deg;
+					double azim = std::atan2(lx, lz) * to_deg;
+					if (azim < 0.0)
+						azim += 360.0;
+
+					INFO_LOG("Remix: MOONFIT over {} verts -- the level's BAKED light comes FROM "
+							 "elevation {:.1f} deg, azimuth {:.1f} deg, directional contrast {:.1f} "
+							 "of 255 (under ~3 the level is lit flat and this is noise). "
+							 "up-facing mean lum {:.1f} over {} verts vs down-facing {:.1f} over {} "
+							 "-- anchor {}, normals {}. Paste into user.conf: "
+							 "rtx.fallbackLightDirection = {:.4f}, {:.4f}, {:.4f} -- or set "
+							 "PCSX2_REMIX_KEYELEV = {:.0f} and PCSX2_REMIX_KEYAZIM = {:.0f}.",
+						s_moonfit_verts, elev, azim, len,
+						up_mean, s_moonfit_up_n, down_mean, s_moonfit_down_n,
+						anchored ? "usable" : "TOO FEW SAMPLES (direction sign unverified)",
+						inverted ? "INVERTED (direction negated)" : "as-submitted",
+						-lx, -ly, -lz, elev, azim);
+				}
+			}
+
+			s_moonfit_verts = 0;
+			s_moonfit_windows = 0;
+			s_moonfit_up_lum = 0.0;
+			s_moonfit_down_lum = 0.0;
+			s_moonfit_up_n = 0;
+			s_moonfit_down_n = 0;
+			for (int i = 0; i < 4; ++i)
+			{
+				s_moonfit_rhs[i] = 0.0;
+				for (int j = 0; j < 4; ++j)
+					s_moonfit_m[i][j] = 0.0;
+			}
+		}
+
+		void accumulate_moon_fit()
+		{
+			const int window = moonfit_window();
+			if (window == 0)
+				return;
+
+			for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+			{
+				const double nx = v.normal[0];
+				const double ny = v.normal[1];
+				const double nz = v.normal[2];
+				const double nlen2 = (nx * nx) + (ny * ny) + (nz * nz);
+
+				// Only unit normals carry a meaningful dot product. Degenerate and
+				// placeholder normals would otherwise drag the fit toward their own axis.
+				if (!std::isfinite(nlen2) || nlen2 < 0.9 || nlen2 > 1.1)
+					continue;
+
+				// Channel order is deliberately not assumed -- a plain mean over the three
+				// low bytes is order-independent, and only the DIRECTION of the fit matters.
+				const u32 c = v.color;
+				const double lum = (static_cast<double>(c & 0xFF) +
+									static_cast<double>((c >> 8) & 0xFF) +
+									static_cast<double>((c >> 16) & 0xFF)) / 3.0;
+
+				if (ny > 0.5)
+				{
+					s_moonfit_up_lum += lum;
+					++s_moonfit_up_n;
+				}
+				else if (ny < -0.5)
+				{
+					s_moonfit_down_lum += lum;
+					++s_moonfit_down_n;
+				}
+
+				const double basis[4] = {1.0, nx, ny, nz};
+				for (int i = 0; i < 4; ++i)
+				{
+					for (int j = 0; j < 4; ++j)
+						s_moonfit_m[i][j] += basis[i] * basis[j];
+
+					s_moonfit_rhs[i] += basis[i] * lum;
+				}
+
+				++s_moonfit_verts;
+			}
+
+			if (++s_moonfit_windows >= window)
+				solve_and_log_moon_fit();
 		}
 
 		void smooth_scratch_normals(float scene_scale)
@@ -8941,7 +10159,17 @@ namespace RemixSubmit
 		// --- classification gates -----------------------------------------------------------
 		// Order matters only for the counters: the first gate that refuses is the one blamed.
 
-		if (r.m_vt.m_primclass != GS_TRIANGLE_CLASS)
+		// PS2 text is drawn as SPRITES, not triangles, and this gate is the first one in the
+		// function -- so every glyph in the game was discarded ~900 lines before the screen-UI
+		// classifier could see it. That is why menu panels, icons and the button glyphs
+		// composited correctly while no text ever appeared: those are triangle-class, the text
+		// is not. Sprites are still never world geometry, so they are admitted ONLY as overlay
+		// candidates and are refused again below if the raster path does not consume them.
+		const bool sprite_class = (r.m_vt.m_primclass == GS_SPRITE_CLASS);
+		const bool sprite_ui_probe = sprite_class && r.m_process_texture &&
+			ui_mode() != 0 && ui_raster_mode() != 0;
+
+		if (r.m_vt.m_primclass != GS_TRIANGLE_CLASS && !sprite_ui_probe)
 		{
 			++s_stats.skip_not_triangle;
 			return;
@@ -8958,8 +10186,26 @@ namespace RemixSubmit
 		const bool untex_draw = !r.m_process_texture;
 		const bool fst_draw = !untex_draw && (r.PRIM->FST != 0);
 		const bool z_depth = untex_draw || fst_draw;
-		const bool fallback_screen_ui = !untex_draw && !s_active_camera.valid &&
-			(z_depth ? (r.m_vt.m_eq.z && (!fst_draw || !remix_ps2::nocam_enabled())) : r.m_vt.m_eq.q);
+		// TWO DIFFERENT QUESTIONS, and widening one of them broke the other.
+		//
+		// fallback_screen_ui answers "there is no camera, so treat this flat draw as a screen
+		// overlay": it forces w = 1 and the VIEW-SPACE tier. That must stay tied to
+		// !s_active_camera.valid. When UIMODE widened it, every distant flat quad -- a moon
+		// sprite, a billboard -- was pushed through the view-space tier at w = 1, i.e. placed at
+		// the eye, and vanished. That is why the moon disappeared.
+		//
+		// ui_candidate answers only "is this draw eligible for the 2D overlay rasteriser". It may
+		// be wide, because the raster path uses NDC and UVs and never touches w, and a draw it
+		// consumes returns before geometry submission anyway.
+		const bool flat_2d = (z_depth ? (r.m_vt.m_eq.z && (!fst_draw || !remix_ps2::nocam_enabled()))
+									  : r.m_vt.m_eq.q);
+		const bool fallback_screen_ui = !untex_draw && !s_active_camera.valid && flat_2d;
+		const bool ui_candidate = !untex_draw && ui_mode() != 0 && flat_2d;
+
+		// Counted at the point of CLASSIFICATION, so "the HUD is not being recognised as 2D" and
+		// "it is recognised but the rasteriser rejects it" stop looking identical in the log.
+		if (fallback_screen_ui)
+			++s_screen_ui_seen;
 
 		// Untextured: no texture means no Q was ever written, and also no material -- these come
 		// back from materials::bind() with the null binding and shade like Rainbow Six 3's white
@@ -8973,7 +10219,7 @@ namespace RemixSubmit
 		// FST=1: the guest fed direct UV texels, so Q is not the perspective divisor. Recoverable
 		// only if this title's Z has been shown to be a usable depth (see fst_z_solution), which
 		// is measured continuously from the FST=0 draws rather than assumed.
-		if (fst_draw && !fallback_screen_ui && !fst_z_solution(fst_z_a, fst_z_b))
+		if (fst_draw && !fallback_screen_ui && !ui_candidate && !fst_z_solution(fst_z_a, fst_z_b))
 		{
 			++s_stats.skip_fst;
 			return;
@@ -8988,7 +10234,7 @@ namespace RemixSubmit
 		// viewed exactly head-on is lost -- applied to the only varying quantity FST draws have.
 		// Applies to every Z-depth draw, textured or not: for an untextured draw Q is not merely
 		// the wrong divisor, it was never written, so testing it would pass everything through.
-		if (!fallback_screen_ui && (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q))
+		if (!fallback_screen_ui && !ui_candidate && (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q))
 		{
 			// Counted separately: "how many FST draws have no depth variation at all" is the
 			// number that decides whether depth-from-Z can recover geometry for this title or
@@ -9216,7 +10462,10 @@ namespace RemixSubmit
 		// World tier: positions are solved against the frame's fused matrix instead of being
 		// expressed in the synthetic camera's space. Both paths consume the same NDC, so the
 		// only difference is the three lines that turn (ndc, w) into a position.
-		const bool world_mode = s_active_camera.valid;
+		// A screen-UI draw must NOT be un-projected: its w is synthetic (1), so the world tier
+		// would place it at the eye. The view-space tier plus a camera-relative instance
+		// transform is what makes it an overlay.
+		const bool world_mode = s_active_camera.valid && !fallback_screen_ui;
 		const float position_limit = max_position_magnitude();
 
 		// --- which camera un-projects THIS draw (step 4A) ------------------------------------
@@ -9292,29 +10541,78 @@ namespace RemixSubmit
 		// way here and reporting it the other way on the dump line, and the loop's min_w likewise
 		// covers every vertex (a vertex that fails its finite/limit check drops the whole draw),
 		// so the two are the same number by construction.
+		const GSTextureCache::Source* const source =
+			static_cast<const GSTextureCache::Source*>(tex_source);
+		const bool cloud_rt_candidate = sky_mode() == 4 && sky_min_w() > 0.f && source &&
+			draw_samples_render_target(source) && !r.m_cached_ctx.DepthWrite() &&
+			source->m_TEX0.TW == 7 && source->m_TEX0.TH == 7 && index_count <= 12;
 		float sky_gate_min_w = 0.f;
+		float cloud_gate_max_w = -std::numeric_limits<float>::max();
+		float cloud_gate_min_px = std::numeric_limits<float>::max();
+		float cloud_gate_max_px = -std::numeric_limits<float>::max();
+		float cloud_gate_min_py = std::numeric_limits<float>::max();
+		float cloud_gate_max_py = -std::numeric_limits<float>::max();
+		float cloud_gate_min_u = std::numeric_limits<float>::max();
+		float cloud_gate_max_u = -std::numeric_limits<float>::max();
 		if (sky_min_w() > 0.f)
 		{
 			float scan_min_w = std::numeric_limits<float>::max();
+			const float scan_fst_inv_w =
+				1.0f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TW) / 16.0f;
 			for (u32 i = 0; i < vertex_count; ++i)
 			{
 				const GSVertex& v = verts[i];
 				const float q = fallback_screen_ui ? 1.f : (z_depth ?
 					static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
 					v.RGBAQ.Q);
-				scan_min_w = std::min(scan_min_w, 1.0f / q);
+				const float w = 1.0f / q;
+				scan_min_w = std::min(scan_min_w, w);
+
+				if (cloud_rt_candidate)
+				{
+					const float px = (static_cast<float>(v.XYZ.X) - ox) * (1.0f / 16.0f);
+					const float py = (static_cast<float>(v.XYZ.Y) - oy) * (1.0f / 16.0f);
+					const float u = fst_draw ? (static_cast<float>(v.U) * scan_fst_inv_w) : (v.ST.S * w);
+					cloud_gate_max_w = std::max(cloud_gate_max_w, w);
+					cloud_gate_min_px = std::min(cloud_gate_min_px, px);
+					cloud_gate_max_px = std::max(cloud_gate_max_px, px);
+					cloud_gate_min_py = std::min(cloud_gate_min_py, py);
+					cloud_gate_max_py = std::max(cloud_gate_max_py, py);
+					cloud_gate_min_u = std::min(cloud_gate_min_u, u);
+					cloud_gate_max_u = std::max(cloud_gate_max_u, u);
+				}
 			}
 
 			sky_gate_min_w = scan_min_w;
 		}
+		// Highwire's four cloud layers are near, blended 128x128 render-target quads. Their
+		// 620x264 coverage and U span of 3.35..3.65 distinguish them from the smaller target
+		// consumers later in the frame. They need the sky solver as well as a material snapshot;
+		// otherwise the textured quads remain camera-relative world panels.
+		const bool cloud_sky_draw = cloud_rt_candidate && cloud_gate_max_w > 0.f &&
+			cloud_gate_max_w < sky_min_w() && (cloud_gate_max_u - cloud_gate_min_u) >= 3.f &&
+			(cloud_gate_max_px - cloud_gate_min_px) >= 500.f &&
+			(cloud_gate_max_px - cloud_gate_min_px) <= 700.f &&
+			(cloud_gate_max_py - cloud_gate_min_py) >= 200.f &&
+			(cloud_gate_max_py - cloud_gate_min_py) <= 320.f;
+
+		// A rtx.skyBoxTextures tag, resolved here rather than left to the category merge, so that
+		// it selects the bias-zeroed sky solver below instead of only setting the instance's SKY
+		// bit after the geometry has already been un-projected with the eye translation in it.
+		// See hash_tagged_sky() for the measurement and the cost guards.
+		const bool hash_sky_draw = hash_tagged_sky(source);
+		if (hash_sky_draw)
+			++s_stats.sky_hash;
 
 		// classify_sky is evaluated again by build_draw_state below; it reads only the cached
 		// depth bits, s_submitted_this_frame and the draw's min w, none of which moves between
 		// here and there -- the min w passed there is the vertex loop's own, which the scan above
-		// reproduces exactly -- so the two agree by construction.
+		// reproduces exactly -- so the two agree by construction. The two forced paths
+		// (cloud_sky_draw, hash_sky_draw) are handed to it as force_sky for the same reason.
 		const bool sky_draw = sky_camera_enabled() &&
-			classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(), s_submitted_this_frame,
-				draw_samples_render_target(tex_source), sky_gate_min_w);
+			(cloud_sky_draw || hash_sky_draw ||
+				classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(),
+					s_submitted_this_frame, draw_samples_render_target(tex_source), sky_gate_min_w));
 
 		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : base_solver;
 
@@ -9369,6 +10667,25 @@ namespace RemixSubmit
 		const float fst_inv_w = 1.0f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TW) / 16.0f;
 		const float fst_inv_h = 1.0f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TH) / 16.0f;
 
+		// Hoisted: constant for the whole draw, and the vertex loop is the hottest code here.
+		const int rot_mode = world_mode ? world_rot_mode() : 0;
+		float cam_pos[3] = {0.f, 0.f, 0.f};
+		if (rot_mode != 0)
+		{
+			cam_pos[0] = s_active_camera.position[0];
+			cam_pos[1] = s_active_camera.position[1];
+			cam_pos[2] = s_active_camera.position[2];
+		}
+
+		// Tracked across the draw so a wholly transparent one can be dropped after the loop.
+		u32 max_vertex_alpha = 0;
+
+		// The overlay rasteriser needs screen-space positions, which only exist inside this loop.
+		if (ui_raster_mode() != 0)
+			s_scratch_ndc.resize((size_t)vertex_count * 2);
+		else
+			s_scratch_ndc.clear();
+
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
 			const GSVertex& v = verts[i];
@@ -9389,6 +10706,12 @@ namespace RemixSubmit
 				v.RGBAQ.Q);
 			const float w = 1.0f / q;
 
+			if (!s_scratch_ndc.empty())
+			{
+				s_scratch_ndc[(size_t)i * 2] = ndc_x;
+				s_scratch_ndc[((size_t)i * 2) + 1] = ndc_y;
+			}
+
 			remixapi_HardcodedVertex& out = s_scratch_vertices[i];
 
 			if (world_mode)
@@ -9398,9 +10721,9 @@ namespace RemixSubmit
 				// already carries the absolute depth, so x/y/w is exactly determined.
 				float world[3];
 				remix_ps2::solve_world_position(solver, ndc_x * w, ndc_y * w, w, world);
-				out.position[0] = world[0];
-				out.position[1] = world[1];
-				out.position[2] = world[2];
+
+				remix_ps2::apply_world_basis_rotation(
+					s_active_camera.view, cam_pos, rot_mode, world, out.position);
 			}
 			else
 			{
@@ -9419,6 +10742,7 @@ namespace RemixSubmit
 			// PS2 alpha is 0..128 (0x80 == 1.0); scale into 0..255 for a D3DCOLOR-style ARGB.
 			// Alpha is kept either way -- it is real transparency, not baked lighting.
 			const u32 alpha = std::min<u32>(255u, static_cast<u32>(v.RGBAQ.A) * 2u);
+			max_vertex_alpha = std::max(max_vertex_alpha, alpha);
 			out.color = (vcolor_mode() != 0) ?
 				((alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
 					(static_cast<u32>(v.RGBAQ.G) << 8) | static_cast<u32>(v.RGBAQ.B)) :
@@ -9482,7 +10806,7 @@ namespace RemixSubmit
 			// 2D that the exact const-Q test missed. Placed here because min_w/max_w only exist
 			// once the vertex loop has run; see w_flat_limit() for the menu measurement behind it.
 			const float flat_limit = w_flat_limit();
-			if (!fallback_screen_ui && flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
+			if (!fallback_screen_ui && !ui_candidate && flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
 			{
 				++s_stats.skip_w_flat;
 				return;
@@ -9602,6 +10926,53 @@ namespace RemixSubmit
 			s_scratch_indices[i] = index;
 		}
 
+		// A GS sprite is TWO vertices naming opposite corners of a screen-aligned quad, so the
+		// buffer above (which assumes indices_per_prim == 3) yields nothing usable. Rebuild it
+		// as a triangle list, synthesising the two off-diagonal corners per sprite and taking
+		// the flat colour from the second vertex, which is what the GS shades a sprite with.
+		if (sprite_ui_probe)
+		{
+			s_scratch_indices.clear();
+			const u32 sprite_indices = index_count - (index_count % 2);
+			for (u32 i = 0; i + 1 < sprite_indices; i += 2)
+			{
+				const u32 a = src_indices[i];
+				const u32 b = src_indices[i + 1];
+				if (a >= vertex_count || b >= vertex_count || s_scratch_ndc.size() < (size_t)vertex_count * 2)
+					continue;
+
+				const float xa = s_scratch_ndc[(size_t)a * 2], ya = s_scratch_ndc[((size_t)a * 2) + 1];
+				const float xb = s_scratch_ndc[(size_t)b * 2], yb = s_scratch_ndc[((size_t)b * 2) + 1];
+				// A sprite spanning essentially the whole target is a background/framebuffer blit,
+				// not UI. Admitting those made the overlay repaint itself once per frame (measured
+				// 1.04x overdraw) and paint over the very glyphs this path exists to composite.
+				// NDC spans -1..1, so 1.8 is 90% of an axis; real HUD/text elements are far smaller.
+				if (std::abs(xb - xa) >= 1.8f && std::abs(yb - ya) >= 1.8f)
+				{
+					++s_overlay_fullscreen;
+					continue;
+				}
+
+				const remixapi_HardcodedVertex& va = s_scratch_vertices[a];
+				const remixapi_HardcodedVertex& vb = s_scratch_vertices[b];
+
+				const u32 c1 = (u32)s_scratch_vertices.size();
+				remixapi_HardcodedVertex corner = vb;
+				corner.texcoord[0] = vb.texcoord[0]; corner.texcoord[1] = va.texcoord[1];
+				s_scratch_vertices.push_back(corner);
+				s_scratch_ndc.push_back(xb); s_scratch_ndc.push_back(ya);
+
+				const u32 c2 = (u32)s_scratch_vertices.size();
+				corner = vb;
+				corner.texcoord[0] = va.texcoord[0]; corner.texcoord[1] = vb.texcoord[1];
+				s_scratch_vertices.push_back(corner);
+				s_scratch_ndc.push_back(xa); s_scratch_ndc.push_back(yb);
+
+				s_scratch_indices.push_back(a);  s_scratch_indices.push_back(c1); s_scratch_indices.push_back(b);
+				s_scratch_indices.push_back(a);  s_scratch_indices.push_back(b);  s_scratch_indices.push_back(c2);
+			}
+		}
+
 		if (s_scratch_indices.empty())
 		{
 			++s_stats.skip_empty;
@@ -9684,17 +11055,83 @@ namespace RemixSubmit
 
 		smooth_scratch_normals(degenerate_scale);
 
+		// Normals are final here, and every vertex still carries its baked colour, which is the
+		// only place this game's authored lighting survives. Called from the caller rather than
+		// from inside smooth_scratch_normals() so the fit still runs when smoothing is disabled.
+		accumulate_moon_fit();
+
 		// --- material ------------------------------------------------------------------------
 		// Recomputed here rather than read off the Source: only HashCacheEntry* is stored
 		// there (GSTextureCache.h:306) and it is null on most draws and always null for a
 		// render-target source, so the key has to be rebuilt from TEX0/TEXA/CLUT/region.
-		const GSTextureCache::Source* const source = static_cast<const GSTextureCache::Source*>(tex_source);
+		const bool allow_render_target_snapshot = sky_draw;
 		// An untextured draw has no source to key a material on, so bind() would hand back null and
 		// the surface would shade colourless -- and since UNTEXZ these are the majority of a SOCOM
 		// frame. Give them the shared white material instead, so their per-vertex colour lands.
 		const remix_ps2::materials::binding material = untex_draw ?
 			remix_ps2::materials::bind_untextured(s_remix) :
-			remix_ps2::materials::bind(s_remix, source, s_frame_counter);
+			remix_ps2::materials::bind(s_remix, source, s_frame_counter, allow_render_target_snapshot);
+
+		// Fully transparent in the guest: it drew nothing, so neither should we.
+		if (drop_clear_mode() != 0 && max_vertex_alpha == 0 && vcolor_mode() != 0)
+		{
+			++s_stats.skip_clear_alpha;
+			return;
+		}
+
+		// A 2D draw is a HUD element, not a surface. Rasterise it into the screen overlay and
+		// stop -- submitting it as geometry is what put the menus out in the world.
+		// A world billboard is not UI, however flat its depth is.
+		const float ui_w_limit = ui_w_max();
+		const bool ui_depth_ok = (ui_w_limit <= 0.f) || (max_w > 0.f && max_w <= ui_w_limit);
+		if (s_drawdump_frames_left > 0 && flat_2d && !r.m_cached_ctx.DepthWrite() &&
+			max_w > 0.f && (ui_w_limit <= 0.f || max_w > ui_w_limit))
+		{
+			INFO_LOG("Remix: MOONCAND d={} w=[{:.6g},{:.6g}] target={} alpha={} mat={:016X} present={} sky={}",
+				s_submitted_this_frame, min_w, max_w,
+				(source && (source->m_target || source->m_from_target)) ? 1 : 0,
+				max_vertex_alpha, material.content_hash, material.material ? 1 : 0, sky_draw ? 1 : 0);
+		}
+
+		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok)
+		{
+			if (material.content_hash == 0)
+				++s_screen_ui_nomat;
+			else if (s_scratch_ndc.empty())
+				++s_screen_ui_nondc;
+		}
+
+		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok &&
+			material.content_hash != 0 && !s_scratch_ndc.empty())
+		{
+			// Size the buffer to the guest's own target the first time a UI draw appears, so the
+			// overlay is authored at native resolution and Remix scales it once, at the end.
+			if (s_overlay_w != (u32)rt_unscaled_width || s_overlay_h != (u32)rt_unscaled_height)
+			{
+				overlay_reset((u32)rt_unscaled_width, (u32)rt_unscaled_height);
+				s_overlay_frame = ~0ull;
+			}
+
+			// First UI draw of this frame: wipe last frame's HUD and rebuild.
+			if (s_overlay_frame != s_frame_counter)
+			{
+				s_overlay_frame = s_frame_counter;
+				std::fill(s_overlay.begin(), s_overlay.end(), (u8)0);
+				s_overlay_used = false;
+			}
+
+			overlay_raster(material.content_hash);
+			return;
+		}
+
+		// A sprite was admitted past the primclass gate ONLY as an overlay candidate. If the
+		// raster path above did not consume it, refuse it here exactly as that gate would have:
+		// it must never reach mesh identity or geometry submission as world geometry.
+		if (sprite_ui_probe)
+		{
+			++s_stats.skip_not_triangle;
+			return;
+		}
 
 		// --- mesh identity ------------------------------------------------------------------
 		u64 hash = fnv_seed;
@@ -9844,6 +11281,38 @@ namespace RemixSubmit
 			return;
 		}
 
+		// Latch one big mesh and follow it. Big, because a large draw is world geometry rather
+		// than a HUD quad or a particle, and its centroid is averaged over enough vertices that
+		// per-vertex un-projection noise cancels.
+		if (stable_id)
+		{
+			// Latching ONE hash failed: the chosen mesh was submitted once and never again
+			// (seen 1), so its centroid froze and measured nothing. Report the LARGEST mesh of
+			// each window instead, with its hash. Whenever consecutive log lines share a hash,
+			// their centroids are directly comparable -- and a world-anchored mesh's centroid
+			// cannot move while the player only turns.
+			// EXCLUDE THE PLAYER. The biggest mesh on screen is always the animated character:
+			// ~1000 verts, a new geometry hash every frame, and a centroid ~10 units from the
+			// eye. It follows the camera by definition, so it can never answer "is the world
+			// anchored?". Require the mesh to be far enough away to be scenery.
+			const float dx = centroid[0] - s_active_camera.position[0];
+			const float dy = centroid[1] - s_active_camera.position[1];
+			const float dz = centroid[2] - s_active_camera.position[2];
+			const float cam_dist = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+			const u32 verts = static_cast<u32>(s_scratch_vertices.size());
+			if (verts >= 256 && cam_dist > 3000.f && verts > s_meshtrack_verts)
+			{
+				s_meshtrack_hash = hash;
+				s_meshtrack_verts = verts;
+				s_meshtrack_centroid[0] = centroid[0];
+				s_meshtrack_centroid[1] = centroid[1];
+				s_meshtrack_centroid[2] = centroid[2];
+				s_meshtrack_dist = cam_dist;
+				++s_meshtrack_seen;
+			}
+		}
+
 		// The registration tolerance, and the quantum the dedupe key measures position in. One
 		// number so that "close enough to be the same geometry" and "close enough to be the same
 		// placement" cannot disagree.
@@ -9906,7 +11375,8 @@ namespace RemixSubmit
 		regs.min_w = min_w;
 		regs.alpha = r.m_context->ALPHA;
 
-		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame, untex_draw);
+		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame,
+			untex_draw, cloud_sky_draw || hash_sky_draw);
 
 		// A lightmap pass sits exactly on the surface it modulates, so it has to be a decal or it
 		// z-fights -- that is what made the FBMSK gate necessary in the first place. Static, because
@@ -10413,6 +11883,15 @@ namespace RemixSubmit
 		// mesh onto this draw; on the legacy path the positions are already in the submitted
 		// camera's space and the transform is the identity.
 		instance.transform = stable_id ? placement : s_identity_transform;
+
+		// View-space overlay geometry needs the eye's own frame to sit in, otherwise Remix
+		// interprets it as world coordinates and the HUD ends up somewhere in the level.
+		if (fallback_screen_ui && s_active_camera.valid)
+		{
+			remix_ps2::mat4 view_to_world{};
+			if (remix_ps2::mat4_invert(s_active_camera.view, view_to_world))
+				instance.transform = remix_ps2::to_remix_transform(view_to_world);
+		}
 		instance.doubleSided = 1;
 
 		const u64 inst_budget = instance_budget();
@@ -10516,6 +11995,23 @@ namespace RemixSubmit
 		// trace all still see the real resolved camera.
 		refresh_window_size();
 
+		// EE camera probe. Mode 1 logs only -- nothing downstream consumes it yet.
+		if (ee_cam_mode() != 0)
+		{
+			float eepos[3], eeang[3];
+			remix_ps2::mat4 eeview{};
+			static u32 s_eecam_n = 0;
+			if (read_ee_camera(eepos, eeview, eeang))
+			{
+				if ((s_eecam_n++ % 120) == 0)
+					INFO_LOG("Remix: EECAM pos {:.1f} {:.1f} {:.1f} | pitch {:+.1f} yaw {:+.1f} roll {:+.1f}",
+						eepos[0], eepos[1], eepos[2], eeang[0], eeang[1], eeang[2]);
+			}
+			else if ((s_eecam_n++ % 600) == 0)
+				INFO_LOG("Remix: EECAM read FAILED (eeMem {} loc {:#x})",
+					eeMem ? "ok" : "null", ee_cam_loc_addr());
+		}
+
 		if (!skip_present)
 		{
 			submit_camera(hold_camera ? s_held_camera : s_active_camera);
@@ -10556,14 +12052,71 @@ namespace RemixSubmit
 			if (s_empty_frame_streak >= s_beacon_after_empty_frames)
 				submit_debug_triangle();
 
-			if (s_debug_light)
-				remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_debug_light);
+			// The return code used to be discarded here, and that was the single remaining blind
+			// spot behind "the backend builds a key and a dome, CreateLight reports success, and
+			// the developer menu still reads Total Lights: 0". A light that is created but never
+			// accepted by the runtime is indistinguishable from one that was never created at all
+			// unless this status is read. Logged sparsely -- first failure, then every 300th --
+			// because a failure here repeats every frame and would otherwise bury the log.
+			//
+			// The success side is logged EXACTLY ONCE per handle-set, because "we asked for three
+			// lights and the runtime took three" is the fact that separates a submission problem
+			// from a shading/exposure one, and it is worth one line to never have to guess again.
+			{
+				static u64 s_light_draw_failures = 0;
+				static u32 s_light_draw_last_ok = 0;
+				u32 accepted = 0;
+				u32 attempted = 0;
 
-			if (s_sun_light)
-				remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_sun_light);
+				const auto draw_light = [&](remixapi_LightHandle handle, const char* which) {
+					if (!handle)
+						return;
 
-			if (s_dome_light)
-				remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, s_dome_light);
+					++attempted;
+					const u32 status =
+						remix_ps2::guarded_draw_light_instance(s_remix.api().DrawLightInstance, handle);
+					if (status == REMIXAPI_ERROR_CODE_SUCCESS)
+					{
+						++accepted;
+						return;
+					}
+
+					if ((s_light_draw_failures++ % 300) == 0)
+					{
+						ERROR_LOG("Remix: DrawLightInstance REFUSED the {} light ({}) -- {} refusals so far. "
+								  "The light exists (CreateLight succeeded) but the runtime is not taking it, "
+								  "which is why LIGHT STATISTICS reads 0.",
+							which, remix_ps2::error_name(status), s_light_draw_failures);
+					}
+				};
+
+				draw_light((light_mode() == 2) ? s_debug_light : nullptr, "camera-attached sphere");
+				draw_light(s_sun_light, "key/distant");
+				draw_light(s_dome_light, "dome");
+
+				// Authored level lights, if loaded. Drawn every presented frame like the others.
+				build_level_lights();
+				for (const remixapi_LightHandle h : s_level_lights)
+					draw_light(h, "level");
+
+				if (accepted != s_light_draw_last_ok)
+				{
+					s_light_draw_last_ok = accepted;
+					INFO_LOG("Remix: DrawLightInstance accepted {} of {} lights this window "
+							 "(sphere {}, key {}, dome {})",
+						accepted, attempted, s_debug_light ? "yes" : "no", s_sun_light ? "yes" : "no",
+						s_dome_light ? "yes" : "no");
+				}
+			}
+
+			// The HUD, composited over the traced image. Submitted before Present so the runtime
+			// has it for this frame; the buffer is cleared at the top of the next one.
+			if (s_overlay_used && s_remix.api().DrawScreenOverlay != nullptr)
+			{
+				s_remix.api().DrawScreenOverlay(s_overlay.data(), s_overlay_w, s_overlay_h,
+					REMIXAPI_FORMAT_B8G8R8A8_UNORM, 1.0f);
+				++s_overlay_presents;
+			}
 
 			remixapi_PresentInfo present_info{};
 			present_info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
@@ -10577,6 +12130,7 @@ namespace RemixSubmit
 
 		// The frame that just presented is the one whose un-projection constants the world
 		// tier has to normalise against.
+
 		if (s_frame_viewport.valid)
 			s_last_viewport = s_frame_viewport;
 
@@ -11104,10 +12658,11 @@ namespace RemixSubmit
 		s_pool_hashes.clear();
 		s_pinned_hashes.clear();
 
-		// Materials are content-keyed, so they survive a load by construction -- the same
-		// texture bytes produce the same hash. Only the per-frame budget is reset, which is
-		// what ramps the rebuild instead of doing it all in the first frame back.
+		// Keep ordinary materials, but discard render-target snapshots: their pixels belong to
+		// the state that was replaced. The material cache suppresses readback for the first post-load
+		// frame so GS local memory has time to settle.
 		remix_ps2::materials::begin_frame();
+		remix_ps2::materials::on_state_loaded(s_remix);
 
 		INFO_LOG("Remix: save state loaded -- dropped {} meshes, camera back to fallback until "
 				 "the back-slice republishes",

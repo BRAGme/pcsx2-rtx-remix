@@ -237,6 +237,7 @@ namespace remix_ps2::materials
 			u32 width = 0;
 			u32 height = 0;
 			bool failed = false; // decode or a runtime call refused: never retried
+			bool is_render_target = false;
 		};
 
 		struct counters
@@ -291,6 +292,7 @@ namespace remix_ps2::materials
 
 		counters s_stats{};
 		u32 s_budget_left = 0;
+		u32 s_rt_readback_block_frames = 0;
 
 		bool reserve_decode_buffer(size_t bytes)
 		{
@@ -380,6 +382,14 @@ namespace remix_ps2::materials
 		std::unordered_map<u64, remixapi_InstanceCategoryFlags> s_categories;
 		u64 s_category_tags = 0; // entries in s_categories, for the stats line
 		u64 s_category_hits = 0; // instances that picked a flag up
+		// The OR of every flag in s_categories, rebuilt with the table.
+		//
+		// Exists so a caller can ask "is ANY texture tagged with this category?" without a map
+		// lookup, and therefore without computing a content hash first. The sky classifier reads
+		// it as an early-out: hashing a source costs a full HashTextureLevel unswizzle+hash
+		// (GSTextureCache.cpp, HashCacheKey::Create) -- the same work that makes bind() 1.7-2.6 us
+		// -- so a title with no sky tags must not pay it on every textured draw.
+		remixapi_InstanceCategoryFlags s_category_mask = 0;
 
 		// Textures the user has asked to emit light. There is no emissive texture list in
 		// RtxOptions -- dxvk-remix only has global scales (rtx_options.h:339, :894) -- so there
@@ -407,6 +417,7 @@ namespace remix_ps2::materials
 		{
 			remixapi_MaterialHandle handle;
 			u64 frame;
+			bool is_render_target;
 		};
 
 		std::vector<retired_material> s_retired;
@@ -709,6 +720,10 @@ namespace remix_ps2::materials
 			}
 
 			s_category_tags = s_categories.size();
+
+			s_category_mask = 0;
+			for (const auto& [hash, flags] : s_categories)
+				s_category_mask |= flags;
 		}
 
 		void dump_write(const std::string& line)
@@ -1110,7 +1125,7 @@ namespace remix_ps2::materials
 			}
 
 			if (entry.material)
-				s_retired.push_back({entry.material, frame});
+				s_retired.push_back({entry.material, frame, entry.is_render_target});
 
 			entry.material = replacement;
 
@@ -1142,14 +1157,167 @@ namespace remix_ps2::materials
 	// waiting out the poll interval. GS thread only, like everything else in this file.
 	bool s_game_config_dirty = true;
 
+	struct ca_runtime_setting
+	{
+		const char* key;
+		const char* backend_default;
+	};
+
+	static constexpr ca_runtime_setting s_ca_runtime_settings[] = {
+		{"rtx.fallbackLightMode", "1"},
+		{"rtx.antiCulling.object.enable", "False"},
+		{"rtx.antiCulling.object.enableHighPrecisionAntiCulling", "True"},
+		{"rtx.antiCulling.object.enableInfinityFarFrustum", "False"},
+		{"rtx.antiCulling.object.farPlaneScale", "10"},
+	};
+
+	std::unordered_map<std::string, std::string> capture_ca_runtime_baseline()
+	{
+		std::unordered_map<std::string, std::string> result;
+		for (const ca_runtime_setting& setting : s_ca_runtime_settings)
+			result.emplace(setting.key, setting.backend_default);
+
+		// SetConfigVariable writes the runtime's user layer and has no getter or unset operation.
+		// Preserve any value from the rtx.conf layer that was actually loaded at startup, then
+		// write it back when CA is left. This avoids replacing a user's global/per-game tuning
+		// with our compiled guesses merely because SCUS-97545 ran once in this process.
+		std::string config_paths = StringUtil::WideStringToUTF8String(read_env(L"DXVK_RTX_CONFIG_FILE"));
+		if (config_paths.empty())
+			config_paths = "rtx.conf";
+
+		std::wstring module_path(32768, L'\0');
+		const DWORD module_length = GetModuleFileNameW(nullptr, module_path.data(), static_cast<DWORD>(module_path.size()));
+		module_path.resize((module_length > 0 && module_length < module_path.size()) ? module_length : 0);
+		const std::string module_path_utf8 = StringUtil::WideStringToUTF8String(module_path);
+		const std::string executable_name(Path::GetFileName(module_path_utf8));
+
+		size_t begin = 0;
+		while (begin <= config_paths.size())
+		{
+			const size_t comma = config_paths.find(',', begin);
+			const std::string path = config_paths.substr(begin,
+				(comma == std::string::npos) ? std::string::npos : comma - begin);
+			begin = (comma == std::string::npos) ? config_paths.size() + 1 : comma + 1;
+
+			std::FILE* file = path.empty() ? nullptr : FileSystem::OpenCFile(path.c_str(), "r");
+			if (!file)
+				continue;
+
+			bool active_section = true;
+			char line[8192];
+			while (std::fgets(line, sizeof(line), file))
+			{
+				std::string text(line);
+				if (const size_t hash_pos = text.find('#'); hash_pos != std::string::npos)
+					text.erase(hash_pos);
+
+				const size_t first_non_space = text.find_first_not_of(" \t\r\n");
+				if (first_non_space != std::string::npos && text[first_non_space] == '[')
+				{
+					const size_t close = text.find_last_of(']');
+					active_section = close > first_non_space + 1 &&
+						text.substr(first_non_space + 1, close - first_non_space - 1) == executable_name;
+					continue;
+				}
+				if (!active_section)
+					continue;
+
+				const size_t eq = text.find('=');
+				if (eq == std::string::npos)
+					continue;
+
+				const auto trim = [](std::string s) {
+					const size_t first = s.find_first_not_of(" \t\r\n");
+					const size_t last = s.find_last_not_of(" \t\r\n");
+					return (first == std::string::npos) ? std::string() : s.substr(first, last - first + 1);
+				};
+				const std::string key = trim(text.substr(0, eq));
+				if (auto it = result.find(key); it != result.end())
+				{
+					std::string value = trim(text.substr(eq + 1));
+					value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
+					if (!value.empty())
+						it->second = value;
+				}
+			}
+			std::fclose(file);
+		}
+
+		return result;
+	}
+
+	bool restore_ca_runtime_baseline(const runtime& rt,
+		const std::unordered_map<std::string, std::string>& baseline)
+	{
+		bool success = true;
+		for (const ca_runtime_setting& setting : s_ca_runtime_settings)
+		{
+			const auto it = baseline.find(setting.key);
+			const std::string value = (it == baseline.end()) ? setting.backend_default : it->second;
+			const u32 code = guarded_set_config_variable(rt.api().SetConfigVariable, setting.key, value.c_str());
+			if (code == REMIXAPI_ERROR_CODE_SUCCESS)
+				INFO_LOG("Remix:   {} = {} (restored pre-CA runtime value)", setting.key, value);
+			else
+			{
+				success = false;
+				WARNING_LOG("Remix:   {} = {} RESTORE FAILED ({})", setting.key, value, error_name(code));
+			}
+		}
+		return success;
+	}
+
+	bool cpu_pixels(u64 content_hash, const u8*& out_pixels, u32& out_width, u32& out_height)
+	{
+		const auto it = s_entries.find(content_hash);
+		if (it == s_entries.end() || it->second.pixels.empty())
+			return false;
+
+		out_pixels = it->second.pixels.data();
+		out_width = it->second.width;
+		out_height = it->second.height;
+		return (out_width != 0) && (out_height != 0);
+	}
+
 	void begin_frame()
 	{
 		s_budget_left = texture_budget();
+		if (s_rt_readback_block_frames > 0)
+			--s_rt_readback_block_frames;
 	}
 
 	void invalidate_game_config()
 	{
 		s_game_config_dirty = true;
+	}
+
+	void on_state_loaded(const runtime& rt)
+	{
+		for (auto it = s_entries.begin(); it != s_entries.end(); )
+		{
+			if (!it->second.is_render_target)
+			{
+				++it;
+				continue;
+			}
+
+			destroy(rt, it->second);
+			it = s_entries.erase(it);
+		}
+
+		if (rt.ok())
+		{
+			s_retired.erase(std::remove_if(s_retired.begin(), s_retired.end(),
+				[&](const retired_material& entry) {
+					if (!entry.is_render_target)
+						return false;
+					guarded_destroy_material(rt.api().DestroyMaterial, entry.handle);
+					return true;
+				}), s_retired.end());
+		}
+
+		// The first draw window after a load still observes the rebuilding GS texture cache. The
+		// following begin_frame() releases the gate, so the second window may take the snapshot.
+		s_rt_readback_block_frames = 1;
 	}
 
 	void refresh_game_config(const runtime& rt)
@@ -1160,6 +1328,8 @@ namespace remix_ps2::materials
 		static u64 last_signature = 0;
 		static bool first = true;
 		static std::string configured_game;
+		static bool configured_ca_profile = false;
+		static std::unordered_map<std::string, std::string> ca_runtime_baseline;
 
 		const Common::Timer::Value now = Common::Timer::GetCurrentValue();
 
@@ -1177,9 +1347,13 @@ namespace remix_ps2::materials
 
 		last_check = now;
 
+		const std::string current_game_id = remix_ps2::paths::game_id();
+		const bool next_ca_profile = current_game_id == "SCUS-97545";
 		const std::vector<std::string> paths = game_conf_paths();
 
 		u64 signature = fnv_seed;
+		for (const char c : current_game_id)
+			signature = fnv_mix(signature, static_cast<u64>(static_cast<unsigned char>(c)));
 		for (const std::string& path : paths)
 		{
 			// The identity itself is part of the signature: two games can both have no conf
@@ -1204,23 +1378,49 @@ namespace remix_ps2::materials
 
 		first = false;
 		last_signature = signature;
+		if (!remix_ps2::paths::clear_title_env())
+		{
+			// A transient Win32 environment failure must not turn into a permanent stale
+			// per-title override merely because the config-file signature did not change.
+			s_game_config_dirty = true;
+		}
+
+		// Runtime settings land in Remix's user layer, which has no public unset operation. CA is
+		// the only profile that promises clean removal: restore the rtx.conf values captured
+		// before its first override, including when the next state has no serial/config paths.
+		if (configured_ca_profile && !next_ca_profile)
+		{
+			if (!restore_ca_runtime_baseline(rt, ca_runtime_baseline))
+			{
+				// Keep ownership and retry on the next refresh instead of forgetting a partial
+				// restore and silently leaving CA values active for another title.
+				s_game_config_dirty = true;
+				return;
+			}
+			configured_ca_profile = false;
+			ca_runtime_baseline.clear();
+		}
 
 		if (paths.empty())
+		{
+			configured_game.clear();
 			return;
+		}
 
-		// Remix has no "unset" through the API, and the values we push land in its user layer,
-		// which outranks every file layer. So a second game configured in the same process
-		// inherits whatever the first one set and cannot clear it. PCSX2 tears the VM down on a
-		// game change but the Remix runtime is a process-lifetime singleton, so this is real.
 		const std::string game = paths.back();
 		if (!configured_game.empty() && configured_game != game)
 		{
-			WARNING_LOG("Remix: per-game config changing from '{}' to '{}' in one process -- keys "
-						"the previous game set cannot be unset through the API and will persist. "
-						"Restart the emulator for a clean per-game config.",
+			WARNING_LOG("Remix: per-game config changing from '{}' to '{}' in one process. "
+						"Combined Assault runtime keys are restored; other titles' runtime keys still "
+						"require an emulator restart because Remix exposes no unset operation.",
 				Path::GetFileName(configured_game), Path::GetFileName(game));
 		}
+
+		if (!configured_ca_profile && next_ca_profile)
+			ca_runtime_baseline = capture_ca_runtime_baseline();
+
 		configured_game = game;
+		configured_ca_profile = next_ca_profile;
 
 		u32 found = 0;
 		u32 applied = 0;
@@ -1271,30 +1471,16 @@ namespace remix_ps2::materials
 					// sets these from the harness, and a per-game conf silently overriding one
 					// mid-arm would invalidate the measurement without saying so.
 					//
-					// But "the environment" must mean the *user's* environment, not one we wrote
-					// ourselves a moment ago. These toggles are applied by setting the process
-					// environment, so without s_env_owned an earlier conf layer would set a key
-					// and the more specific layer would then skip it as "already set" -- which
-					// silently inverts the layer precedence. Measured, not reasoned about: with
-					// SCUS-97545.conf at MAXW=100 and SCUS-97545_D7CFDCCF.conf at 300, the
-					// counter block read "maxw gate 100".
-					static std::unordered_set<std::string> s_env_owned;
-
-					const std::wstring wkey(key.begin(), key.end());
-					if (!read_env(wkey.c_str()).empty() && s_env_owned.find(key) == s_env_owned.end())
+					if (remix_ps2::paths::is_external_env(key))
 					{
 						++env_skipped;
-						INFO_LOG("Remix:   {} = {} SKIPPED (already set in the environment)", key, value);
+						INFO_LOG("Remix:   {} = {} SKIPPED (external process environment)", key, value);
 						continue;
 					}
 
-					s_env_owned.insert(key);
-
-					const std::wstring wvalue(value.begin(), value.end());
-					if (::SetEnvironmentVariableW(wkey.c_str(), wvalue.c_str()))
+					if (remix_ps2::paths::apply_title_env(key, value))
 					{
 						++env_applied;
-						INFO_LOG("Remix:   {} = {} (PCSX2 toggle)", key, value);
 					}
 					else
 					{
@@ -1318,7 +1504,7 @@ namespace remix_ps2::materials
 				if (code == REMIXAPI_ERROR_CODE_SUCCESS)
 				{
 					++applied;
-					INFO_LOG("Remix:   {} = {}", key, value);
+					INFO_LOG("Remix:   {} = {} (per-game conf)", key, value);
 				}
 				else
 				{
@@ -1346,6 +1532,33 @@ namespace remix_ps2::materials
 		INFO_LOG("Remix: per-game config applied -- {} runtime keys, {} PCSX2 toggles, "
 				 "{} skipped (environment wins), {} failed",
 			applied, env_applied, env_skipped, failed);
+		const auto effective_env = [](std::string_view name, const char* fallback) {
+			std::string value = remix_ps2::paths::env_value(name);
+			return value.empty() ? std::string(fallback) : value;
+		};
+		INFO_LOG("Remix: effective LIGHTMODE={} [{}] WORLDROT={} [{}] SKY={} [{}] SKYMINW={} [{}] "
+				 "SKYCAM={} [{}] RTTEX={} [{}] MATSTAGE={} [{}] UIMODE={} [{}] UIRASTER={} [{}] "
+				 "UIWMAX={} [{}]",
+			effective_env("PCSX2_REMIX_LIGHTMODE", "1"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_LIGHTMODE"),
+			effective_env("PCSX2_REMIX_WORLDROT", "0"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_WORLDROT"),
+			effective_env("PCSX2_REMIX_SKY", "1"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_SKY"),
+			effective_env("PCSX2_REMIX_SKYMINW", "0"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_SKYMINW"),
+			effective_env("PCSX2_REMIX_SKYCAM", "1"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_SKYCAM"),
+			effective_env("PCSX2_REMIX_RTTEX", "0"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_RTTEX"),
+			effective_env("PCSX2_REMIX_MATSTAGE", "4"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_MATSTAGE"),
+			effective_env("PCSX2_REMIX_UIMODE", "0"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_UIMODE"),
+			effective_env("PCSX2_REMIX_UIRASTER", "0"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_UIRASTER"),
+			effective_env("PCSX2_REMIX_UIWMAX", "50"),
+			remix_ps2::paths::env_source("PCSX2_REMIX_UIWMAX"));
 	}
 
 	void refresh_categories()
@@ -1401,6 +1614,11 @@ namespace remix_ps2::materials
 	u64 generation()
 	{
 		return s_generation;
+	}
+
+	remixapi_InstanceCategoryFlags tagged_category_mask()
+	{
+		return s_category_mask;
 	}
 
 	remixapi_InstanceCategoryFlags categories_for(u64 content_hash)
@@ -1596,7 +1814,8 @@ namespace remix_ps2::materials
 		return out;
 	}
 
-	binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame)
+	binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame,
+		bool allow_render_target_snapshot)
 	{
 		binding out{};
 
@@ -1624,7 +1843,19 @@ namespace remix_ps2::materials
 		const bool is_render_target = (source->m_target || source->m_from_target);
 		const u32 rt_interval = rt_texture_interval();
 
+		if (is_render_target && !allow_render_target_snapshot)
+		{
+			++s_stats.skip_target;
+			return out;
+		}
+
 		if (is_render_target && (rt_interval == 0 || !source->m_texture || !g_texture_cache))
+		{
+			++s_stats.skip_target;
+			return out;
+		}
+
+		if (is_render_target && s_rt_readback_block_frames > 0)
 		{
 			++s_stats.skip_target;
 			return out;
@@ -1702,6 +1933,7 @@ namespace remix_ps2::materials
 			it->second.created_frame = frame;
 			material_entry& entry = it->second;
 			entry.last_used_frame = frame;
+			entry.is_render_target = is_render_target;
 
 			// Pull the render target's pixels down into GS local memory so the ordinary decode()
 			// inside create() can see them. Under the hardware renderer the content lives in a GPU

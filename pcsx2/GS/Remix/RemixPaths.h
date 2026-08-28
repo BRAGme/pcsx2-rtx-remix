@@ -4,6 +4,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 // Per-game Remix file layout, and the bridge from PCSX2's own settings to the knobs the Remix
 // backend reads out of the environment.
@@ -77,10 +78,25 @@ namespace remix_ps2
 		// game runs. Latched knobs are deliberately left alone. Call once per frame; it is a
 		// handful of settings lookups.
 		void apply_live_knobs();
+		bool apply_title_env(std::string_view name, std::string_view value);
+		bool clear_title_env();
+		bool is_external_env(std::string_view name);
+		std::string env_value(std::string_view name);
+		const char* env_source(std::string_view name);
 
 		// Counts how many times a knob's environment value has actually changed. A backend knob
 		// that wants to be live caches its parsed value alongside this and re-reads only when it
 		// moves, which keeps GetEnvironmentVariableW out of the per-draw path.
 		u64 knob_generation();
+
+		// Force every live_int/live_float to re-parse on its next get(). The per-game conf applier
+		// sets environment variables directly rather than through apply_live_knobs(), so without
+		// this the counter never moves and a conf-delivered value is only ever seen by knobs whose
+		// FIRST read happens to fall after the conf landed. That is not a theory: PCSX2_REMIX_UIMODE
+		// and PCSX2_REMIX_UIRASTER were applied in the same conf, in the same millisecond, and read
+		// back 1 and 0 respectively -- ui_mode() is first called from the draw path (after), and
+		// ui_raster_mode() from OnVSync at frame 0 (before), so one cached the conf value and the
+		// other cached the default forever. Eighth instance of this bug class in this project.
+		void bump_knob_generation();
 	} // namespace paths
 } // namespace remix_ps2

@@ -4,6 +4,10 @@ add_pcsx2_test(core_test
 	StubHost.cpp
 )
 
+if(WIN32 AND NOT ARCH_ARM64)
+	target_sources(core_test PRIVATE remix_transform_tests.cpp)
+endif()
+
 set(multi_isa_sources
 	GS/swizzle_test_main.cpp
 )

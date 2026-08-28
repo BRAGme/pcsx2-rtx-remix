@@ -13,6 +13,7 @@
 
 #include "Config.h"
 
+#include "common/Console.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
 
@@ -99,6 +100,10 @@ namespace RemixVU1Capture
 		// offset 0x0000 was scored ZERO times -- the lowest address ever read was 0x0020. The one
 		// place the ucode says the camera is written has never been looked at.
 		std::atomic<bool> s_pin_user_seeded{false};
+		// Live-refreshed once per frame by refresh_user_pin(); see the note there.
+		std::atomic<u32> s_pin_kick_window{4};
+		std::atomic<u32> s_pin_hold_frames{0};
+		std::atomic<bool> s_slice_rank_on{false};
 
 		// Re-read PCSX2_REMIX_PINOFFSET from the environment. Called once per frame from
 		// publish(), NOT cached and NOT latched: the per-game .conf reaches the environment
@@ -116,6 +121,31 @@ namespace RemixVU1Capture
 				s_pinned_offset.store(s_no_pin, std::memory_order_relaxed); // knob withdrawn
 
 			s_pin_user_seeded.store(valid, std::memory_order_relaxed);
+
+			// PINKICKS / PINHOLD, for the SAME reason and by the same route. Both were
+			// `static const` lambdas, i.e. latched on FIRST CALL -- and the first call is the
+			// gate test on the very first XGKick, long before the per-game conf reaches the
+			// environment. Measured 2026-08-26: PINKICKS=512 set in BOTH the settings overlay
+			// and the conf, and PINPROBE still reported window=4 every run. Neither route can
+			// win against a latch. That makes five knobs lost to this (FRAMETRACE, SLICEVF,
+			// UCODEDUMP, PINOFFSET, and now these two).
+			{
+				const s64 kicks = remix_ps2::read_env_int(L"PCSX2_REMIX_PINKICKS", 4);
+				s_pin_kick_window.store((kicks <= 0) ? 0u
+					: static_cast<u32>(std::min<s64>(kicks, 4096)), std::memory_order_relaxed);
+
+				const s64 hold = remix_ps2::read_env_int(L"PCSX2_REMIX_PINHOLD", 0);
+				s_pin_hold_frames.store((hold <= 0) ? 0u
+					: static_cast<u32>(std::min<s64>(hold, 600)), std::memory_order_relaxed);
+
+				// SLICERANK, for the same reason. It was `static const` -- latched on the first
+				// ranked() call, i.e. the first candidate of the first kick -- so it could never
+				// be turned on from the conf no matter what the file said. Refreshed here into an
+				// atomic so ranked() stays a cheap load per candidate rather than an env read.
+				s_slice_rank_on.store(
+					remix_ps2::read_env_int(L"PCSX2_REMIX_SLICERANK", 0) != 0,
+					std::memory_order_relaxed);
+			}
 		}
 
 		struct scan_guard
@@ -312,12 +342,9 @@ namespace RemixVU1Capture
 		// of max_candidates. Default 4 keeps the old behaviour exactly.
 		u32 pinned_kick_window()
 		{
-			static const u32 value = []() -> u32 {
-				const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_PINKICKS", 4);
-				return (env <= 0) ? 0u : static_cast<u32>(std::min<s64>(env, 4096));
-			}();
-
-			return value;
+			// Live, not latched: see refresh_user_pin(). A latch here silently ignored every
+			// PINKICKS the conf or the overlay ever set.
+			return s_pin_kick_window.load(std::memory_order_relaxed);
 		}
 
 		bool finite_window(const float* m);
@@ -325,11 +352,24 @@ namespace RemixVU1Capture
 		// Finite is not the same as usable: an all-zero block passes every finiteness test, and
 		// VU1[pin] reads as all zeros for long stretches of every frame because the guest only
 		// holds a camera there part of the time.
+		// 'Nonzero and finite' is too weak to be a filter: DENORMALS pass both, and denormals
+		// are exactly what uninitialised VU1 memory reads as. Measured 2026-08-26 on save
+		// state 07: the pin's TOPS-bank fallback returned m0=1.7e-44 m10=20.07 and was
+		// accepted, publishing garbage at score 2000 -- the TOP of the candidate ranking,
+		// where it evicts real matrices. A camera coefficient is either exactly zero or of
+		// ordinary magnitude; nothing legitimate lands at 1e-44.
 		bool usable_matrix(const float* m)
 		{
 			bool any_nonzero = false;
-			for (u32 i = 0; i < 16 && !any_nonzero; ++i)
-				any_nonzero = (m[i] != 0.f);
+			for (u32 i = 0; i < 16; ++i)
+			{
+				const float a = std::fabs(m[i]);
+				if (a == 0.f)
+					continue;
+				if (a < 1e-20f) // denormal / uninitialised-memory noise
+					return false;
+				any_nonzero = true;
+			}
 
 			return any_nonzero && finite_window(m);
 		}
@@ -352,12 +392,8 @@ namespace RemixVU1Capture
 		// view for this frame" -- the second is worse, but only up to a point, hence the bound.
 		u32 pin_hold_frames()
 		{
-			static const u32 value = []() -> u32 {
-				const s64 env = remix_ps2::read_env_int(L"PCSX2_REMIX_PINHOLD", 0);
-				return (env <= 0) ? 0u : static_cast<u32>(std::min<s64>(env, 600));
-			}();
-
-			return value;
+			// Live, not latched: see refresh_user_pin().
+			return s_pin_hold_frames.load(std::memory_order_relaxed);
 		}
 
 		void record_kick_camera(u64 seq)
@@ -455,8 +491,9 @@ namespace RemixVU1Capture
 		// Something about applying it as an insertion score is what does not carry through.
 		bool slice_rank_enabled()
 		{
-			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_SLICERANK", 0) != 0;
-			return value;
+			// Live, not latched: see refresh_user_pin(). Latched, this knob could never be
+			// switched on -- the first ranked() call happens before the conf is applied.
+			return s_slice_rank_on.load(std::memory_order_relaxed);
 		}
 
 		float ranked(float base, const float* m)
@@ -1087,7 +1124,7 @@ namespace RemixVU1Capture
 					if (!slice_auto)
 						continue;
 
-					if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && finite_window(m))
+					if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && usable_matrix(m))
 					{
 						insert_candidate(m, ranked(1000.f, m), offset, start_pc, ucode, 6, flags);
 						++s_frame.sliced_published;
@@ -1098,9 +1135,53 @@ namespace RemixVU1Capture
 					continue;
 				}
 
-				if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && finite_window(m))
+				// vi00 is HARDWIRED TO ZERO on the VU, so a matrix whose rows are indexed off it
+				// sits at a CONSTANT, statically knowable address -- it cannot drift, and it does
+				// not depend on a VI register whose value at kick time may not be its value at
+				// load time. That is strictly stronger evidence than a register-indexed load.
+				//
+				// MEASURED 2026-08-26, R6 3 save state 07: ucode 0x1045fdf6f596e615 declares three
+				// matrices -- two indexed off vi06 (which drifts across 0x3760, 0x2ca0, 0x0000 ...)
+				// and ONE off vi00 imm=36..39, i.e. a fixed 0x240. That fixed one is the camera:
+				// it is the only offset in 6,603 candidates that ever resolves, and it resolves to
+				// exactly fovY=48.07 aspect=1.429. At an equal score of 1000 it was published just
+				// TWICE, because insert_candidate refuses `score <= worst` once the set fills with
+				// the drifting pair's 1000s. The camera was being evicted by its own noise.
+				// finite_window() accepts an ALL-ZERO matrix -- zero is finite and within every
+				// coefficient bound -- so an empty VU1 address publishes as a plausible camera.
+				// VI0PROBE, save state 07, 2026-08-27: VU1[0x240] reads all zeros on ~93% of kicks
+				// and the real camera on the rest. The zeros were flooding the candidate set and
+				// resolving to nothing. usable_matrix() rejects both zero and denormal payloads.
+				// This is the same 'finiteness is not validity' trap already recorded on this
+				// project for the all-zero second camera -- fixed there, still live here.
+				const float slice_rank =
+					(matrix.rows[0].vi_base == 0) ? 1500.f : 1000.f;
+
+				// TEMPORARY DIAGNOSTIC (2026-08-27). Matrix 2 of ucode 0x1045fdf6f596e615 is a
+				// vi00-indexed (constant 0x240) load -- the camera -- and by inspection it should
+				// publish on EVERY kick, yet only 2 of 5,750 dumped candidates carry off=0x0240.
+				// Nothing in the loop above filters it, so the drop is inside read_sliced_matrix
+				// or finite_window. Report both verdicts and the payload. Remove once answered.
+				if (matrix.rows[0].vi_base == 0)
 				{
-					insert_candidate(m, ranked(1000.f, m), offset, start_pc, ucode, 1, flags);
+					static u32 s_vi0_n = 0;
+					const u32 vn = s_vi0_n++;
+					if (vn < 6 || (vn % 5000) == 0)
+					{
+						float probe[16];
+						u32 probe_off = 0;
+						const bool read_ok =
+							read_sliced_matrix(mem, matrix, false, tops, probe, probe_off);
+						INFO_LOG("Remix: VI0PROBE n={} read={} off={} finite={} imm={} delta={} m0={} m5={} m10={}",
+							vn, read_ok ? 1 : 0, probe_off, read_ok ? (finite_window(probe) ? 1 : 0) : -1,
+							matrix.rows[0].imm, matrix.rows[0].vi_delta,
+							read_ok ? probe[0] : 0.f, read_ok ? probe[5] : 0.f, read_ok ? probe[10] : 0.f);
+					}
+				}
+
+				if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && usable_matrix(m))
+				{
+					insert_candidate(m, ranked(slice_rank, m), offset, start_pc, ucode, 1, flags);
 					if (ucode == 0xd74d4042a48b1ba8ULL)
 						capture_transform_probe(mem, offset, ucode);
 					++s_frame.sliced_published;
@@ -1111,7 +1192,7 @@ namespace RemixVU1Capture
 				// recomputed that register after the load would not be -- so offer the
 				// current TOPS bank as well and let the GS side arbitrate.
 				if (matrix.rows[0].vi_base != 0 &&
-					read_sliced_matrix(mem, matrix, true, tops, m, offset) && finite_window(m))
+					read_sliced_matrix(mem, matrix, true, tops, m, offset) && usable_matrix(m))
 				{
 					insert_candidate(m, ranked(999.f, m), offset, start_pc, ucode, 2, flags);
 					++s_frame.sliced_published;
@@ -1160,11 +1241,68 @@ namespace RemixVU1Capture
 		// its contents are rewritten between kicks, and letting every kick contribute a
 		// 1000-scored entry would evict the whole rest of the set.
 		const u32 pinned = s_pinned_offset.load(std::memory_order_relaxed);
+
+		// TEMPORARY DIAGNOSTIC (2026-08-26). src=pinned published ZERO candidates on save
+		// state 07 even with PINOFFSET=576 read and PINKICKS=512, and usable_matrix() is too
+		// weak to be the filter (denormals pass it) -- so the gate below is never satisfied.
+		// This prints its three operands so we stop guessing which one. Remove once answered.
+		{
+			static u32 s_pinprobe_n = 0;
+			const u32 n = s_pinprobe_n++;
+			if (n < 8 || (n % 20000) == 0)
+			{
+				INFO_LOG("Remix: PINPROBE n={} pinned={} is_no_pin={} kicks_scanned={} window={} fits={}",
+					n, pinned, (pinned == s_no_pin) ? 1 : 0, s_frame.kicks_scanned,
+					pinned_kick_window(), ((pinned + s_matrix_bytes) <= VU1_MEMSIZE) ? 1 : 0);
+			}
+		}
+
 		if (pinned != s_no_pin && s_frame.kicks_scanned <= pinned_kick_window() &&
 			(pinned + s_matrix_bytes) <= VU1_MEMSIZE)
 		{
 			float m[16];
 			std::memcpy(m, mem + pinned, sizeof(m));
+
+			// VU1 data memory is DOUBLE-BUFFERED through the VIF TOPS base, and this pin is an
+			// absolute byte address -- so for most of a frame it reads the bank the camera is
+			// NOT in. Measured on save state 07 (2026-08-26, PINHIT probe): 19 of 23 sampled
+			// reads at 0x240 came back ALL ZERO, not garbage -- the address is empty, not stale.
+			// Widening PINKICKS from 4 to 512 changed nothing for exactly that reason.
+			//
+			// Same qword arithmetic read_sliced_matrix uses for its use_tops hypothesis
+			// (qword = (base + disp) & 0x3FF, offset = qword * 16). Fallback only: a usable
+			// absolute read still wins, so this cannot regress the states where the pin works.
+			u32 pin_read_offset = pinned;
+			bool pin_used_tops = false;
+			if (!usable_matrix(m))
+			{
+				// tops is not in scope here (it is a local of the scan path), so read the VIF
+				// register directly -- same source line 1019 uses.
+				const u32 pin_tops = static_cast<u32>(vuRegs[1].GetVifRegs().tops);
+				const u32 tops_offset = ((pin_tops + (pinned / 16u)) & 0x3FFu) * 16u;
+				if ((tops_offset + s_matrix_bytes) <= VU1_MEMSIZE)
+				{
+					float mt[16];
+					std::memcpy(mt, mem + tops_offset, sizeof(mt));
+					if (usable_matrix(mt))
+					{
+						std::memcpy(m, mt, sizeof(m));
+						pin_read_offset = tops_offset;
+						pin_used_tops = true;
+					}
+				}
+			}
+
+			// Second half of the diagnostic: the gate DID pass, so say whether the matrix
+			// read at the pin was usable or was the denormal garbage seen in the dump.
+			{
+				static u32 s_pinhit_n = 0;
+				const u32 h = s_pinhit_n++;
+				if (h < 8 || (h % 2000) == 0)
+					INFO_LOG("Remix: PINHIT h={} kicks_scanned={} usable={} tops={} off={} m0={} m5={} m10={}",
+						h, s_frame.kicks_scanned, usable_matrix(m) ? 1 : 0, pin_used_tops ? 1 : 0,
+						pin_read_offset, m[0], m[5], m[10]);
+			}
 
 			// Source 3, not the default 0. This candidate is the address a back-slice already
 			// resolved, re-read each frame -- calling it a window-scan hit made 'accept (sliced
@@ -1180,7 +1318,7 @@ namespace RemixVU1Capture
 			// does hold the camera outranks the kicks where it does not.
 			if (usable_matrix(m))
 			{
-				insert_candidate(m, ranked(2000.f, m), pinned, start_pc, ucode, 3);
+				insert_candidate(m, ranked(2000.f, m), pin_read_offset, start_pc, ucode, 3);
 
 				std::memcpy(s_pin_retained, m, sizeof(s_pin_retained));
 				s_pin_retained_valid = true;

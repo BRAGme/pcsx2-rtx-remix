@@ -39,12 +39,19 @@ namespace remix_ps2
 			u64 content_hash = 0;
 		};
 
+		// CPU-side decoded pixels for a resolved material, for the 2D overlay rasteriser.
+		// The payload is the same BGRA8 block handed to CreateTexture and kept resident for the
+		// life of the entry, so the pointer is valid until that material is reaped.
+		// Returns false when the hash is unknown or carries no pixels.
+		bool cpu_pixels(u64 content_hash, const u8*& out_pixels, u32& out_width, u32& out_height);
+
 		// Resets the per-frame CreateTexture budget. Call once per frame, before the reaps.
 		void begin_frame();
 
 		// 'source' is the GSTextureCache::Source the draw sampled, or null for an untextured
 		// draw. Never throws and never asserts: any failure degrades to a null material.
-		binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame);
+		binding bind(const runtime& rt, const GSTextureCache::Source* source, u64 frame,
+			bool allow_render_target_snapshot);
 
 		// The content hash for a source, computed and nothing else -- no texture upload, no
 		// material, no budget consumed, no cache entry.
@@ -89,6 +96,18 @@ namespace remix_ps2
 		// anything we submit.
 		remixapi_InstanceCategoryFlags categories_for(u64 content_hash);
 
+		// The OR of every category flag currently in the tag table, so a caller can test whether
+		// ANY texture carries a category before it computes a content hash to look one up with.
+		//
+		// The distinction matters because the hash is not free: hash_only() runs the same
+		// HashTextureLevel unswizzle-and-hash that makes bind() cost 1.7-2.6 us per call. A draw
+		// classifier that wants to consult the tag table BEFORE bind() runs (the sky path does --
+		// classification chooses the solver, and the solver is picked before any material exists)
+		// would otherwise pay that on every textured draw of every title, tagged or not.
+		//
+		// Rebuilt with the table, so it moves with generation(). Zero means no tags at all.
+		remixapi_InstanceCategoryFlags tagged_category_mask();
+
 		// Re-reads the conf layers if any of them changed on disk. Cheap (a stat per file, at
 		// most once a second); call once per frame.
 		void refresh_categories();
@@ -114,6 +133,7 @@ namespace remix_ps2
 		// can switch title, and up to a second of frames would otherwise run the previous
 		// game's settings.
 		void invalidate_game_config();
+		void on_state_loaded(const runtime& rt);
 
 		// Bumped every time the tag lists change on disk. The caller MUST fold this into its
 		// mesh hash: Remix binds the material into the mesh at CreateMesh time, so a mesh built
