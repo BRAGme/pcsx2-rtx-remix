@@ -1216,6 +1216,19 @@ namespace RemixSubmit
 		scene_bounds s_frame_bounds{};
 		scene_bounds s_last_bounds{};
 
+		// DEPTHDIAG (2026-08-27). The EE camera installs every frame but geometry un-projects
+		// to a 4-8 unit ball, so the guest's clip w and our recovered world units disagree by
+		// some factor. Guessing it twice made things worse; measure it instead. Accumulated
+		// per frame in the vertex loop, reported and reset once a second.
+		world_camera s_ee_pending_camera{};
+		bool s_ee_pending_valid = false;
+		u64 s_ee_installed = 0;
+
+		float s_dd_w_min = 1e30f, s_dd_w_max = -1e30f;
+		float s_dd_p_min[3] = {1e30f, 1e30f, 1e30f};
+		float s_dd_p_max[3] = {-1e30f, -1e30f, -1e30f};
+		u64 s_dd_verts = 0;
+
 		// Whether s_last_bounds was captured while world-anchored. Without this the drift guard
 		// cannot tell world-space bounds from view-space ones, and comparing a world-space eye
 		// against view-space bounds is a units error -- the bug that locked Rainbow Six 3 out of
@@ -2075,6 +2088,33 @@ namespace RemixSubmit
 		{
 			return std::clamp(env_int_live(L"PCSX2_REMIX_EECAM", 0), 0, 2);
 		}
+		// The EE gives Location + Rotation, i.e. the VIEW half only. The projection half is
+		// synthesised: make_perspective() builds the same row-vector convention the clip solver
+		// expects, and the solver reads only columns 0/1/3 so the depth column never matters.
+		// Defaults are the values the old solve reported for this title (fovY 48.1, 10:7).
+		float ee_cam_fov()    { static live_float v(L"PCSX2_REMIX_EECAMFOV", 48.1f);   return v.get(); }
+		float ee_cam_aspect() { static live_float v(L"PCSX2_REMIX_EECAMASPECT", 1.429f); return v.get(); }
+
+		// Depth calibration. The solver reads fused columns {0,1,3}; column 3 is what maps view
+		// depth to clip w, and the guest's Q is scaled by whatever projection IT used. A
+		// synthetic make_perspective() puts +-1 there, which is only right by luck. Measured
+		// 2026-08-27: with EECAM=2 the camera is valid every frame (fallback 0, held 0) but the
+		// scene still un-projects to a 4-8 unit ball, so recovered depth is ~100x too small and
+		// the eye sweeps past the geometry. This scales that column so depth can be calibrated
+		// against the real scene extent instead of guessed.
+		float ee_cam_w_scale() { static live_float v(L"PCSX2_REMIX_EECAMWSCALE", 1.f); return v.get(); }
+
+		// Depth calibration, applied to the CLIP VECTOR rather than the matrix.
+		//
+		// Scaling a fused column (EECAMWSCALE) changes the conditioning of the 3x3 the solver
+		// inverts and made the camera wobble; scaling clip uniformly leaves B untouched and is
+		// numerically safe. DEPTHDIAG measured why it is needed: the guest supplies
+		// clip w in [0.0008, 8.04] while the solver's bias terms are ~16,000, so (clip - bias)
+		// is all bias and every vertex collapses onto the eye -- world bounds ran from the
+		// origin to the camera on all three axes. A correct clip w IS view-space depth, which
+		// for this corridor should be tens to hundreds, so the guest's w is short by ~50-100x.
+		float ee_cam_depth_scale() { static live_float v(L"PCSX2_REMIX_EECAMDEPTH", 1.f); return v.get(); }
+
 		u32 ee_cam_loc_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMLOC", 0x00F0F670)); }
 		u32 ee_cam_rot_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMROT", 0x00F0F680)); }
 
@@ -2122,6 +2162,60 @@ namespace RemixSubmit
 			view.m[3][1] = -((p[0]*up[0])    + (p[1]*up[1])    + (p[2]*up[2]));
 			view.m[3][2] = -((p[0]*fwd[0])   + (p[1]*fwd[1])   + (p[2]*fwd[2]));
 			view.m[3][3] = 1.f;
+			return true;
+		}
+
+		// Assembles a complete world_camera from the EE view plus a synthetic projection,
+		// including the clip solver the geometry un-projection runs on. Without the solver
+		// the renderer would draw from the right eye while geometry stayed un-projected
+		// against the old broken one, which looks worse than leaving it alone.
+		bool build_ee_world_camera(world_camera& out)
+		{
+			float pos[3], ang[3];
+			remix_ps2::mat4 view{};
+			if (!read_ee_camera(pos, view, ang))
+				return false;
+
+			const float near_plane = 1.f;
+			const float far_plane = 100000.f;
+			remix_ps2::mat4 proj =
+				remix_ps2::make_perspective(ee_cam_fov(), ee_cam_aspect(), near_plane, far_plane);
+
+			// Scale the depth->w column. Anything non-unity here means the guest's projection
+			// disagreed with the synthetic one about how far a unit of view depth is.
+			const float wscale = ee_cam_w_scale();
+			if (wscale != 1.f && wscale > 0.f)
+			{
+				for (u32 i = 0; i < 4; ++i)
+					proj.m[i][3] *= wscale;
+			}
+
+			const remix_ps2::mat4 fused = remix_ps2::mat4_multiply(view, proj);
+
+			remix_ps2::clip_solver solver{};
+			if (!remix_ps2::make_clip_solver(fused, solver))
+				return false;
+
+			out = world_camera{};
+			out.valid = true;
+			out.view = view;
+			out.projection = proj;
+			out.solver = solver;
+			out.position[0] = pos[0];
+			out.position[1] = pos[1];
+			out.position[2] = pos[2];
+			out.near_plane = near_plane;
+			out.far_plane = far_plane;
+			// hash_floats() is declared further down this file; fnv_mix is already in scope.
+			u64 h = fnv_seed;
+			for (u32 i = 0; i < 16; ++i)
+			{
+				u32 bits;
+				std::memcpy(&bits, &fused.m[i / 4][i % 4], sizeof(bits));
+				h = fnv_mix(h, bits);
+			}
+			out.matrix_hash = h;
+			out.score = 1.f;
 			return true;
 		}
 		void place_debug_light(const float (&position)[3], float scene_radius)
@@ -10720,7 +10814,22 @@ namespace RemixSubmit
 				// a PS2 vertex's GS Z is a raw integer in a per-title convention, and w
 				// already carries the absolute depth, so x/y/w is exactly determined.
 				float world[3];
-				remix_ps2::solve_world_position(solver, ndc_x * w, ndc_y * w, w, world);
+				// Scale the whole clip vector, so NDC is preserved and only depth changes scale.
+				const float wk = (ee_cam_mode() == 2) ? (w * ee_cam_depth_scale()) : w;
+				remix_ps2::solve_world_position(solver, ndc_x * wk, ndc_y * wk, wk, world);
+
+				if (std::isfinite(w))
+				{
+					s_dd_w_min = std::min(s_dd_w_min, w);
+					s_dd_w_max = std::max(s_dd_w_max, w);
+					for (u32 k = 0; k < 3; ++k)
+					{
+						if (!std::isfinite(world[k])) continue;
+						s_dd_p_min[k] = std::min(s_dd_p_min[k], world[k]);
+						s_dd_p_max[k] = std::max(s_dd_p_max[k], world[k]);
+					}
+					++s_dd_verts;
+				}
 
 				remix_ps2::apply_world_basis_rotation(
 					s_active_camera.view, cam_pos, rot_mode, world, out.position);
@@ -11995,17 +12104,45 @@ namespace RemixSubmit
 		// trace all still see the real resolved camera.
 		refresh_window_size();
 
-		// EE camera probe. Mode 1 logs only -- nothing downstream consumes it yet.
+		// EE camera. Mode 1 logs only; mode 2 REPLACES the resolved camera outright -- view,
+		// projection and the clip solver together, so the geometry un-projection and the
+		// submitted viewpoint agree. Assigned here, ahead of submit_camera(), which is the
+		// same one-frame-lag contract the resolved camera already runs under.
 		if (ee_cam_mode() != 0)
 		{
 			float eepos[3], eeang[3];
 			remix_ps2::mat4 eeview{};
 			static u32 s_eecam_n = 0;
+			static u64 s_eecam_used = 0;
 			if (read_ee_camera(eepos, eeview, eeang))
 			{
+				// STAGED, not installed here. submit_camera() runs a few lines below and must
+				// send the camera THIS frame's geometry was already un-projected against -- the
+				// backend's own one-matrix contract. Installing a fresh read before that sent
+				// Remix a camera one frame ahead of the geometry, which is the view model
+				// lagging and the world sliding under motion. It looked fine with the dev menu
+				// open only because the emulator slows and the mismatch shrinks to nothing.
+				if (ee_cam_mode() == 2 && build_ee_world_camera(s_ee_pending_camera))
+					s_ee_pending_valid = true;
 				if ((s_eecam_n++ % 120) == 0)
-					INFO_LOG("Remix: EECAM pos {:.1f} {:.1f} {:.1f} | pitch {:+.1f} yaw {:+.1f} roll {:+.1f}",
-						eepos[0], eepos[1], eepos[2], eeang[0], eeang[1], eeang[2]);
+				{
+					if (s_dd_verts > 0)
+					{
+						INFO_LOG("Remix: DEPTHDIAG verts {} | clip w [{:.6g},{:.6g}] | world x[{:.1f},{:.1f}] "
+								 "y[{:.1f},{:.1f}] z[{:.1f},{:.1f}] | extent {:.1f} | eye {:.1f} {:.1f} {:.1f}",
+							s_dd_verts, s_dd_w_min, s_dd_w_max,
+							s_dd_p_min[0], s_dd_p_max[0], s_dd_p_min[1], s_dd_p_max[1],
+							s_dd_p_min[2], s_dd_p_max[2],
+							std::max(std::max(s_dd_p_max[0]-s_dd_p_min[0], s_dd_p_max[1]-s_dd_p_min[1]),
+								s_dd_p_max[2]-s_dd_p_min[2]),
+							eepos[0], eepos[1], eepos[2]);
+					}
+					s_dd_w_min = 1e30f; s_dd_w_max = -1e30f; s_dd_verts = 0;
+					for (u32 k = 0; k < 3; ++k) { s_dd_p_min[k] = 1e30f; s_dd_p_max[k] = -1e30f; }
+				}
+				if (false)
+					INFO_LOG("Remix: EECAM mode {} pos {:.1f} {:.1f} {:.1f} | pitch {:+.1f} yaw {:+.1f} roll {:+.1f} | used {}",
+						ee_cam_mode(), eepos[0], eepos[1], eepos[2], eeang[0], eeang[1], eeang[2], s_ee_installed);
 			}
 			else if ((s_eecam_n++ % 600) == 0)
 				INFO_LOG("Remix: EECAM read FAILED (eeMem {} loc {:#x})",
@@ -12018,6 +12155,16 @@ namespace RemixSubmit
 
 			if (hold_camera)
 				++s_stats.hold_cameras;
+		}
+
+		// Now install the staged EE camera: it governs the draws of the NEXT window, and is
+		// submitted at the NEXT VSync -- one matrix for geometry and camera, as designed.
+		if (s_ee_pending_valid)
+		{
+			s_active_camera = s_ee_pending_camera;
+			s_camera_last_accept_frame = s_frame_counter;
+			s_ee_pending_valid = false;
+			++s_ee_installed;
 		}
 
 		// Before Present, and before the beacon's empty-frame test, because a batched frame's
