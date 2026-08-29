@@ -241,6 +241,7 @@ namespace RemixSubmit
 			u64 cam_failed = 0;
 			// Draws rejected for rendering into a small off-screen target (PCSX2_REMIX_MINRT).
 			u64 skip_offscreen_rt = 0;
+			u64 skip_shadow_pass = 0; // depth-detached silhouette pass, not world geometry
 			// World-anchor (step 9) accounting. Every one of these has to be readable in a
 			// null result: "no candidate" and "candidates that never split" and "splits that
 			// scored zero" are three completely different findings.
@@ -699,6 +700,19 @@ namespace RemixSubmit
 		u64 s_meshtrack_seen = 0;
 		u32 s_meshtrack_verts = 0;
 		float s_meshtrack_dist = 0.f;
+		float s_meshtrack_normal[3] = {0.f, 0.f, 0.f};
+		float s_meshtrack_facing = 0.f; // dot(normal, eye - centroid), normalised
+
+		// LIGHTFIT. The projection null: an authored lamp and the fixture geometry it sits in must
+		// occupy the same world point. Geometry re-projects to the guest's own clip coordinates
+		// whatever projection we use, so only a world-space light exposes an error in it -- and
+		// the DIRECTION of the residual names the wrong parameter: perpendicular to the view means
+		// FOV or aspect, along it means depth scale.
+		float s_lightfit_light[3] = {0.f, 0.f, 0.f};
+		float s_lightfit_best_light[3] = {0.f, 0.f, 0.f};
+		float s_lightfit_vert[3] = {0.f, 0.f, 0.f};
+		float s_lightfit_best_d2 = 1e30f;
+		bool s_lightfit_armed = false;
 
 		// PCSX2_REMIX_UIMODE -- make menus and HUD render.
 		//
@@ -1955,7 +1969,32 @@ namespace RemixSubmit
 			return std::max(1e-6f, value.get());
 		}
 
-		std::vector<remixapi_LightHandle> s_level_lights;
+		// Radius around the camera outside which an authored light is not submitted. 0 disables the
+		// cull. Only the geometry the guest actually drew is submitted, so a light in another room
+		// has no walls to occlude it and lights this one straight through them.
+		// Physical radius of an authored sphere emitter, in world units. 0 keeps the authored value.
+		// UE2's LightRadius is a FALLOFF DISTANCE, not an emitter size, and remixapi's sphere radius
+		// is the emitter itself -- passing one into the other turns every lamp into a ball up to 256
+		// units across inside a ~400-unit corridor, which then intersects and occludes the walls.
+		float level_light_radius()
+		{
+			static live_float value(L"PCSX2_REMIX_LEVELLIGHTRADIUS", 0.f);
+			return std::max(0.f, value.get());
+		}
+
+		float level_light_range()
+		{
+			static live_float value(L"PCSX2_REMIX_LEVELLIGHTRANGE", 0.f);
+			return std::max(0.f, value.get());
+		}
+
+		struct level_light
+		{
+			remixapi_LightHandle handle;
+			float position[3];
+			bool distant; // a directional light has no position to cull against
+		};
+		std::vector<level_light> s_level_lights;
 		bool s_level_lights_built = false;
 
 		// UE2 hue/saturation -> linear RGB. Saturation is INVERTED in UE2: 255 is white and 0 is
@@ -2012,7 +2051,7 @@ namespace RemixSubmit
 
 			const remixapi_Interface& api = s_remix.api();
 			const float scale = level_light_scale();
-			u32 made = 0, failed = 0, suns = 0;
+			u32 made = 0, failed = 0, suns = 0, skipped_dark = 0;
 			char line[512];
 			while (std::fgets(line, sizeof(line), f))
 			{
@@ -2025,6 +2064,9 @@ namespace RemixSubmit
 				info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 				info.isDynamic = 1; // MUST be set or the runtime sleeps analytical lights
 
+				float lpos[3] = {0.f, 0.f, 0.f};
+				float radiance_boost = 1.f;
+				bool distant_light = false;
 				remixapi_LightInfoSphereEXT sphere{};
 				remixapi_LightInfoDistantEXT distant{};
 				float rgb[3] = {1.f, 1.f, 1.f};
@@ -2038,6 +2080,7 @@ namespace RemixSubmit
 					distant.angularDiameterDegrees = 0.5f;
 					info.pNext = &distant;
 					info.hash = 0x9C5241B210000000ull + suns;
+					distant_light = true;
 					++suns;
 				}
 				else if (std::sscanf(line, "LIGHT %f %f %f %f %f %u %u",
@@ -2045,25 +2088,39 @@ namespace RemixSubmit
 				{
 					ue2_hue_sat_to_rgb(hue, sat, rgb);
 					sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-					sphere.position = {ax + (x - ax) * pscale,
-					                   ay + (y - ay) * pscale,
-					                   az + (z - az) * pscale};
-					sphere.radius = std::max(0.01f, radius * pscale);
+					lpos[0] = ax + (x - ax) * pscale;
+					lpos[1] = ay + (y - ay) * pscale;
+					lpos[2] = az + (z - az) * pscale;
+					sphere.position = {lpos[0], lpos[1], lpos[2]};
+					const float authored_radius = std::max(0.01f, radius * pscale);
+					const float override_radius = level_light_radius();
+					sphere.radius = (override_radius > 0.f) ? override_radius : authored_radius;
+					// Emitted power is radiance x area, so shrinking the emitter without this would dim
+					// the lamp by the square of the change.
+					radiance_boost = (authored_radius * authored_radius) / (sphere.radius * sphere.radius);
 					sphere.shaping_hasvalue = 0;
 					info.pNext = &sphere;
 					info.hash = 0x9C5241B220000000ull + made;
+					// 37 of this map's 211 Light actors carry brightness 0 -- 29 of them radius 0 too,
+					// meaning the .rsm property walk found neither field. They emit nothing and exist
+					// only as clutter in the debug overlay.
+					if (bright <= 0.f)
+					{
+						++skipped_dark;
+						continue;
+					}
 				}
 				else
 					continue;
 
-				const float r = (bright / 255.f) * scale;
+				const float r = (bright / 255.f) * scale * radiance_boost;
 				info.radiance = {rgb[0] * r, rgb[1] * r, rgb[2] * r};
 
 				remixapi_LightHandle h = nullptr;
 				if (remix_ps2::guarded_create_light(api.CreateLight, &info, &h) ==
 						REMIXAPI_ERROR_CODE_SUCCESS && h)
 				{
-					s_level_lights.push_back(h);
+					s_level_lights.push_back({h, {lpos[0], lpos[1], lpos[2]}, distant_light});
 					++made;
 				}
 				else
@@ -2071,8 +2128,8 @@ namespace RemixSubmit
 			}
 			std::fclose(f);
 
-			INFO_LOG("Remix: LEVELLIGHTS loaded '{}' -- created {} ({} distant) failed {} scale {:.3f} posscale {:.5f} anchor {:.0f} {:.0f} {:.0f}",
-				path, made, suns, failed, scale, pscale, ax, ay, az);
+			INFO_LOG("Remix: LEVELLIGHTS loaded '{}' -- created {} ({} distant) failed {} skipped-dark {} scale {:.3f} posscale {:.5f} anchor {:.0f} {:.0f} {:.0f}",
+				path, made, suns, failed, skipped_dark, scale, pscale, ax, ay, az);
 		}
 		// --- EE-resident camera ---------------------------------------------------------------
 		// FOUND 2026-08-27 by diffing three save states (still / turn in place / walk+turn):
@@ -2092,8 +2149,25 @@ namespace RemixSubmit
 		// synthesised: make_perspective() builds the same row-vector convention the clip solver
 		// expects, and the solver reads only columns 0/1/3 so the depth column never matters.
 		// Defaults are the values the old solve reported for this title (fovY 48.1, 10:7).
-		float ee_cam_fov()    { static live_float v(L"PCSX2_REMIX_EECAMFOV", 48.1f);   return v.get(); }
-		float ee_cam_aspect() { static live_float v(L"PCSX2_REMIX_EECAMASPECT", 1.429f); return v.get(); }
+		// Read live, refreshed once per frame alongside the depth scale. These decide where a
+		// WORLD-SPACE light lands relative to the geometry: geometry re-projects to the guest's own
+		// clip coordinates by construction whatever projection we use, but a light is projected
+		// directly, so an error here separates the two -- proportionally to distance from screen
+		// centre and changing sign across it. Never validated against the guest's real projection.
+		float s_ee_fov = -1.f;
+		float s_ee_aspect = -1.f;
+		float ee_cam_fov()
+		{
+			if (s_ee_fov < 0.f)
+				s_ee_fov = env_float_signed(L"PCSX2_REMIX_EECAMFOV", 48.1f);
+			return s_ee_fov;
+		}
+		float ee_cam_aspect()
+		{
+			if (s_ee_aspect < 0.f)
+				s_ee_aspect = env_float_signed(L"PCSX2_REMIX_EECAMASPECT", 1.429f);
+			return s_ee_aspect;
+		}
 
 		// Depth calibration. The solver reads fused columns {0,1,3}; column 3 is what maps view
 		// depth to clip w, and the guest's Q is scaled by whatever projection IT used. A
@@ -2113,7 +2187,17 @@ namespace RemixSubmit
 		// is all bias and every vertex collapses onto the eye -- world bounds ran from the
 		// origin to the camera on all three axes. A correct clip w IS view-space depth, which
 		// for this corridor should be tens to hundreds, so the guest's w is short by ~50-100x.
-		float ee_cam_depth_scale() { static live_float v(L"PCSX2_REMIX_EECAMDEPTH", 1.f); return v.get(); }
+		// Read live, and cached per frame rather than per vertex: this is the dial that decides
+		// where the recovered world sits relative to the map's own light coordinates, so it has to
+		// be tunable while the game runs. live_float cannot do that -- it re-parses only when
+		// knob_generation() moves, and the per-game .conf never moves it (see env_float_signed).
+		float s_ee_depth_scale = -1.f;
+		float ee_cam_depth_scale()
+		{
+			if (s_ee_depth_scale < 0.f)
+				s_ee_depth_scale = env_float_signed(L"PCSX2_REMIX_EECAMDEPTH", 1.f);
+			return s_ee_depth_scale;
+		}
 
 		u32 ee_cam_loc_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMLOC", 0x00F0F670)); }
 		u32 ee_cam_rot_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMROT", 0x00F0F680)); }
@@ -2893,6 +2977,16 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// Distance from the eye at which a sky draw is planted, in world units. 0 disables the push
+		// and leaves the old behaviour. The SKY instance category is delete-on-sight on the remixapi
+		// path, so pushing is the only way to keep a backdrop at all: the draw is placed on a sphere
+		// around the camera and submitted as ordinary geometry.
+		float sky_distance()
+		{
+			static live_float value(L"PCSX2_REMIX_SKYDIST", 0.f);
+			return std::max(0.f, value.get());
+		}
+
 		bool s_logged_sky_camera = false;
 
 		// Whether to submit a REMIXAPI_CAMERA_TYPE_VIEW_MODEL camera. Harmless on its own: the
@@ -2991,7 +3085,7 @@ namespace RemixSubmit
 
 					INFO_LOG("Remix: CAMTRACK fwd {:+.4f} {:+.4f} {:+.4f} | right {:+.4f} {:+.4f} {:+.4f} "
 							 "| pos {:.1f} {:.1f} {:.1f} | scene centre {:.1f} {:.1f} {:.1f}"
-							 " | MESHTRACK id {:08X} {} verts seen {} centroid {:.1f} {:.1f} {:.1f} dist {:.0f}",
+							 " | MESHTRACK id {:08X} {} verts seen {} centroid {:.1f} {:.1f} {:.1f} dist {:.0f} n {:+.3f} {:+.3f} {:+.3f} facing {:+.3f}",
 						cam.view.m[0][2], cam.view.m[1][2], cam.view.m[2][2],
 						cam.view.m[0][0], cam.view.m[1][0], cam.view.m[2][0],
 						cam.position[0], cam.position[1], cam.position[2],
@@ -2999,7 +3093,8 @@ namespace RemixSubmit
 						static_cast<u32>(s_meshtrack_hash & 0xFFFFFFFFull),
 						s_meshtrack_verts, s_meshtrack_seen,
 						s_meshtrack_centroid[0], s_meshtrack_centroid[1], s_meshtrack_centroid[2],
-						s_meshtrack_dist);
+						s_meshtrack_dist, s_meshtrack_normal[0], s_meshtrack_normal[1],
+						s_meshtrack_normal[2], s_meshtrack_facing);
 					// Re-elect next window so the biggest CURRENTLY VISIBLE mesh is reported.
 					s_meshtrack_verts = 0;
 				}
@@ -6312,6 +6407,12 @@ namespace RemixSubmit
 				return;
 			}
 
+			// EECAM 2 owns s_active_camera: it is installed in OnVSync from the game's actor
+			// Location/Rotation, and a VU1 winner accepted here would govern the next window's
+			// draws instead, alternating the scene between two spaces.
+			if (ee_cam_mode() == 2)
+				return;
+
 			s_active_camera = camera;
 			s_camera_last_accept_frame = s_frame_counter;
 			++s_stats.cam_accept;
@@ -8679,6 +8780,20 @@ namespace RemixSubmit
 		//
 		// Absolute, NOT relative to the largest target seen: see the gate itself for why the
 		// relative version culled the whole world.
+		// Drop the depth-detached silhouette pass. Measured on R6 3 (logsemix_draws.txt, 708
+		// draws): every real surface and every real character uses ZTST=2 (GEQUAL) with depth
+		// writes on. Exactly 9 draws use ZTST=1 (ALWAYS) with ZMSK=1 (no depth write) -- 1.3% of
+		// the draws carrying 24% of the vertices, all one ~3730-vertex character mesh at the same
+		// draw index every frame. A character composited without participating in the depth buffer
+		// is the game's shadow/silhouette pass, and un-projected with the player's camera it is the
+		// ghost body that floats through walls. 0 disables the gate.
+		int shadow_pass_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_SHADOWPASS", 0), 0, 1));
+			return value;
+		}
+
 		int offscreen_rt_min_area()
 		{
 			static const int value =
@@ -9027,8 +9142,13 @@ namespace RemixSubmit
 			out.blend = blend;
 			out.is_sky = is_sky;
 			out.is_cutout = is_cutout;
-			out.categories = tagged |
-			                 (is_sky ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) : 0u) |
+			// A pushed sky must not carry REMIXAPI_INSTANCE_CATEGORY_BIT_SKY: the runtime deletes
+			// that category outright on this path, so the bit would remove the geometry the push
+			// just placed. Stripped from the tag list as well, which is where it usually arrives.
+			const u32 sky_bit = static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY);
+			const bool pushing_sky = sky_distance() > 0.f;
+			out.categories = (pushing_sky ? (tagged & ~sky_bit) : tagged) |
+			                 ((is_sky && !pushing_sky) ? sky_bit : 0u) |
 			                 (is_cutout ? static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT) : 0u);
 			return out;
 		}
@@ -9608,7 +9728,7 @@ namespace RemixSubmit
 
 			INFO_LOG("Remix: frame {} | seen {} submitted {} | meshes live {} (+{} -{}) | "
 					 "skip: tri {} untex {} fst {} constq {} wflat {} notarget {} empty {} large {} "
-					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} offscreenrt {} | "
+					 "nonfinite {} poisoned {} meshbudget {} fbmsk {} coincident {} multipass {} minw {} minvw {} offscreenrt {} shadowpass {} | "
 					 "warn stq {} | cam world {} fallback {} held {} expired {} skycam {} vmcam {} REFUSED {} | "
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} sky_hash {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
@@ -9620,7 +9740,7 @@ namespace RemixSubmit
 				s_stats.skip_const_q, s_stats.skip_w_flat, s_stats.skip_no_target, s_stats.skip_empty,
 				s_stats.skip_too_large, s_stats.skip_nonfinite, s_stats.skip_poisoned,
 				s_stats.skip_mesh_budget, s_stats.skip_fbmsk, s_stats.skip_coincident, s_stats.multipass_overlay,
-				s_stats.skip_minw, s_stats.skip_min_vertex_w, s_stats.skip_offscreen_rt,
+				s_stats.skip_minw, s_stats.skip_min_vertex_w, s_stats.skip_offscreen_rt, s_stats.skip_shadow_pass,
 				s_stats.warn_inaccurate_stq, s_stats.cam_world, s_stats.cam_fallback, s_stats.cam_held_gap, s_stats.cam_hold_expired, s_stats.cam_sky, s_stats.cam_viewmodel,
 				s_stats.cam_failed,
 				s_max_seen_position, max_position_magnitude(), s_last_bounds.radius(),
@@ -10495,6 +10615,30 @@ namespace RemixSubmit
 		// An absolute area has none of that ordering dependence: 128x128 = 16,384 is rejected at any
 		// threshold that keeps 640x448 = 286,720, and a title with an unusual framebuffer (512x224 =
 		// 114,688) still clears a 65,536 setting comfortably. 0 disables the gate.
+		// RTSIZE census: what render-target shapes this title actually draws into, so MINRT can be
+		// set from measurement. A shadow pass rendered from a light's viewpoint is a small target;
+		// the main framebuffer is the large one that must survive.
+		{
+			static std::map<u32, u64> census;
+			static u32 rt_n = 0;
+			const u32 key = (static_cast<u32>(rt_unscaled_width) << 16) | static_cast<u32>(rt_unscaled_height & 0xFFFF);
+			++census[key];
+			if ((rt_n++ % 20000) == 0 && !census.empty())
+			{
+				std::string line;
+				for (const auto& [k, n] : census)
+					line += fmt::format(" {}x{}={} (area {})", k >> 16, k & 0xFFFF, n, (k >> 16) * (k & 0xFFFF));
+				INFO_LOG("Remix: RTSIZE census --{}", line);
+			}
+		}
+
+		if (shadow_pass_mode() != 0 && r.m_cached_ctx.TEST.ZTE != 0 &&
+			r.m_cached_ctx.TEST.ZTST == 1 && r.m_cached_ctx.ZBUF.ZMSK != 0)
+		{
+			++s_stats.skip_shadow_pass;
+			return;
+		}
+
 		if (const int min_rt_area = offscreen_rt_min_area(); min_rt_area > 0)
 		{
 			if ((rt_unscaled_width * rt_unscaled_height) < min_rt_area)
@@ -10708,6 +10852,11 @@ namespace RemixSubmit
 				classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(),
 					s_submitted_this_frame, draw_samples_render_target(tex_source), sky_gate_min_w));
 
+		// Independent of SKYCAM: that knob only chooses the solver. The push replaces the guest's
+		// depth outright, so the base solver plants the draw on a sphere centred on the eye --
+		// which is what a skybox is -- rather than 5 feet in front of the player.
+		const bool sky_push = (sky_distance() > 0.f) && (cloud_sky_draw || hash_sky_draw);
+
 		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : base_solver;
 
 		s_scratch_vertices.clear();
@@ -10815,8 +10964,28 @@ namespace RemixSubmit
 				// already carries the absolute depth, so x/y/w is exactly determined.
 				float world[3];
 				// Scale the whole clip vector, so NDC is preserved and only depth changes scale.
-				const float wk = (ee_cam_mode() == 2) ? (w * ee_cam_depth_scale()) : w;
+				const float wk = sky_push ? sky_distance() :
+					((ee_cam_mode() == 2) ? (w * ee_cam_depth_scale()) : w);
 				remix_ps2::solve_world_position(solver, ndc_x * wk, ndc_y * wk, wk, world);
+
+				// A constant wk puts every sky vertex at the same VIEW DEPTH, which is a plane normal
+				// to the view -- camera-locked geometry, measured as the sky mesh normal's Z tracking
+				// the camera forward's Z exactly. Re-project onto a sphere of that radius about the
+				// eye instead, which is what a backdrop actually is.
+				if (sky_push)
+				{
+					const float ox = world[0] - s_active_camera.position[0];
+					const float oy = world[1] - s_active_camera.position[1];
+					const float oz = world[2] - s_active_camera.position[2];
+					const float olen = std::sqrt((ox * ox) + (oy * oy) + (oz * oz));
+					if (std::isfinite(olen) && olen > 1e-6f)
+					{
+						const float scale_to_sphere = wk / olen;
+						world[0] = s_active_camera.position[0] + (ox * scale_to_sphere);
+						world[1] = s_active_camera.position[1] + (oy * scale_to_sphere);
+						world[2] = s_active_camera.position[2] + (oz * scale_to_sphere);
+					}
+				}
 
 				if (std::isfinite(w))
 				{
@@ -10870,7 +11039,55 @@ namespace RemixSubmit
 				!(w > 0.0f))
 			{
 				++s_stats.skip_nonfinite;
+				// NFWHY. One bucket cannot say whether these draws are arithmetic casualties or
+				// simply behind the eye, and those need opposite fixes.
+				{
+					static u64 nf_nan = 0, nf_big = 0, nf_w = 0, nf_n = 0;
+					const bool nan_hit = !std::isfinite(out.position[0]) || !std::isfinite(out.position[1]) ||
+						!std::isfinite(out.position[2]);
+					if (nan_hit) ++nf_nan;
+					else if (!(w > 0.0f)) ++nf_w;
+					else ++nf_big;
+					if ((nf_n++ % 20000) == 0)
+					{
+						// Whether the draw is salvageable: if every vertex but this one yields a
+						// finite positive w, discarding the whole draw throws away real geometry.
+						u32 good = 0;
+						for (u32 j = 0; j < vertex_count; ++j)
+						{
+							const float qj = fallback_screen_ui ? 1.f : (z_depth ?
+								static_cast<float>((static_cast<double>(verts[j].XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
+								verts[j].RGBAQ.Q);
+							const float wj = 1.0f / qj;
+							if (std::isfinite(wj) && wj > 0.f)
+								++good;
+						}
+						INFO_LOG("Remix: NFWHY nan {} w<=0 {} overlimit {} | this draw: good {}/{} vert {} "
+								 "w {:.6g} pos {:.1f} {:.1f} {:.1f} tex {} prim {}",
+							nf_nan, nf_w, nf_big, good, vertex_count, i, w,
+							out.position[0], out.position[1], out.position[2],
+							r.m_process_texture ? 1 : 0, static_cast<int>(r.m_vt.m_primclass));
+					}
+				}
 				return;
+			}
+
+			if (s_lightfit_armed && world_mode)
+			{
+				const float lx = out.position[0] - s_lightfit_light[0];
+				const float ly = out.position[1] - s_lightfit_light[1];
+				const float lz = out.position[2] - s_lightfit_light[2];
+				const float ld2 = (lx * lx) + (ly * ly) + (lz * lz);
+				if (ld2 < s_lightfit_best_d2)
+				{
+					s_lightfit_best_d2 = ld2;
+					s_lightfit_vert[0] = out.position[0];
+					s_lightfit_vert[1] = out.position[1];
+					s_lightfit_vert[2] = out.position[2];
+					s_lightfit_best_light[0] = s_lightfit_light[0];
+					s_lightfit_best_light[1] = s_lightfit_light[1];
+					s_lightfit_best_light[2] = s_lightfit_light[2];
+				}
 			}
 
 			const float vert_max_pos = std::max({std::abs(out.position[0]),
@@ -11138,6 +11355,27 @@ namespace RemixSubmit
 			n[0] /= len;
 			n[1] /= len;
 			n[2] /= len;
+
+			// Orient it toward the eye. The cross product's sign follows the triangle's winding,
+			// and PS2 strip-to-list conversion does not keep winding consistent -- measured as two
+			// adjacent meshes carrying exactly opposite normals in one frame. doubleSided then
+			// resolves each ray toward the viewer, which makes the shading normal view-dependent
+			// and sweeps light across surfaces as the camera turns. The guest rasterised this
+			// triangle, so its front face is the one pointing at the eye.
+			{
+				const float cx = (v0.position[0] + v1.position[0] + v2.position[0]) * (1.f / 3.f);
+				const float cy = (v0.position[1] + v1.position[1] + v2.position[1]) * (1.f / 3.f);
+				const float cz = (v0.position[2] + v1.position[2] + v2.position[2]) * (1.f / 3.f);
+				const float ex = s_active_camera.position[0] - cx;
+				const float ey = s_active_camera.position[1] - cy;
+				const float ez = s_active_camera.position[2] - cz;
+				if (((n[0] * ex) + (n[1] * ey) + (n[2] * ez)) < 0.f)
+				{
+					n[0] = -n[0];
+					n[1] = -n[1];
+					n[2] = -n[2];
+				}
+			}
 
 			// The whole triangle shares it: doubleSided = 1 makes the winding irrelevant.
 			for (u32 k = 0; k < 3; ++k)
@@ -11410,7 +11648,10 @@ namespace RemixSubmit
 			const float cam_dist = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
 
 			const u32 verts = static_cast<u32>(s_scratch_vertices.size());
-			if (verts >= 256 && cam_dist > 3000.f && verts > s_meshtrack_verts)
+			// 3000 was set when the un-projection scattered the scene; the EE camera resolves a
+			// room ~580 units across, so nothing was ever far enough and this never fired. The
+			// bound only has to clear the player (~10 units) and the weapon.
+			if (verts >= 64 && cam_dist > 250.f && verts > s_meshtrack_verts)
 			{
 				s_meshtrack_hash = hash;
 				s_meshtrack_verts = verts;
@@ -11418,6 +11659,14 @@ namespace RemixSubmit
 				s_meshtrack_centroid[1] = centroid[1];
 				s_meshtrack_centroid[2] = centroid[2];
 				s_meshtrack_dist = cam_dist;
+				{
+					const remixapi_HardcodedVertex& nv = s_scratch_vertices[s_scratch_indices[0]];
+					s_meshtrack_normal[0] = nv.normal[0];
+					s_meshtrack_normal[1] = nv.normal[1];
+					s_meshtrack_normal[2] = nv.normal[2];
+					const float inv = (cam_dist > 0.f) ? (1.f / cam_dist) : 0.f;
+					s_meshtrack_facing = ((nv.normal[0] * -dx) + (nv.normal[1] * -dy) + (nv.normal[2] * -dz)) * inv;
+				}
 				++s_meshtrack_seen;
 			}
 		}
@@ -12108,6 +12357,58 @@ namespace RemixSubmit
 		// projection and the clip solver together, so the geometry un-projection and the
 		// submitted viewpoint agree. Assigned here, ahead of submit_camera(), which is the
 		// same one-frame-lag contract the resolved camera already runs under.
+		s_ee_depth_scale = env_float_signed(L"PCSX2_REMIX_EECAMDEPTH", 1.f);
+		s_ee_fov = env_float_signed(L"PCSX2_REMIX_EECAMFOV", 48.1f);
+		s_ee_aspect = env_float_signed(L"PCSX2_REMIX_EECAMASPECT", 1.429f);
+
+		// LIGHTFIT: pick the emitting lamp nearest the eye, report last frame's residual against it,
+		// then arm the next frame's search.
+		if (level_lights_mode() != 0 && !s_level_lights.empty())
+		{
+			static u32 lf_n = 0;
+			if (s_lightfit_armed && s_lightfit_best_d2 < 1e29f && (lf_n++ % 120) == 0)
+			{
+				const float dx = s_lightfit_vert[0] - s_lightfit_best_light[0];
+				const float dy = s_lightfit_vert[1] - s_lightfit_best_light[1];
+				const float dz = s_lightfit_vert[2] - s_lightfit_best_light[2];
+				const float ex = s_lightfit_best_light[0] - s_active_camera.position[0];
+				const float ey = s_lightfit_best_light[1] - s_active_camera.position[1];
+				const float ez = s_lightfit_best_light[2] - s_active_camera.position[2];
+				const float elen = std::sqrt((ex * ex) + (ey * ey) + (ez * ez));
+				const float along = (elen > 0.f) ? (((dx * ex) + (dy * ey) + (dz * ez)) / elen) : 0.f;
+				const float total = std::sqrt(s_lightfit_best_d2);
+				const float perp = std::sqrt(std::max(0.f, (total * total) - (along * along)));
+				INFO_LOG("Remix: LIGHTFIT lamp {:.0f} {:.0f} {:.0f} at {:.0f} from eye | nearest vertex "
+						 "{:.0f} {:.0f} {:.0f} | residual {:.1f} (along view {:+.1f}, perpendicular {:.1f}) "
+						 "| fov {:.1f} aspect {:.3f} depth {:.0f}",
+					s_lightfit_best_light[0], s_lightfit_best_light[1], s_lightfit_best_light[2], elen,
+					s_lightfit_vert[0], s_lightfit_vert[1], s_lightfit_vert[2],
+					total, along, perp, ee_cam_fov(), ee_cam_aspect(), ee_cam_depth_scale());
+				s_lightfit_best_d2 = 1e30f;
+			}
+
+			float best = 1e30f;
+			for (const level_light& ll : s_level_lights)
+			{
+				if (ll.distant)
+					continue;
+				const float dx = ll.position[0] - s_active_camera.position[0];
+				const float dy = ll.position[1] - s_active_camera.position[1];
+				const float dz = ll.position[2] - s_active_camera.position[2];
+				const float d2 = (dx * dx) + (dy * dy) + (dz * dz);
+				if (d2 < best)
+				{
+					best = d2;
+					s_lightfit_light[0] = ll.position[0];
+					s_lightfit_light[1] = ll.position[1];
+					s_lightfit_light[2] = ll.position[2];
+				}
+			}
+			s_lightfit_armed = (best < 1e29f);
+		}
+		s_ee_fov = env_float_signed(L"PCSX2_REMIX_EECAMFOV", 48.1f);
+		s_ee_aspect = env_float_signed(L"PCSX2_REMIX_EECAMASPECT", 1.429f);
+
 		if (ee_cam_mode() != 0)
 		{
 			float eepos[3], eeang[3];
@@ -12243,16 +12544,31 @@ namespace RemixSubmit
 
 				// Authored level lights, if loaded. Drawn every presented frame like the others.
 				build_level_lights();
-				for (const remixapi_LightHandle h : s_level_lights)
-					draw_light(h, "level");
+				const float light_range = level_light_range();
+				u32 culled = 0;
+				for (const level_light& ll : s_level_lights)
+				{
+					if (light_range > 0.f && !ll.distant)
+					{
+						const float dx = ll.position[0] - s_active_camera.position[0];
+						const float dy = ll.position[1] - s_active_camera.position[1];
+						const float dz = ll.position[2] - s_active_camera.position[2];
+						if (((dx * dx) + (dy * dy) + (dz * dz)) > (light_range * light_range))
+						{
+							++culled;
+							continue;
+						}
+					}
+					draw_light(ll.handle, "level");
+				}
 
 				if (accepted != s_light_draw_last_ok)
 				{
 					s_light_draw_last_ok = accepted;
 					INFO_LOG("Remix: DrawLightInstance accepted {} of {} lights this window "
-							 "(sphere {}, key {}, dome {})",
+							 "(sphere {}, key {}, dome {}), {} level lights out of range",
 						accepted, attempted, s_debug_light ? "yes" : "no", s_sun_light ? "yes" : "no",
-						s_dome_light ? "yes" : "no");
+						s_dome_light ? "yes" : "no", culled);
 				}
 			}
 
@@ -12294,7 +12610,10 @@ namespace RemixSubmit
 			// while placing every vertex somewhere wrong. That is the failure the internal
 			// consistency checks cannot see: SOCOM's accepted camera measures depth scale 0.9999
 			// and anisotropy 2.6x, both perfect, and still explodes the scene 1,450x.
-			if (s_frame_bounds_world && s_active_camera.valid && s_frame_max_w > 0.f)
+			// EECAM 2 is exempt: its world units come from the game's own actors and relate to the
+			// guest's clip w only through PCSX2_REMIX_EECAMDEPTH, so the ratio this tests is
+			// non-unity by construction and no camera read that way can ever pass it.
+			if (s_frame_bounds_world && s_active_camera.valid && s_frame_max_w > 0.f && ee_cam_mode() != 2)
 			{
 				const float world_radius = s_frame_bounds.radius();
 				const float ratio = world_radius / s_frame_max_w;

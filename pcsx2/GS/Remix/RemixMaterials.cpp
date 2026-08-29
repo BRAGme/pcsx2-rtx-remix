@@ -103,6 +103,21 @@ namespace remix_ps2::materials
 			return value;
 		}
 
+		// Perceptual roughness for every legacy (non-replaced) material. 0.7 matches the runtime's
+		// own default. PS2 titles ship no roughness map, so this single constant decides how glossy
+		// the whole world is, and a low value gives every bright light a broad specular lobe that
+		// slides across surfaces as the view moves.
+		float legacy_roughness()
+		{
+			static const float value = [] {
+				const std::wstring raw = read_env(L"PCSX2_REMIX_ROUGHNESS");
+				if (raw.empty())
+					return 0.7f;
+				return std::clamp(static_cast<float>(std::wcstod(raw.c_str(), nullptr)), 0.f, 1.f);
+			}();
+			return value;
+		}
+
 		// Mirrors RemixSubmit's PCSX2_REMIX_ALPHASTATE so the material flag and the instance
 		// struct can never disagree.
 		int alpha_state_mode()
@@ -965,7 +980,7 @@ namespace remix_ps2::materials
 			opaque.anisotropy = 0.f;
 			opaque.albedoConstant = {1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
-			opaque.roughnessConstant = 0.7f;
+			opaque.roughnessConstant = legacy_roughness();
 			opaque.metallicConstant = 0.f;
 			opaque.thinFilmThickness_hasvalue = 0;
 			opaque.thinFilmThickness_value = 0.f;
@@ -1092,7 +1107,7 @@ namespace remix_ps2::materials
 			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
 			opaque.albedoConstant = {1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
-			opaque.roughnessConstant = 0.7f;
+			opaque.roughnessConstant = legacy_roughness();
 			opaque.metallicConstant = 0.f;
 			opaque.useDrawCallAlphaState = (alpha_state_mode() != 0) ? 1 : 0;
 			opaque.alphaTestType = 7;
@@ -1749,7 +1764,7 @@ namespace remix_ps2::materials
 			// White, so the per-vertex RGBAQ colour is what decides the surface colour.
 			opaque.albedoConstant = {1.f, 1.f, 1.f};
 			opaque.opacityConstant = 1.f;
-			opaque.roughnessConstant = 0.7f;
+			opaque.roughnessConstant = legacy_roughness();
 			opaque.metallicConstant = 0.f;
 			opaque.thinFilmThickness_hasvalue = 0;
 			opaque.thinFilmThickness_value = 0.f;
