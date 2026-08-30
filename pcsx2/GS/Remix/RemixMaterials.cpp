@@ -107,6 +107,25 @@ namespace remix_ps2::materials
 		// own default. PS2 titles ship no roughness map, so this single constant decides how glossy
 		// the whole world is, and a low value gives every bright light a broad specular lobe that
 		// slides across surfaces as the view moves.
+		// Self-illuminate every textured material, so the folded lightmap in vertex colour becomes
+		// EMITTED radiance rather than albedo that still needs a light. Remix's fixed-function
+		// stage feeds emissive through the same Arg1=Texture / Arg2=VertexColor0 / Modulate path
+		// as albedo, so emissive = texture x lightmap -- exactly what the PS2 put on screen.
+		//
+		// The point of doing it this way: light that does not exist cannot leak in through walls
+		// we never submit, and only the surfaces the guest drew are visible anyway. 0 = off, and
+		// the per-texture emissive tag list still works independently.
+		float lightmap_emissive()
+		{
+			static const float value = [] {
+				const std::wstring raw = read_env(L"PCSX2_REMIX_LIGHTMAPEMISSIVE");
+				if (raw.empty())
+					return 0.f;
+				return std::max(0.f, static_cast<float>(std::wcstod(raw.c_str(), nullptr)));
+			}();
+			return value;
+		}
+
 		float legacy_roughness()
 		{
 			static const float value = [] {
@@ -1003,8 +1022,11 @@ namespace remix_ps2::materials
 			// This is what turns a tagged fixture into an actual light source: WORLD_UI alone
 			// makes it render bright but contributes nothing to the path tracer, which is why
 			// the level still needed the follow-cam debug light.
-			const bool is_emissive = (material_stage() >= 4) && (s_emissive.count(content_hash) != 0);
-			const float intensity = is_emissive ? emissive_intensity() : 0.f;
+			const bool tagged_emissive = (material_stage() >= 4) && (s_emissive.count(content_hash) != 0);
+			const bool is_emissive = tagged_emissive ||
+				((material_stage() >= 4) && lightmap_emissive() > 0.f);
+			const float intensity = tagged_emissive ? emissive_intensity() :
+				(is_emissive ? lightmap_emissive() : 0.f);
 
 			remixapi_MaterialInfo material{};
 			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
@@ -1100,8 +1122,11 @@ namespace remix_ps2::materials
 			wchar_t albedo_path[32]{};
 			::swprintf_s(albedo_path, L"0x%016llX", static_cast<unsigned long long>(content_hash));
 
-			const bool is_emissive = (material_stage() >= 4) && (s_emissive.count(content_hash) != 0);
-			const float intensity = is_emissive ? emissive_intensity() : 0.f;
+			const bool tagged_emissive = (material_stage() >= 4) && (s_emissive.count(content_hash) != 0);
+			const bool is_emissive = tagged_emissive ||
+				((material_stage() >= 4) && lightmap_emissive() > 0.f);
+			const float intensity = tagged_emissive ? emissive_intensity() :
+				(is_emissive ? lightmap_emissive() : 0.f);
 
 			remixapi_MaterialInfoOpaqueEXT opaque{};
 			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
@@ -1647,6 +1672,14 @@ namespace remix_ps2::materials
 
 		++s_category_hits;
 		return it->second;
+	}
+
+	bool decode_source(const GSTextureCache::Source* source, std::vector<u8>& out_pixels,
+		u32& out_width, u32& out_height)
+	{
+		if (!source || source->m_from_target)
+			return false;
+		return decode(*source, out_pixels, out_width, out_height);
 	}
 
 	u64 hash_only(const GSTextureCache::Source* source)

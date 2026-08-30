@@ -447,6 +447,11 @@ namespace RemixSubmit
 			std::unordered_map<u64, size_t> surface_of_material;
 			std::vector<batch_surface> surfaces;
 			size_t surfaces_used = 0;
+			// Content key for mesh reuse. The flush used to hash s_frame_counter and the group index,
+			// which is unique per frame BY CONSTRUCTION -- so Remix received a new mesh handle for
+			// identical geometry every frame and nothing could ever have a stable identity. Each draw
+			// mixes its own (camera-invariant, see the stable_id branch) hash in as it joins.
+			u64 content = fnv_seed;
 		};
 
 		// Kept allocated across frames and cleared rather than destroyed -- a frame's worth of
@@ -468,6 +473,14 @@ namespace RemixSubmit
 		};
 
 		std::vector<batch_mesh> s_batch_meshes;
+		// Reuse a batch group's mesh across frames instead of recreating it. The comment at the
+		// CreateMesh call justified per-frame creation with "the geometry is camera-derived and
+		// genuinely new every frame" -- true before the EE camera, false after it: MESHTRACK measures
+		// static geometry holding its world position to 1.4 units while the player turns. Recreating
+		// it hands Remix a new mesh handle every frame, so nothing has a stable identity, the denoiser
+		// gets no temporal history, and the texture-categorisation UI has nothing to hover.
+		std::unordered_map<u64, batch_mesh> s_batch_mesh_cache;
+		u64 s_batch_reused = 0;
 		std::vector<remixapi_MeshInfoSurfaceTriangles> s_batch_surface_scratch;
 
 		// What one flush actually instanced, kept so an empty window can re-present it instead of
@@ -508,6 +521,13 @@ namespace RemixSubmit
 		// Distinct (blend state, category) groups seen this frame, counted even when batching is
 		// off so the feasibility question can be answered without turning it on.
 		std::unordered_set<u64> s_frame_group_keys;
+
+		int batch_reuse_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_BATCHREUSE", 0), 0, 1));
+			return value;
+		}
 
 		int batch_mode()
 		{
@@ -8910,6 +8930,61 @@ namespace RemixSubmit
 			out_rgb[2] = writes_b ? 1.f : 0.f;
 		}
 
+		// Fold the baked lightmap into the BASE surface's vertex colours.
+		//
+		// Measured (LMPAIR): the masked channel passes re-draw the base pass's vertices exactly --
+		// 236,001 of 236,001, no exceptions -- so the lightmap can be sampled per vertex and
+		// multiplied into the colour we already submit. That needs NO extra geometry, which is the
+		// whole point: submitting the passes as decals put four coincident surfaces on every wall
+		// and produced the black flickering squares that got LIGHTMAPINJECT reverted.
+		//
+		// Per-vertex, not per-pixel: high-frequency lightmap detail inside a quad is lost. The
+		// geometry is 4-5 vertex quads, so each one still gets its own corner samples.
+		int lightmap_fold_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_LIGHTMAPFOLD", 0), 0, 1));
+			return value;
+		}
+		float lightmap_fold_scale()
+		{
+			return env_float_signed(L"PCSX2_REMIX_LIGHTMAPSCALE", 1.f);
+		}
+		// Floor under the sampled lightmap: fully shadowed texels are 0, and zero albedo is black
+		// under any light no matter how bright. The original never looked like that because the
+		// hardware had an ambient term beneath the modulation. Remaps [0,1] to [floor,1] rather
+		// than clamping, so lit areas keep their values and only the black end lifts.
+		float lightmap_fold_floor()
+		{
+			return std::clamp(env_float_signed(L"PCSX2_REMIX_LIGHTMAPFLOOR", 0.f), 0.f, 1.f);
+		}
+
+		struct lm_image
+		{
+			std::vector<u8> px; // BGRA8
+			u32 w = 0;
+			u32 h = 0;
+		};
+		std::unordered_map<u64, lm_image> s_lm_images;
+
+		struct lm_verts
+		{
+			std::vector<float> rgb; // 3 per vertex
+			u32 n = 0;
+			u8 seen = 0; // bit per channel
+			u64 frame = 0;
+		};
+		std::unordered_map<u64, lm_verts> s_lm_verts;
+		// The vertex range the last batched draw occupies, for in-frame lightmap modulation.
+		size_t s_lm_span_group = 0;
+		size_t s_lm_span_surface = 0;
+		u32 s_lm_span_first = 0;
+		u32 s_lm_span_count = 0;
+		bool s_lm_span_valid = false;
+		u64 s_lm_inframe = 0;
+		u64 s_lm_applied = 0, s_lm_stored = 0, s_lm_decode_fail = 0, s_lm_images_made = 0;
+		u64 s_lm_miss_nokey = 0, s_lm_miss_partial = 0, s_lm_miss_vcount = 0;
+
 		struct lightmap_entry
 		{
 			u64 hash = 0;
@@ -9159,7 +9234,8 @@ namespace RemixSubmit
 		// Vertices go in exactly as they were built -- world or view space, whichever the frame is
 		// submitting in -- so the batch instance carries the identity transform and there is no
 		// registration to get wrong. Batching and stable identity are alternatives, not partners.
-		void batch_append(u64 group_key, const draw_state& ds, const remix_ps2::materials::binding& material)
+		void batch_append(u64 group_key, const draw_state& ds, const remix_ps2::materials::binding& material,
+			u64 draw_hash)
 		{
 			size_t group_index;
 
@@ -9178,10 +9254,12 @@ namespace RemixSubmit
 				fresh.categories = ds.categories;
 				fresh.surfaces_used = 0;
 				fresh.surface_of_material.clear();
+				fresh.content = fnv_seed;
 				s_batch_group_of_key.emplace(group_key, group_index);
 			}
 
 			batch_group& group = s_batch_groups[group_index];
+			group.content = fnv_mix(group.content, draw_hash);
 
 			size_t surface_index;
 
@@ -9208,6 +9286,15 @@ namespace RemixSubmit
 			const u32 base = static_cast<u32>(surface.vertices.size());
 
 			surface.vertices.insert(surface.vertices.end(), s_scratch_vertices.begin(), s_scratch_vertices.end());
+			// Where this draw's vertices landed, so the masked lightmap passes that follow it in the
+			// SAME frame can modulate them in place. The batch is not flushed until the end of the
+			// frame, so there is no cross-frame key to go stale -- which is what made the fold hit
+			// only while the camera was still.
+			s_lm_span_group = group_index;
+			s_lm_span_surface = surface_index;
+			s_lm_span_first = base;
+			s_lm_span_count = static_cast<u32>(s_scratch_vertices.size());
+			s_lm_span_valid = true;
 			surface.indices.reserve(surface.indices.size() + s_scratch_indices.size());
 
 			for (const u32 index : s_scratch_indices)
@@ -9588,25 +9675,49 @@ namespace RemixSubmit
 				// Unique per frame per group: the geometry is camera-derived and genuinely new
 				// every frame, so reusing a hash would ask the runtime to treat different
 				// geometry as the same object.
-				mesh_info.hash = (hash == 0) ? 1 : hash;
+				// Content key when reusing, so identical geometry keeps its handle. The old key
+				// (frame counter + group index) is retained for the non-reuse path.
+				const u64 mesh_key = (batch_reuse_mode() != 0) ? group.content : hash;
+				mesh_info.hash = (mesh_key == 0) ? 1 : mesh_key;
 				mesh_info.surfaces_values = s_batch_surface_scratch.data();
 				mesh_info.surfaces_count = s_batch_surface_scratch.size();
 
 				remixapi_MeshHandle handle = nullptr;
-				const auto create_mesh = api.CreateMeshBatched ? api.CreateMeshBatched : api.CreateMesh;
-				const u32 status = remix_ps2::guarded_create_mesh(create_mesh, &mesh_info, &handle);
 
-				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
+				// Same geometry, same handle. Refreshing created_frame keeps a visible group alive;
+				// the reap below retires whatever stops being drawn.
+				const bool reuse = batch_reuse_mode() != 0;
+				if (reuse)
 				{
-					ERROR_LOG("Remix: batch CreateMesh failed for group {} ({} surfaces): {}",
-						g, s_batch_surface_scratch.size(), remix_ps2::error_name(status));
-					continue;
+					const auto cached = s_batch_mesh_cache.find(mesh_info.hash);
+					if (cached != s_batch_mesh_cache.end() && cached->second.handle)
+					{
+						cached->second.created_frame = s_frame_counter;
+						handle = cached->second.handle;
+						++s_batch_reused;
+					}
 				}
 
-				++s_stats.meshes_created;
-				++s_stats.meshes_created_frame;
-				++s_stats.batch_meshes_created;
-				s_batch_meshes.push_back(batch_mesh{handle, s_frame_counter});
+				if (!handle)
+				{
+					const auto create_mesh = api.CreateMeshBatched ? api.CreateMeshBatched : api.CreateMesh;
+					const u32 status = remix_ps2::guarded_create_mesh(create_mesh, &mesh_info, &handle);
+
+					if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
+					{
+						ERROR_LOG("Remix: batch CreateMesh failed for group {} ({} surfaces): {}",
+							g, s_batch_surface_scratch.size(), remix_ps2::error_name(status));
+						continue;
+					}
+
+					++s_stats.meshes_created;
+					++s_stats.meshes_created_frame;
+					++s_stats.batch_meshes_created;
+					if (reuse)
+						s_batch_mesh_cache[mesh_info.hash] = batch_mesh{handle, s_frame_counter};
+					else
+						s_batch_meshes.push_back(batch_mesh{handle, s_frame_counter});
+				}
 
 				remixapi_InstanceInfo instance{};
 				instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
@@ -9659,9 +9770,18 @@ namespace RemixSubmit
 						++s_stats.meshes_destroyed;
 					}
 				}
+				for (const auto& [k, e] : s_batch_mesh_cache)
+				{
+					if (e.handle)
+					{
+						remix_ps2::guarded_destroy_mesh(api.DestroyMesh, e.handle);
+						++s_stats.meshes_destroyed;
+					}
+				}
 			}
 
 			s_batch_meshes.clear();
+			s_batch_mesh_cache.clear();
 			s_batch_group_of_key.clear();
 			s_batch_groups_used = 0;
 
@@ -9684,7 +9804,9 @@ namespace RemixSubmit
 		// reference them.
 		void batch_reap()
 		{
-			if (s_batch_meshes.empty())
+			// Both containers, not just the flat list: with BATCHREUSE on, every mesh lives in the
+			// cache and the flat list is always empty, so returning on it leaked the lot.
+			if (s_batch_meshes.empty() && s_batch_mesh_cache.empty())
 				return;
 
 			const u64 retain = batch_retain_frames();
@@ -9710,6 +9832,22 @@ namespace RemixSubmit
 			}
 
 			s_batch_meshes.resize(write);
+
+			for (auto it = s_batch_mesh_cache.begin(); it != s_batch_mesh_cache.end();)
+			{
+				if ((it->second.created_frame + retain) > s_frame_counter)
+				{
+					++it;
+					continue;
+				}
+				if (it->second.handle)
+				{
+					remix_ps2::guarded_destroy_mesh(api.DestroyMesh, it->second.handle);
+					++s_stats.meshes_destroyed;
+					++s_stats.meshes_destroyed_frame;
+				}
+				it = s_batch_mesh_cache.erase(it);
+			}
 		}
 
 		void log_stats(bool force)
@@ -9733,7 +9871,7 @@ namespace RemixSubmit
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} sky_hash {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
 					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
-				 "batch: mode {} groups/frame avg {} peak {} | surfaces peak {} verts peak {} meshes {}",
+				 "batch: mode {} groups/frame avg {} peak {} | surfaces peak {} verts peak {} meshes {} reused {} cached {}",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -9755,7 +9893,7 @@ namespace RemixSubmit
 				batch_mode(),
 				(s_stats.batch_frames > 0) ? (s_stats.batch_groups_total / s_stats.batch_frames) : 0,
 				s_stats.batch_groups_peak, s_stats.batch_surfaces_peak, s_stats.batch_vertices_peak,
-				s_stats.batch_meshes_created);
+				s_stats.batch_meshes_created, s_batch_reused, s_batch_mesh_cache.size());
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -10484,6 +10622,51 @@ namespace RemixSubmit
 		bool lightmap_pass = false;
 		float lightmap_channel[3] = {0.f, 0.f, 0.f};
 
+		// LMPAIR. Whether a masked lightmap pass re-draws the SAME vertices as the unmasked base
+		// pass it modulates decides how the lightmap can be folded in. Same positions -> the
+		// lightmap's own UVs can be sampled per vertex and multiplied into the base surface's
+		// vertex colour, needing no extra geometry and so no coincident surfaces. Different
+		// positions -> it has to be separate geometry, which is what flickered before.
+		u64 lm_pos_hash = 0;
+		{
+			const u32 lm_vn = r.m_vertex->next;
+			const GSVertex* const lm_v = r.m_vertex->buff;
+			u64 h = fnv_seed;
+			for (u32 i = 0; i < lm_vn; ++i)
+			{
+				// Vertex COUNT and the index stream, not screen positions: XYZ here is post-transform,
+				// so a key built from it changes the instant the camera moves and the fold only ever
+				// hit while standing still. With LIGHTMAPEMISSIVE on, a miss means no lightmap
+				// darkening at all, so walls emitted at full albedo whenever the player moved.
+				h = fnv_mix(h, static_cast<u32>(lm_v[i].XYZ.X));
+				h = fnv_mix(h, static_cast<u32>(lm_v[i].XYZ.Y));
+				h = fnv_mix(h, lm_v[i].XYZ.Z);
+			}
+			lm_pos_hash = h;
+			const bool lm_masked = (r.m_cached_ctx.FRAME.FBMSK & 0x00FFFFFFu) != 0;
+			static u64 prev_hash = 0;
+			static u32 prev_vn = 0;
+			static u64 lm_match = 0, lm_miss = 0, lm_n = 0;
+			if (lm_masked)
+			{
+				const bool same = (lm_vn == prev_vn) && (h == prev_hash);
+				if (same) ++lm_match; else ++lm_miss;
+				if ((lm_n++ % 4000) == 0)
+				{
+					INFO_LOG("Remix: LMPAIR masked draws {} | same-vertices-as-previous {} ({:.1f}%) "
+							 "different {} | this masked verts {} prev unmasked verts {} | mask 0x{:08x}",
+						lm_match + lm_miss, lm_match,
+						(100.0 * static_cast<double>(lm_match)) / static_cast<double>(std::max<u64>(1, lm_match + lm_miss)),
+						lm_miss, lm_vn, prev_vn, static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK));
+				}
+			}
+			else
+			{
+				prev_hash = h;
+				prev_vn = lm_vn;
+			}
+		}
+
 		if ((r.m_cached_ctx.FRAME.FBMSK & 0x00FFFFFFu) != 0)
 		{
 			++s_stats.skip_fbmsk;
@@ -10514,6 +10697,124 @@ namespace RemixSubmit
 						s_lightmaps_dirty = true;
 					}
 					++e.draws;
+				}
+			}
+
+			// Sample this channel of the lightmap at each vertex and stash it against the base
+			// pass's vertex identity, for the base draw to pick up. One frame of latency, which is
+			// exact for a baked lightmap: it does not change between frames.
+			if (lightmap_fold_mode() != 0 && lm_pos_hash != 0)
+			{
+				const GSTextureCache::Source* const lm_src =
+					static_cast<const GSTextureCache::Source*>(tex_source);
+				const u64 lm_key = remix_ps2::materials::hash_only(lm_src);
+				float chan[3] = {0.f, 0.f, 0.f};
+				fbmsk_channel(static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK), chan);
+				const u32 ci = (chan[0] > 0.f) ? 0u : ((chan[1] > 0.f) ? 1u : 2u);
+				const bool one_channel = (chan[0] + chan[1] + chan[2]) == 1.f;
+
+				if (lm_key != 0 && one_channel)
+				{
+					auto img_it = s_lm_images.find(lm_key);
+					if (img_it == s_lm_images.end())
+					{
+						lm_image made{};
+						if (remix_ps2::materials::decode_source(lm_src, made.px, made.w, made.h) &&
+							made.w > 0 && made.h > 0)
+						{
+							{
+								double mb = 0, mg = 0, mr = 0, ma = 0;
+								const size_t n = made.px.size() / 4;
+								for (size_t q = 0; q < n; ++q)
+								{
+									mb += made.px[(q * 4) + 0]; mg += made.px[(q * 4) + 1];
+									mr += made.px[(q * 4) + 2]; ma += made.px[(q * 4) + 3];
+								}
+								const double inv = (n > 0) ? (1.0 / static_cast<double>(n)) : 0.0;
+								INFO_LOG("Remix: LMDECODE {:016X} {}x{} mask 0x{:08x} channel {} | mean "
+										 "B {:.1f} G {:.1f} R {:.1f} A {:.1f}",
+									lm_key, made.w, made.h, static_cast<u32>(r.m_cached_ctx.FRAME.FBMSK),
+									ci, mb * inv, mg * inv, mr * inv, ma * inv);
+							}
+							img_it = s_lm_images.emplace(lm_key, std::move(made)).first;
+							++s_lm_images_made;
+						}
+						else
+							++s_lm_decode_fail;
+					}
+
+					if (img_it != s_lm_images.end())
+					{
+						const lm_image& img = img_it->second;
+						const u32 vn = r.m_vertex->next;
+						const GSVertex* const vv = r.m_vertex->buff;
+						const bool fst = r.PRIM->FST != 0;
+						const float inv_tw = 1.f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TW);
+						const float inv_th = 1.f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TH);
+
+						// Modulate the base draw's vertices directly, in this frame's batch buffer.
+						const bool inframe = batch_mode() != 0 && s_lm_span_valid &&
+							s_lm_span_count == vn && s_lm_span_group < s_batch_groups.size() &&
+							s_lm_span_surface < s_batch_groups[s_lm_span_group].surfaces.size();
+						std::vector<remixapi_HardcodedVertex>* target = nullptr;
+						if (inframe)
+						{
+							auto& tv = s_batch_groups[s_lm_span_group].surfaces[s_lm_span_surface].vertices;
+							if ((static_cast<size_t>(s_lm_span_first) + vn) <= tv.size())
+								target = &tv;
+						}
+
+						lm_verts& lv = s_lm_verts[lm_pos_hash];
+						if (lv.n != vn)
+						{
+							lv.n = vn;
+							lv.rgb.assign(static_cast<size_t>(vn) * 3, 0.f);
+							lv.seen = 0;
+						}
+						for (u32 i = 0; i < vn; ++i)
+						{
+							float u, v;
+							if (fst)
+							{
+								u = (static_cast<float>(vv[i].U) * (1.f / 16.f)) * inv_tw;
+								v = (static_cast<float>(vv[i].V) * (1.f / 16.f)) * inv_th;
+							}
+							else
+							{
+								const float q = vv[i].RGBAQ.Q;
+								if (!std::isfinite(q) || q == 0.f)
+									continue;
+								u = vv[i].ST.S / q;
+								v = vv[i].ST.T / q;
+							}
+							const int tx = std::clamp(static_cast<int>(u * static_cast<float>(img.w)), 0, static_cast<int>(img.w) - 1);
+							const int ty = std::clamp(static_cast<int>(v * static_cast<float>(img.h)), 0, static_cast<int>(img.h) - 1);
+							const size_t off = ((static_cast<size_t>(ty) * img.w) + static_cast<size_t>(tx)) * 4;
+							if ((off + 3) >= img.px.size())
+								continue;
+							// ALPHA, not colour. The PS2 blend equation (A-B)*C+D takes C from an alpha
+							// source, which is the entire reason this title moves each lightmap channel
+							// into alpha via its own CLUT. Sampling the colour components instead gave a
+							// heavy orange cast, since they carry the palette entry rather than the value.
+							lv.rgb[(static_cast<size_t>(i) * 3) + ci] =
+								static_cast<float>(img.px[off + 3]) * (1.f / 255.f);
+							if (target != nullptr)
+							{
+								remixapi_HardcodedVertex& tvx = (*target)[s_lm_span_first + i];
+								const float lmv = lightmap_fold_floor() +
+									((1.f - lightmap_fold_floor()) * (static_cast<float>(img.px[off + 3]) * (1.f / 255.f)));
+								const u32 shift = (ci == 0) ? 16u : ((ci == 1) ? 8u : 0u);
+								const u32 chan = (tvx.color >> shift) & 0xFFu;
+								const u32 lit = static_cast<u32>(std::clamp(
+									static_cast<float>(chan) * lmv * lightmap_fold_scale(), 0.f, 255.f));
+								tvx.color = (tvx.color & ~(0xFFu << shift)) | (lit << shift);
+								++s_lm_inframe;
+							}
+						}
+						lv.seen |= static_cast<u8>(1u << ci);
+						lv.frame = s_frame_counter;
+						++s_lm_stored;
+					}
 				}
 			}
 
@@ -10759,6 +11060,31 @@ namespace RemixSubmit
 		sky_solver.bias[2] = 0.f;
 
 		const GSVertex* const verts = r.m_vertex->buff;
+
+		// The baked lightmap for this surface, sampled from the masked channel passes that
+		// re-drew these same vertices. Complete only once all three channels have been seen.
+		const lm_verts* lm_fold = nullptr;
+		float lm_scale = 1.f;
+		float lm_floor = 0.f;
+		// Batched draws are modulated in place by the masked passes that follow them in the same
+		// frame, so applying the cross-frame cache here as well would square the lightmap.
+		if (lightmap_fold_mode() != 0 && lm_pos_hash != 0 && batch_mode() == 0)
+		{
+			const auto lm_it = s_lm_verts.find(lm_pos_hash);
+			if (lm_it == s_lm_verts.end())
+				++s_lm_miss_nokey;
+			else if (lm_it->second.seen != 0x7)
+				++s_lm_miss_partial;
+			else if (lm_it->second.n != r.m_vertex->next)
+				++s_lm_miss_vcount;
+			else
+			{
+				lm_fold = &lm_it->second;
+				lm_scale = lightmap_fold_scale();
+				lm_floor = lightmap_fold_floor();
+				++s_lm_applied;
+			}
+		}
 
 		// Z -> w calibration scale for this draw. Hoisted above the sky classification because the
 		// far-distance scan below needs it too, and computing it twice would be two expressions
@@ -11021,6 +11347,17 @@ namespace RemixSubmit
 			// Alpha is kept either way -- it is real transparency, not baked lighting.
 			const u32 alpha = std::min<u32>(255u, static_cast<u32>(v.RGBAQ.A) * 2u);
 			max_vertex_alpha = std::max(max_vertex_alpha, alpha);
+			if (lm_fold != nullptr)
+			{
+				const float lr = (lm_floor + ((1.f - lm_floor) * lm_fold->rgb[(static_cast<size_t>(i) * 3) + 0])) * lm_scale;
+				const float lg = (lm_floor + ((1.f - lm_floor) * lm_fold->rgb[(static_cast<size_t>(i) * 3) + 1])) * lm_scale;
+				const float lb = (lm_floor + ((1.f - lm_floor) * lm_fold->rgb[(static_cast<size_t>(i) * 3) + 2])) * lm_scale;
+				const u32 mr = static_cast<u32>(std::clamp(static_cast<float>(v.RGBAQ.R) * lr, 0.f, 255.f));
+				const u32 mg = static_cast<u32>(std::clamp(static_cast<float>(v.RGBAQ.G) * lg, 0.f, 255.f));
+				const u32 mb = static_cast<u32>(std::clamp(static_cast<float>(v.RGBAQ.B) * lb, 0.f, 255.f));
+				out.color = (alpha << 24) | (mr << 16) | (mg << 8) | mb;
+			}
+			else
 			out.color = (vcolor_mode() != 0) ?
 				((alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
 					(static_cast<u32>(v.RGBAQ.G) << 8) | static_cast<u32>(v.RGBAQ.B)) :
@@ -12014,7 +12351,45 @@ namespace RemixSubmit
 
 		if (batch_mode() != 0)
 		{
-			batch_append(group_key, ds, material);
+			// A GEOMETRY key, not an identity key. `hash` under STABLEID deliberately excludes
+			// positions so an object keeps its identity as the camera moves -- correct for "is this
+			// the same object", wrong for "is the vertex data unchanged". The view model has the
+			// same identity every frame but new vertices every frame, so keying mesh REUSE on the
+			// identity hash handed it a stale mesh and froze the weapon in place. Quantised
+			// positions absorb camera jitter on static geometry while still moving when the
+			// geometry genuinely does.
+			// Per-vertex quantisation cannot work here: with ~1.4 units of camera jitter and a
+			// 4-unit bucket, some vertex in a mesh always crosses a boundary and the key changes
+			// anyway (reused fell 3709 -> 552 when it was tried). The CENTROID is an average, so
+			// the jitter cancels, while anything that genuinely moves -- the view model above all
+			// -- shifts it far more than one bucket and correctly re-creates its mesh.
+			u64 geom_hash = hash;
+			if (!s_scratch_vertices.empty())
+			{
+				double cx = 0.0, cy = 0.0, cz = 0.0;
+				for (const remixapi_HardcodedVertex& gv : s_scratch_vertices)
+				{
+					cx += gv.position[0]; cy += gv.position[1]; cz += gv.position[2];
+				}
+				const double inv_n = 1.0 / static_cast<double>(s_scratch_vertices.size());
+				const float ccx = static_cast<float>(cx * inv_n);
+				const float ccy = static_cast<float>(cy * inv_n);
+				const float ccz = static_cast<float>(cz * inv_n);
+				// The view model has a stable identity and new vertices every frame, so no key built
+				// from identity can tell it changed. It is the only thing that sits at the eye, which
+				// is the same test MESHTRACK uses to exclude it. Mixing the frame in forces a rebuild.
+				const float edx = ccx - s_active_camera.position[0];
+				const float edy = ccy - s_active_camera.position[1];
+				const float edz = ccz - s_active_camera.position[2];
+				if (((edx * edx) + (edy * edy) + (edz * edz)) < (250.f * 250.f))
+					geom_hash = fnv_mix(geom_hash, s_frame_counter);
+
+				const float cq = std::max(1.f, mesh_hash_quantum() * 4.f);
+				geom_hash = fnv_mix(geom_hash, static_cast<u64>(static_cast<s64>(std::llround(ccx / cq))));
+				geom_hash = fnv_mix(geom_hash, static_cast<u64>(static_cast<s64>(std::llround(ccy / cq))));
+				geom_hash = fnv_mix(geom_hash, static_cast<u64>(static_cast<s64>(std::llround(ccz / cq))));
+			}
+			batch_append(group_key, ds, material, geom_hash);
 
 			if (!ds.is_sky && draw_bounds.valid)
 			{
@@ -12406,8 +12781,30 @@ namespace RemixSubmit
 			}
 			s_lightfit_armed = (best < 1e29f);
 		}
-		s_ee_fov = env_float_signed(L"PCSX2_REMIX_EECAMFOV", 48.1f);
-		s_ee_aspect = env_float_signed(L"PCSX2_REMIX_EECAMASPECT", 1.429f);
+
+		if (lightmap_fold_mode() != 0)
+		{
+			// The per-surface cache is keyed by vertex identity and would otherwise grow for the
+			// life of the session -- 78,165 entries and climbing when this was first measured.
+			// Anything not re-drawn in 600 frames is out of the room and can be re-sampled if the
+			// player returns; a baked lightmap costs one frame to rebuild.
+			if ((s_frame_counter % 600) == 0 && s_frame_counter > 600)
+			{
+				const u64 cutoff = s_frame_counter - 600;
+				for (auto it = s_lm_verts.begin(); it != s_lm_verts.end();)
+					it = (it->second.frame < cutoff) ? s_lm_verts.erase(it) : std::next(it);
+			}
+
+			static u32 lmf_n = 0;
+			if ((lmf_n++ % 300) == 0)
+			{
+				INFO_LOG("Remix: LIGHTMAPFOLD applied {} miss(no-key {} partial {} vcount {}) | stored {} | cached {} "
+						 "| lightmap images {} decode-fail {} | in-frame {} | scale {:.2f}",
+					s_lm_applied, s_lm_miss_nokey, s_lm_miss_partial, s_lm_miss_vcount,
+					s_lm_stored, s_lm_verts.size(), s_lm_images_made, s_lm_decode_fail, s_lm_inframe,
+					lightmap_fold_scale());
+			}
+		}
 
 		if (ee_cam_mode() != 0)
 		{

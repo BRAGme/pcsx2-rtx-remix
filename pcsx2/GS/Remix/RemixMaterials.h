@@ -63,6 +63,13 @@ namespace remix_ps2
 		// all. Returns 0 when there is no hashable source.
 		u64 hash_only(const GSTextureCache::Source* source);
 
+		// Decode a source's texels to BGRA8 on the CPU, using whatever CLUT is bound right now.
+		// For the lightmap fold-in: R6 3 writes one PSMT8 index page through three different CLUTs,
+		// one per colour channel, so the same page has to be decoded once per channel while that
+		// channel's CLUT is live. Returns false and leaves the vector untouched on any failure.
+		bool decode_source(const GSTextureCache::Source* source, std::vector<u8>& out_pixels,
+			u32& out_width, u32& out_height);
+
 		// One shared white material for untextured draws.
 		//
 		// Since untextured draws started being submitted rather than dropped (PCSX2_REMIX_UNTEXZ),
