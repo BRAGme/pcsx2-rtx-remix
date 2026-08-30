@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include <locale>
 #include "GS/Remix/RemixRuntime.h"
 #include "GS/Remix/RemixPaths.h"
 
@@ -137,6 +138,22 @@ namespace remix_ps2
 		// this title's own folder and bridges the PCSX2 settings onto the PCSX2_REMIX_* knobs.
 		// Both are read-once inside the runtime, so there is no later opportunity.
 		paths::apply_before_runtime_load();
+
+		// The runtime builds USD prim names with a bare std::stringstream (rtx_utils.h:
+		// hashToString), so it inherits whatever global locale this process has. QtHost.cpp calls
+		// std::locale::global(std::locale("")), which on a grouping locale turns a hash into
+		// "D,CEB,BBF,051,655,89A" -- commas are not valid in a USD identifier, so every material
+		// prim comes back invalid and a capture dies in exportMaterials with "Used null prim".
+		// PCSX2's own code guards this in four places ("Disable integer separators"); the runtime
+		// cannot, because it is a DLL we hand a locale to. Machine-readable output is what this
+		// process mostly writes, so classic is the right global anyway.
+		try
+		{
+			std::locale::global(std::locale::classic());
+		}
+		catch (const std::exception&)
+		{
+		}
 
 		const std::wstring path = paths::runtime_dll();
 		if (path.empty())

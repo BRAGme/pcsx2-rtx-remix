@@ -2099,7 +2099,12 @@ namespace RemixSubmit
 					distant.direction = {dx, dy, dz};
 					distant.angularDiameterDegrees = 0.5f;
 					info.pNext = &distant;
-					info.hash = 0x9C5241B210000000ull + suns;
+					{
+						u64 lh = fnv_seed;
+						for (const char* c = line; *c && *c != 10 && *c != 13; ++c)
+							lh = fnv_mix(lh, static_cast<u32>(static_cast<unsigned char>(*c)));
+						info.hash = 0x9C5241B210000000ull ^ (lh & 0x00FFFFFFFFFFFFFFull);
+					}
 					distant_light = true;
 					++suns;
 				}
@@ -2120,7 +2125,17 @@ namespace RemixSubmit
 					radiance_boost = (authored_radius * authored_radius) / (sphere.radius * sphere.radius);
 					sphere.shaping_hasvalue = 0;
 					info.pNext = &sphere;
-					info.hash = 0x9C5241B220000000ull + made;
+					// Identity from the actor's own line in lights_<LEVEL>.txt, not its ordinal. A hash
+					// of "how many lights came before this one" changes for every later lamp the moment
+					// anything is skipped or the file is edited -- which would silently re-bind a
+					// modder's placements in mod.usda to different lamps. The line is stable across
+					// runs and independent of the skip rules and of POSSCALE.
+					{
+						u64 lh = fnv_seed;
+						for (const char* c = line; *c && *c != 10 && *c != 13; ++c)
+							lh = fnv_mix(lh, static_cast<u32>(static_cast<unsigned char>(*c)));
+						info.hash = 0x9C5241B220000000ull ^ (lh & 0x00FFFFFFFFFFFFFFull);
+					}
 					// 37 of this map's 211 Light actors carry brightness 0 -- 29 of them radius 0 too,
 					// meaning the .rsm property walk found neither field. They emit nothing and exist
 					// only as clutter in the debug overlay.
