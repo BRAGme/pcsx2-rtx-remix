@@ -235,26 +235,44 @@ technique generalises better than the console-specific plumbing around it does.
 
 Windows, Visual Studio 2022, x64.
 
-### Build the dependencies first
+### Get the dependencies first
 
-**This is the step people miss.** A fresh clone will not build. MSBuild resolves third-party
-libraries from `$(SolutionDir)deps\` (`common/vsprops/DepsDir.props:4`), and `deps/` is gitignored
-(`.gitignore:118-119`) because it is *built*, not committed. Skip this and the build fails looking
-for zlib, libpng, Qt and the rest -- which is upstream PCSX2 behaviour, not something this fork
-introduced.
+**This is the step people miss, and the error does not look like a missing step.** A fresh
+clone does not build. MSBuild resolves every third-party library from `$(SolutionDir)deps\`
+(`common/vsprops/DepsDir.props:4`), and `deps/` is gitignored (`.gitignore:118-119`) because it is
+*obtained*, not committed. Build the `sln` without it and you get a wall of `C1083` misses --
+`zlib.h`, `zstd.h`, `ft2build.h`, `jpeglib.h`, `ryml.hpp`, `directx/d3d12.h` and more. That is
+every third-party library at once, not one broken vendored copy, and it is upstream PCSX2
+behaviour rather than anything this fork introduced.
 
-Run this once, from the repo root:
+There are no git submodules. `.gitmodules` is empty and upstream moved every vendored library
+in-tree, so `git submodule update` will appear to do nothing. That is correct, not a failed clone,
+and it is the first false lead to skip.
+
+**Fastest route -- download the prebuilt package.** Upstream publishes one:
+
+1. Get `pcsx2-windows-dependencies.7z` (~142 MB) from
+   [`PCSX2/pcsx2-windows-dependencies`](https://github.com/PCSX2/pcsx2-windows-dependencies/releases/tag/latest-windows-dependencies),
+   tag `latest-windows-dependencies`.
+2. Extract it **at the repo root**. The archive already contains a top-level `deps` folder, so you
+   end up with `<repo>\deps\` and nothing to rename.
+
+Verified on 2026-08-31: a clean clone of this branch plus that archive builds
+`PCSX2_qt.sln` to exit 0 with no errors, producing a `pcsx2-qtx64.exe` carrying the full Remix
+backend. The package is dated 2026-07-27 and upstream last changed a pinned dependency version on
+2026-07-20, so it is current for this fork -- the only edits this fork makes to the dependency
+script are two 7-Zip extraction exclusions, which change no versions.
+
+**Or build them yourself**, which is what CI does and what you need if the prebuilt package ever
+falls behind:
 
 ```bat
 .github\workflows\scripts\windows\build-dependencies.bat
 ```
 
-It builds ~28 libraries (Qt 6.11.1, zlib 1.3.2, libpng, FFmpeg, freetype, harfbuzz, shaderc,
-KDDockWidgets and so on) into `deps\`. Expect it to take a while -- it is compiling Qt from
-source. It is the same script CI runs, so if it works there it works here.
-
-It needs these on the machine, at these paths, because the script hardcodes them
-(`build-dependencies.bat:26-28`):
+It compiles ~28 libraries (Qt 6.11.1, zlib 1.3.2, libpng, FFmpeg, freetype, harfbuzz, shaderc,
+KDDockWidgets and the rest) into `deps\`. Expect it to take a long while -- it is building Qt from
+source. It hardcodes these tool paths (`build-dependencies.bat:26-28`), so they have to exist:
 
 | Tool | Path the script expects |
 |---|---|
@@ -262,10 +280,6 @@ It needs these on the machine, at these paths, because the script hardcodes them
 | 7-Zip | `C:\Program Files\7-Zip\7z.exe` |
 | Git for Windows | `C:\Program Files\Git\usr\bin\` (`patch.exe`, `bash.exe`) |
 | CMake, Ninja, Python | on `PATH` |
-
-There are no git submodules -- `.gitmodules` is empty and upstream moved every vendored library
-in-tree, so `git submodule update` is not part of this and will appear to do nothing. That is
-correct, not a failed clone.
 
 ### Then build the emulator
 
