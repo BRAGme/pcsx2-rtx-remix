@@ -70,6 +70,63 @@ namespace RemixVU1Capture
 	inline constexpr u8 candidate_flag_feeds_div = 1u << 0;
 	inline constexpr u8 candidate_flag_feeds_clip = 1u << 1;
 
+	// ---- Zen (Mercenaries: Playground of Destruction) fixed-address snapshot -----------------
+	//
+	// Nothing here is solved or inferred: the Zen renderer's own source names every one of these
+	// addresses. From Platform\Ps2\Zen\ee\vurender.h:
+	//
+	//   SCREEN_TRANS 4    SCREEN_SCALE 5
+	//   DIRLIGHT_COLOR 44 DIRLIGHT_DIR 48 (DIRLIGHT_MATRIX 52 is the MODEL-SPACE rebuild)
+	//   OMNILIGHT_COLOR 56 OMNILIGHT_POS 60 (+ OMNILIGHT_RADS at 63; OMNILIGHT_MATRIX 64 is
+	//                     again the model-space rebuild)
+	//   AMBIENT 68        PERSP 132  CAMERA 136  MODEL 140
+	//
+	// All of them sit BELOW the VIF double-buffer base (vurender.s: BASE 272 / OFFSET 186), so
+	// they are absolute VU1 addresses and no TOPS arithmetic applies -- unlike the pinned camera
+	// window the rest of this file has to chase across two banks.
+	//
+	// Conventions, all from the microcode rather than assumed (vurender.i):
+	//   * SetTransform_4x3 TRANSPOSES its three input qwords into four row-qwords with an
+	//     implicit (0,0,0,1) fourth column (:1766-1789), and BuildDrawMatrix composes
+	//     DRAW = MODEL x CAMERA x PERSP with the vertex applied as a ROW vector (:2329-2376,
+	//     :151-158). So `camera`/`model`/`persp` below are row-vector 4x4s, matching
+	//     RemixTransforms.h's convention exactly.
+	//   * CAMERA is world->view: ps2RedRenderer.cpp:1307-1312 emits inverse(camera-to-world)
+	//     with the Y and Z axes negated.
+	//   * The light colours are ITOF0 x 2^-7 (vurender.i:2623), i.e. 0x80 == 1.0 -- divide the
+	//     stored value by nothing, it is ALREADY float, but its 1.0 is the guest's 0x80.
+	//   * Directional directions are stored pre-scaled by -0.5 with w = 0.5 (:2646-2676) and
+	//     left TRANSPOSED (four qwords of "component r of light c"), which is why `dir_dir` is
+	//     indexed [row][light] while `dir_colour` is indexed [light][channel].
+	//   * Omni positions are transposed the same way and carry 1/radius^2 in the fourth row
+	//     (:2721-2727). Unused slots are RedOmniLight::Black: colour 0, radius 0.01, so
+	//     1/r^2 == 10000 (RedLight.cpp:23,279-283).
+	struct ZenOmni
+	{
+		float position[3];
+		float inv_radius_sq;
+		float colour[3]; // 0x80 == 1.0
+	};
+
+	// Slots for the frame's de-duplicated omni set. Zen re-emits up to four nearest omnis per
+	// OBJECT, so the same lamp arrives many times per frame and the distinct count is small.
+	inline constexpr u32 max_zen_omnis = 16;
+
+	struct ZenSnapshot
+	{
+		float screen_trans[4]; // qword 4
+		float screen_scale[4]; // qword 5
+		float dir_colour[4][4]; // qwords 44-47, one ROW per light
+		float dir_dir[4][4]; // qwords 48-51, TRANSPOSED: [component][light]
+		float omni_colour[4][4]; // qwords 56-59, one ROW per light
+		float omni_pos[4][4]; // qwords 60-63, TRANSPOSED: rows x, y, z, 1/r^2
+		float ambient[4]; // qword 68
+		float persp[16]; // qwords 132-135
+		float camera[16]; // qwords 136-139
+		float model[16]; // qwords 140-143, diagnostics only
+		u32 valid; // a snapshot was taken and its PERSP was finite
+	};
+
 	struct Frame
 	{
 		// Value of g_kick_seq at the instant this frame was published. Together with a live
@@ -110,6 +167,17 @@ namespace RemixVU1Capture
 		u32 transform_probe_matrix; // qword index of the back-sliced matrix row 0
 		u64 transform_probe_ucode;
 		bool transform_probe_valid;
+
+		// PCSX2_REMIX_ZENCAM >= 1. The LAST snapshot of the frame whose PERSP read finite, plus
+		// the frame's de-duplicated omni set. Zero-filled and untouched when the knob is off, so
+		// every other title carries these bytes through the seqlock memcpy and nothing else.
+		ZenSnapshot zen;
+		u32 zen_kicks; // kicks the snapshot path ran on
+		u32 zen_persp_ok; // ... of which PERSP passed the finite check
+		u32 zen_omni_count; // distinct omnis accumulated across the frame's kicks
+		u32 zen_omni_dropped; // omnis refused because the 16 slots were full
+		ZenOmni zen_omnis[max_zen_omnis];
+
 		Candidate items[max_candidates];
 	};
 

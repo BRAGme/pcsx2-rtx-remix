@@ -105,6 +105,13 @@ namespace RemixVU1Capture
 		std::atomic<u32> s_pin_hold_frames{0};
 		std::atomic<bool> s_slice_rank_on{false};
 
+		// PCSX2_REMIX_ZENCAM -- 0 off, 1 capture + log, 2 capture and replace the camera.
+		// Refreshed once per frame by refresh_user_pin() into this atomic for exactly the reason
+		// that function exists: a `static const` read here would latch the pre-conf value and the
+		// knob would be a silent no-op forever, which is how five knobs have already been lost on
+		// this project. The hot path reads one relaxed load per kick.
+		std::atomic<u32> s_zen_mode{0};
+
 		// Re-read PCSX2_REMIX_PINOFFSET from the environment. Called once per frame from
 		// publish(), NOT cached and NOT latched: the per-game .conf reaches the environment
 		// after this file's arm path has already run, so anything evaluated once at arm time
@@ -144,6 +151,12 @@ namespace RemixVU1Capture
 				// atomic so ranked() stays a cheap load per candidate rather than an env read.
 				s_slice_rank_on.store(
 					remix_ps2::read_env_int(L"PCSX2_REMIX_SLICERANK", 0) != 0,
+					std::memory_order_relaxed);
+
+				// PCSX2_REMIX_ZENCAM, here and not at arm time for the identical reason. Clamped
+				// 0..2 to mirror ee_cam_mode()'s shape (RemixSubmit.cpp:2179-2182).
+				const s64 zen = remix_ps2::read_env_int(L"PCSX2_REMIX_ZENCAM", 0);
+				s_zen_mode.store((zen <= 0) ? 0u : static_cast<u32>(std::min<s64>(zen, 2)),
 					std::memory_order_relaxed);
 			}
 		}
@@ -829,6 +842,129 @@ namespace RemixVU1Capture
 			s_frame.transform_probe_valid = true;
 		}
 
+		// ---- Zen (Mercenaries) fixed-address snapshot ---------------------------------------
+		//
+		// The whole of this backend's slice/split machinery exists because Rainbow Six 3 composes
+		// per-object MVPs on the EE and ships only the product. Mercenaries is the opposite case:
+		// its renderer uploads PERSP, CAMERA and MODEL SEPARATELY to fixed VU1 qwords and composes
+		// them on VU1 itself, and the slicer structurally cannot see any of it -- the per-vertex
+		// chain opens with `MULAw ACC, VF13, VF00w` (vurender.i:151), so ft == vf00, Analyze
+		// records vertex_vf = 0 and then rejects every x/y/z row on the
+		// `ft == active.vertex_vf || ft == 0` gate (RemixVU1Slice.cpp:432). Measured: accept 0
+		// over 231,982 kicks. There is nothing to tune; there is an address to read.
+		//
+		// See the ZenSnapshot comment in the header for every address and every convention.
+		constexpr u32 zen_qw_screen_trans = 4;
+		constexpr u32 zen_qw_screen_scale = 5;
+		constexpr u32 zen_qw_dir_colour = 44;
+		constexpr u32 zen_qw_dir_dir = 48;
+		constexpr u32 zen_qw_omni_colour = 56;
+		constexpr u32 zen_qw_omni_pos = 60;
+		constexpr u32 zen_qw_ambient = 68;
+		constexpr u32 zen_qw_persp = 132;
+		constexpr u32 zen_qw_camera = 136;
+		constexpr u32 zen_qw_model = 140;
+
+		// 1 / RedOmniLight::Black's radius^2 (radius 0.01, RedLight.cpp:23). The padding slots
+		// CollectCurOmniLights writes when an object has fewer than four lights near it.
+		constexpr float zen_black_omni_inv_r2 = 10000.f;
+
+		__fi void zen_read_qwords(const u8* mem, u32 first_qword, u32 count, float* out)
+		{
+			std::memcpy(out, mem + (first_qword * s_qword), count * s_qword);
+		}
+
+		// Accumulates one kick's four omni slots into the frame's de-duplicated set. Zen re-emits
+		// the object's four nearest lamps for EVERY object, so without this the same handful of
+		// lamps would arrive dozens of times a frame and the GS side would churn light handles.
+		//
+		// The compare is exact rather than epsilon-based on purpose: the same lamp re-emitted for
+		// a different object carries bit-identical floats (they come from the same
+		// RedOmniLight::GetPosition()), so exact is both correct and the cheapest test there is.
+		void zen_accumulate_omnis(const ZenSnapshot& snap)
+		{
+			for (u32 light = 0; light < 4; ++light)
+			{
+				ZenOmni omni{};
+				omni.position[0] = snap.omni_pos[0][light];
+				omni.position[1] = snap.omni_pos[1][light];
+				omni.position[2] = snap.omni_pos[2][light];
+				omni.inv_radius_sq = snap.omni_pos[3][light];
+				omni.colour[0] = snap.omni_colour[light][0];
+				omni.colour[1] = snap.omni_colour[light][1];
+				omni.colour[2] = snap.omni_colour[light][2];
+
+				if (!std::isfinite(omni.position[0]) || !std::isfinite(omni.position[1]) ||
+					!std::isfinite(omni.position[2]) || !std::isfinite(omni.inv_radius_sq))
+					continue;
+
+				// RedOmniLight::Black padding: colour 0 at the origin with 1/r^2 == 10000. Either
+				// half on its own is enough -- a genuinely black lamp emits nothing, and a 1 cm
+				// radius is not a lamp -- so both are refused.
+				if (omni.inv_radius_sq <= 0.f || omni.inv_radius_sq >= (zen_black_omni_inv_r2 - 1.f))
+					continue;
+				if (omni.colour[0] <= 0.f && omni.colour[1] <= 0.f && omni.colour[2] <= 0.f)
+					continue;
+
+				bool seen = false;
+				for (u32 i = 0; i < s_frame.zen_omni_count; ++i)
+				{
+					const ZenOmni& have = s_frame.zen_omnis[i];
+					if (have.position[0] == omni.position[0] && have.position[1] == omni.position[1] &&
+						have.position[2] == omni.position[2] && have.inv_radius_sq == omni.inv_radius_sq)
+					{
+						seen = true;
+						break;
+					}
+				}
+
+				if (seen)
+					continue;
+
+				if (s_frame.zen_omni_count >= max_zen_omnis)
+				{
+					++s_frame.zen_omni_dropped;
+					continue;
+				}
+
+				s_frame.zen_omnis[s_frame.zen_omni_count++] = omni;
+			}
+		}
+
+		void capture_zen(const u8* mem)
+		{
+			++s_frame.zen_kicks;
+
+			ZenSnapshot snap{};
+
+			zen_read_qwords(mem, zen_qw_screen_trans, 1, snap.screen_trans);
+			zen_read_qwords(mem, zen_qw_screen_scale, 1, snap.screen_scale);
+			zen_read_qwords(mem, zen_qw_dir_colour, 4, &snap.dir_colour[0][0]);
+			zen_read_qwords(mem, zen_qw_dir_dir, 4, &snap.dir_dir[0][0]);
+			zen_read_qwords(mem, zen_qw_omni_colour, 4, &snap.omni_colour[0][0]);
+			zen_read_qwords(mem, zen_qw_omni_pos, 4, &snap.omni_pos[0][0]);
+			zen_read_qwords(mem, zen_qw_ambient, 1, snap.ambient);
+			zen_read_qwords(mem, zen_qw_persp, 4, snap.persp);
+			zen_read_qwords(mem, zen_qw_camera, 4, snap.camera);
+			zen_read_qwords(mem, zen_qw_model, 4, snap.model);
+
+			// Omnis accumulate from EVERY kick, valid PERSP or not: they are per-object state and
+			// the object that carries a lamp is not necessarily the one that last wrote PERSP.
+			zen_accumulate_omnis(snap);
+
+			// The named risk is a torn read -- a SetTransform landing between two kicks with the
+			// scan in the middle of it. usable_matrix() rejects the all-zero and denormal payloads
+			// that produces, and finite_window() the NaNs; anything that survives both is a matrix.
+			// The frame keeps the LAST such snapshot, which is the one contemporaneous with the
+			// most geometry.
+			if (!usable_matrix(snap.persp) || !usable_matrix(snap.camera))
+				return;
+
+			++s_frame.zen_persp_ok;
+			snap.valid = 1;
+			std::memcpy(&s_frame.zen, &snap, sizeof(ZenSnapshot));
+		}
+
 		void publish()
 		{
 			// Pick up a PINOFFSET that arrived with the per-game .conf, which lands after the
@@ -993,6 +1129,22 @@ namespace RemixVU1Capture
 		}
 
 		++s_frame.kicks_seen;
+
+		// PCSX2_REMIX_ZENCAM. Deliberately AHEAD of the scan budget, on the same reasoning
+		// record_kick_camera() carries: the budget caps the SEARCH for a camera, and this is not a
+		// search -- it is a 496-byte read from ten addresses the guest's own source names. Off, it
+		// costs one relaxed atomic load per kick and nothing else, which is what keeps Rainbow Six 3
+		// and SOCOM CA byte-identical.
+		//
+		// The budget still gates publish() further down, so a title that exhausts SCANKICKS
+		// publishes the snapshot taken by its last scanned kick rather than none at all.
+		// Mercenaries issues ~14.6 kicks/frame (231,982 over 15,900 frames, all scanned), so the
+		// default budget of 16 never binds here.
+		if (s_zen_mode.load(std::memory_order_relaxed) != 0)
+		{
+			if (const u8* const zen_mem = vuRegs[1].Mem)
+				capture_zen(zen_mem);
+		}
 
 		if (s_frame.kicks_scanned >= s_scan_budget)
 			return;

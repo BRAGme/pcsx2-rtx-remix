@@ -264,6 +264,14 @@ namespace RemixSubmit
 			u64 vu_programs_refused = 0;
 			u32 vu_refused_start_pc = 0;
 			u64 vu_refused_ucode = 0;
+			// Zen fixed-address snapshot (PCSX2_REMIX_ZENCAM). 'kicks' is how often the read ran,
+			// 'persp ok' how often both PERSP and CAMERA passed usable_matrix(). The GAP between
+			// them is the named tell for a torn read landing between two SetTransforms; the gap
+			// being total means the addresses are wrong, not that the read is racing.
+			u64 zen_kicks = 0;
+			u64 zen_persp_ok = 0;
+			u64 zen_installed = 0; // frames a Zen camera actually replaced s_active_camera
+			u64 zen_build_failed = 0; // snapshot present, but the camera could not be assembled
 			u64 cam_accept_sliced = 0; // accepted cameras that came from the back-slice
 			u64 cam_candidates = 0; // offered to the GS side, summed over frames
 			u64 cam_reject_split = 0; // split_view_projection_direct refused
@@ -2337,6 +2345,500 @@ namespace RemixSubmit
 			out.score = 1.f;
 			return true;
 		}
+
+		// --- Zen (Mercenaries) fixed-address camera -------------------------------------------
+		//
+		// Same shape as the EE camera above, and for the same reason: this title's transforms are
+		// not solvable by the slicer and do not have to be. Mercenaries' renderer uploads PERSP,
+		// CAMERA and MODEL separately to fixed VU1 qwords (132/136/140, vurender.h:210-213) and
+		// composes DRAW = MODEL x CAMERA x PERSP on VU1 itself (vurender.i:2329-2376). The
+		// snapshot arrives from the VU side through RemixVU1Capture::Frame.
+		//
+		// BETTER THAN EECAM in one specific way, and it is the way that cost EECAM a calibration
+		// knob: the guest's OWN perspective matrix is available, so the fused view-projection the
+		// clip solver inverts is the real one rather than a synthesised stand-in. The guest's
+		// GS Q is exactly 1 / (world_row x CAMERA x PERSP).w -- SetVerts writes
+		// `DIV Q, VF00w, VF04w` and the viewport fold at vurender.i:136-143 touches xyz only --
+		// so clip w and the recovered world are in the guest's own units by construction and no
+		// EECAMDEPTH-style depth scale is needed.
+		//
+		// 0 = off, 1 = capture and LOG only, 2 = also replace the world camera.
+		int zen_cam_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_ZENCAM", 0), 0, 2);
+		}
+
+		// The engine source settles the convention: ps2RedRenderer.cpp:1307-1312 emits
+		// inverse(camera-to-world) with Y and Z negated, i.e. CAMERA is WORLD->VIEW and no
+		// inversion is wanted here. The knob exists because that is a source reading rather than a
+		// measurement, and the step-2 log is what confirms it -- an eye pinned near the origin
+		// while the player moves is the tell that it should be 1.
+		int zen_cam_invert() { return std::clamp(env_int_live(L"PCSX2_REMIX_ZENCAMINV", 0), 0, 1); }
+
+		// PCSX2_REMIX_ZENCAMYFLIP -- DEFAULT 1, and on measurement rather than on taste.
+		//
+		// The guest's clip y points DOWN the screen and this backend's NDC y points UP, so the
+		// two disagree by a sign and the un-projection would otherwise solve the wrong system.
+		// The proof is arithmetic, from numbers the ZENCAM line prints:
+		//
+		//   * Zen folds the viewport into the matrix as
+		//     row.xyz = SCREEN_SCALE.xyz * row.xyz + SCREEN_TRANS.xyz * row.w (vurender.i:136-143),
+		//     so after the divide  gs_y_pixels = (clip.y / clip.w) * SCREEN_SCALE.y + SCREEN_TRANS.y.
+		//     MEASURED on Mercenaries: SCREEN_SCALE = (256, 224), TRANS = (2048, 2048). Scale.y is
+		//     POSITIVE and GS y grows downward, so clip +y is screen DOWN.
+		//   * This file derives ndc_y as `-(((Y - 0.05) * sy) - offset_y)` (the vertex loop), i.e.
+		//     it NEGATES, so its +y is screen UP. EECAM agrees with that: make_perspective is
+		//     "+Y up" by construction and EECAM works.
+		//   * The RTSIZE census reads 512x448 for 1,271,698 of 1,300,001 draws and SCREEN_SCALE is
+		//     exactly (W/2, H/2), so the two maps agree in MAGNITUDE. Only the sign differs.
+		//
+		// Negating column 1 of the fused matrix is a CORRECTION, not a transformation: it is the
+		// same equation multiplied by -1 on both sides, so the recovered world is identical when
+		// the sign is right and vertically mirrored when it is wrong. The submitted projection
+		// takes the same negation for the separate reason that Remix's own clip y is up.
+		int zen_cam_yflip() { return std::clamp(env_int_live(L"PCSX2_REMIX_ZENCAMYFLIP", 1), 0, 1); }
+
+		// Submitted-projection depth range only. Neither number reaches the un-projection: the
+		// solver reads fused columns {0, 1, 3} and rebuild_projection_z rewrites column 2, which
+		// nothing on the geometry path ever looks at.
+		float zen_cam_near() { return env_float_signed(L"PCSX2_REMIX_ZENCAMNEAR", 1.f); }
+		float zen_cam_far() { return env_float_signed(L"PCSX2_REMIX_ZENCAMFAR", 100000.f); }
+
+		// GS-side copy of the last Zen snapshot the VU side published, taken where the VU Frame is
+		// latched (resolve_world_camera) and consumed at the next OnVSync's staging point -- the
+		// same one-window contract every camera in this file runs under.
+		RemixVU1Capture::ZenSnapshot s_zen_snapshot{};
+		RemixVU1Capture::ZenOmni s_zen_omnis[RemixVU1Capture::max_zen_omnis]{};
+		u32 s_zen_omni_count = 0;
+		u32 s_zen_omni_dropped = 0;
+		world_camera s_zen_pending_camera{};
+		bool s_zen_pending_valid = false;
+
+		// Row-vector mat4 straight out of four VU1 qwords. SetTransform stores rows (the 4x3 path
+		// transposes its three input qwords into four row-qwords with an implicit (0,0,0,1) fourth
+		// column, vurender.i:1766-1789), and remix_ps2::mat4 is row-vector, so this is a copy.
+		remix_ps2::mat4 zen_mat4(const float (&src)[16])
+		{
+			remix_ps2::mat4 out{};
+			std::memcpy(&out.m[0][0], src, sizeof(out.m));
+			return out;
+		}
+
+		bool build_zen_world_camera(world_camera& out)
+		{
+			if (s_zen_snapshot.valid == 0)
+				return false;
+
+			remix_ps2::mat4 view = zen_mat4(s_zen_snapshot.camera);
+			if (zen_cam_invert() != 0)
+			{
+				remix_ps2::mat4 flipped{};
+				if (!remix_ps2::mat4_invert(view, flipped))
+					return false;
+				view = flipped;
+			}
+
+			const remix_ps2::mat4 persp = zen_mat4(s_zen_snapshot.persp);
+			if (!remix_ps2::mat4_is_finite(view) || !remix_ps2::mat4_is_finite(persp))
+				return false;
+
+			// THE GUEST'S OWN fused view-projection -- not a reconstruction, not a hypothesis.
+			// Its z column is unused by design (make_clip_solver reads {0, 1, 3}), which is what
+			// makes the PS2's per-title GS Z convention irrelevant here.
+			remix_ps2::mat4 fused = remix_ps2::mat4_multiply(view, persp);
+
+			// Screen-map correction, see zen_cam_yflip(). Applied to the FUSED matrix rather than
+			// to the vertex loop, deliberately: the loop is shared with every other title and the
+			// un-projection has to stay exactly inverse to what THIS guest did.
+			const bool yflip = (zen_cam_yflip() != 0);
+			if (yflip)
+			{
+				for (u32 i = 0; i < 4; ++i)
+					fused.m[i][1] = -fused.m[i][1];
+			}
+
+			remix_ps2::clip_solver solver{};
+			if (!remix_ps2::make_clip_solver(fused, solver))
+				return false;
+
+			// Eye = translation row of the inverse view. Done on the matrix rather than by negating
+			// the translation through the basis, so a CAMERA that is not exactly orthonormal (a
+			// non-uniform scale folded in, which Zen's Scale(1,-1,-1) makes plausible) still lands
+			// the eye in the right place.
+			remix_ps2::mat4 view_to_world{};
+			if (!remix_ps2::mat4_invert(view, view_to_world))
+				return false;
+
+			const float near_plane = std::max(1e-4f, zen_cam_near());
+			const float far_plane = std::max(near_plane * 2.f, zen_cam_far());
+
+			// The SUBMITTED projection. Scaling a projection matrix uniformly is a no-op for
+			// rendering (clip scales, the divide cancels), but rebuild_projection_z assumes
+			// |m[2][3]| == 1 when it writes the new z column -- so normalise first or the depth
+			// range comes out wrong by exactly that factor. Only the submitted matrix is touched;
+			// `fused` above keeps the guest's raw PERSP, because there the scale is NOT free: it
+			// is what makes recovered world units equal the guest's.
+			remix_ps2::mat4 proj = persp;
+			const float w_scale = std::abs(proj.m[2][3]);
+			if (std::isfinite(w_scale) && w_scale > 1e-12f)
+			{
+				const float k = 1.f / w_scale;
+				for (u32 i = 0; i < 4; ++i)
+				{
+					for (u32 j = 0; j < 4; ++j)
+						proj.m[i][j] *= k;
+				}
+			}
+			// The other half of the sign correction: Remix's clip y is up, the guest's is down.
+			// This one does NOT touch the recovered world -- geometry is submitted in world space
+			// and re-projected by Remix -- it only stops the traced image arriving upside down.
+			if (yflip)
+			{
+				for (u32 i = 0; i < 4; ++i)
+					proj.m[i][1] = -proj.m[i][1];
+			}
+
+			proj = remix_ps2::rebuild_projection_z(proj, near_plane, far_plane);
+			if (!remix_ps2::mat4_is_finite(proj))
+				return false;
+
+			out = world_camera{};
+			out.valid = true;
+			out.view = view;
+			out.projection = proj;
+			out.solver = solver;
+			out.position[0] = view_to_world.m[3][0];
+			out.position[1] = view_to_world.m[3][1];
+			out.position[2] = view_to_world.m[3][2];
+			for (const float p : out.position)
+			{
+				if (!std::isfinite(p))
+					return false;
+			}
+			out.near_plane = near_plane;
+			out.far_plane = far_plane;
+
+			u64 h = fnv_seed;
+			for (u32 i = 0; i < 16; ++i)
+			{
+				u32 bits;
+				std::memcpy(&bits, &fused.m[i / 4][i % 4], sizeof(bits));
+				h = fnv_mix(h, bits);
+			}
+			out.matrix_hash = h;
+			out.score = 1.f;
+			return true;
+		}
+
+		// --- Zen light rig (PCSX2_REMIX_ZENLIGHTS) ---------------------------------------------
+		//
+		// Mercenaries on PS2 HAS NO LIGHTMAPS. The only `lightmap` hits anywhere in its source tree
+		// are the Sony SDK's sample library, a dead RENDERTYPE_LIGHTMAP enum that is never assigned
+		// or tested (Tools\ModelMunge\Source\Mesh.cpp:902), an XBOX debug toggle guarding
+		// commented-out code (RedEngine\Source\xboxRedTerrain.cpp:1657), and a 64x64 2D PDA
+		// texture; the second UV set is plumbed but every PS2 call site passes pTex2 == NULL
+		// (ps2RedTerrain.cpp:237). What it actually ships is (a) baked per-vertex colour, which is
+		// PCSX2_REMIX_VCBAKED's job and needs no code, and (b) THIS: a live rig in VU1 qwords
+		// 44-68 -- one world-space sun plus ambient emitted per frame
+		// (ps2RedRenderer.cpp:1322-1329), and up to four nearest omnis per object
+		// (RedLight.h:16,121).
+		//
+		// NOT replicated, deliberately: Zen's non-physical falloff (half-Lambert^4,
+		// (d^2/r^2 - 1)^4). The rig's directions, positions, radii and colours are injected and the
+		// path tracer's own falloff stands, with ZENLIGHTSCALE / ZENAMBIENT as the dials.
+		int zen_lights_mode() { return std::clamp(env_int_live(L"PCSX2_REMIX_ZENLIGHTS", 0), 0, 1); }
+		float zen_light_scale() { return env_float_signed(L"PCSX2_REMIX_ZENLIGHTSCALE", 1.f); }
+		// DEFAULT 0, AND THAT IS A MEASUREMENT, NOT CAUTION. The ambient half of the rig is an
+		// extra DOME light, and creating one on this title reproducibly takes the Remix runtime
+		// down. A/B/A/A/A on Mercenaries save state 02, 2026-08-31, identical command each time:
+		//
+		//   ZENAMBIENT = 1   died at t = 3.9 / 4.2 / 6.5 / 3.9 s   (4 of 4)
+		//   ZENAMBIENT = 0   alive at t = 61 s, killed by the harness   (2 of 2)
+		//
+		// The dump is 0xC0000005 inside d3d9.dll on one of the runtime's OWN worker threads, with
+		// no PCSX2 frame anywhere in the stack -- the same signature this machine already produces
+		// spontaneously, which is exactly why one crash proved nothing and five runs were needed.
+		// The suspect is adding a dome light AFTER the scene is live and presenting: the fill's
+		// dome (refresh_fill_lights) is built during create_debug_scene and never hits this, and
+		// this title builds no fill dome at all, so a dome arriving mid-session is new behaviour.
+		//
+		// The sun and the omnis are unaffected and verified over 60 s. Set this above 0 only to
+		// investigate the dome; the ambient value itself is printed on the ZENLIGHTS line either
+		// way, so nothing is hidden by leaving it off.
+		float zen_ambient_scale() { return env_float_signed(L"PCSX2_REMIX_ZENAMBIENT", 0.f); }
+
+		// Frames a lamp survives after the last frame it was emitted in. Zen re-selects the four
+		// NEAREST omnis per object, so a lamp legitimately drops out of one frame's set and comes
+		// straight back -- destroying and recreating it on that gap is the churn this exists to
+		// stop. The tell that it is too small is created/destroyed reading large and roughly equal
+		// every stats interval.
+		int zen_light_hold() { return std::clamp(env_int_live(L"PCSX2_REMIX_ZENLIGHTHOLD", 8), 0, 600); }
+
+		struct zen_light
+		{
+			remixapi_LightHandle handle = nullptr;
+			u64 key = 0;
+			u64 last_seen = 0;
+			float position[3] = {0.f, 0.f, 0.f};
+			bool distant = false;
+		};
+
+		std::vector<zen_light> s_zen_lights;
+		u64 s_zen_lights_created = 0;
+		u64 s_zen_lights_destroyed = 0;
+		u32 s_zen_lights_sun = 0;
+		u32 s_zen_lights_omni = 0;
+
+		// Quantised identity. A lamp whose position and colour round to the same bucket across two
+		// frames IS the same lamp, which is what lets the handle survive instead of being torn down
+		// and rebuilt every window. Follows the same reasoning as LEVELLIGHTS' line hash: identity
+		// must not be an ordinal, because the frame's set is re-selected per object and its order
+		// is meaningless.
+		// The DIRECTION is in the key, not just the position and colour, and that is not cosmetic:
+		// a distant light has no position, so keying a sun on (origin, colour) alone would give
+		// every direction the same key -- the sun would be created once and then FROZEN at
+		// whatever direction it had on that frame, however far the game turned it afterwards, and
+		// two directional slots sharing a colour would collide into one. Directions are unit
+		// vectors, so they need a much finer quantum than world positions do: 1/256 is ~0.22 deg,
+		// against 1/4 of a world unit for a lamp.
+		u64 zen_light_key(u32 kind, const float (&pos)[3], const float (&colour)[3], float radius,
+			const float (&direction)[3])
+		{
+			u64 h = fnv_seed;
+			h = fnv_mix(h, kind);
+			// QUANTA CHOSEN ON MEASUREMENT. At 64 steps per unit of colour the sun was rebuilt
+			// ~2.5 times a second on a static direction (created 136 / destroyed 135 over 55 s,
+			// live 1) -- the game's time-of-day tint drifts across a bucket boundary constantly.
+			// These coarser steps are hysteresis, not precision loss: the key decides only
+			// WHETHER to rebuild, and the light keeps the radiance it was built with until it is.
+			//   colour     1/16  (~6% steps)
+			//   direction  1/64  (~0.9 degrees)
+			//   position   1/4 of a world unit, radius likewise
+			const float terms[10] = {pos[0] * 4.f, pos[1] * 4.f, pos[2] * 4.f, colour[0] * 16.f,
+				colour[1] * 16.f, colour[2] * 16.f, radius * 4.f, direction[0] * 64.f,
+				direction[1] * 64.f, direction[2] * 64.f};
+			for (const float t : terms)
+				h = fnv_mix(h, static_cast<u32>(static_cast<s32>(std::isfinite(t) ? std::lround(t) : 0)));
+			return h;
+		}
+
+		void destroy_zen_lights()
+		{
+			if (s_zen_lights.empty())
+				return;
+
+			const remixapi_Interface& api = s_remix.api();
+			for (const zen_light& zl : s_zen_lights)
+			{
+				if (zl.handle)
+				{
+					remix_ps2::guarded_destroy_light(api.DestroyLight, zl.handle);
+					++s_zen_lights_destroyed;
+				}
+			}
+			s_zen_lights.clear();
+		}
+
+		// Adds one light to the frame's live set, reusing the existing handle when the quantised
+		// key matches. GS thread, called from the top of OnVSync -- see refresh_fill_lights() for
+		// why that is the one point in the window at which a light handle may be freed.
+		void want_zen_light(u32 kind, const float (&pos)[3], const float (&colour)[3], float radius,
+			const float (&direction)[3])
+		{
+			const u64 key = zen_light_key(kind, pos, colour, radius, direction);
+			for (zen_light& zl : s_zen_lights)
+			{
+				if (zl.key == key)
+				{
+					zl.last_seen = s_frame_counter;
+					return;
+				}
+			}
+
+			remixapi_LightInfo info{};
+			info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+			// MUST be set, or the runtime sleeps the light after
+			// getNumFramesToPutLightsToSleep() frames and it silently leaves LIGHT STATISTICS.
+			// Dome lights are immune, which is exactly what disguises the bug. See the same note
+			// on refresh_fill_lights().
+			info.isDynamic = 1;
+			info.hash = 0x9C5241B230000000ull ^ (key & 0x00FFFFFFFFFFFFFFull);
+			info.radiance = {colour[0], colour[1], colour[2]};
+
+			remixapi_LightInfoSphereEXT sphere{};
+			remixapi_LightInfoDistantEXT distant{};
+			const bool is_distant = (kind == 0);
+
+			if (is_distant)
+			{
+				distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
+				distant.direction = {direction[0], direction[1], direction[2]};
+				distant.angularDiameterDegrees = 0.5f;
+				distant.volumetricRadianceScale = 1.f;
+				info.pNext = &distant;
+			}
+			else
+			{
+				sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+				sphere.position = {pos[0], pos[1], pos[2]};
+				sphere.radius = std::max(0.01f, radius);
+				sphere.shaping_hasvalue = 0;
+				info.pNext = &sphere;
+			}
+
+			remixapi_LightHandle handle = nullptr;
+			if (remix_ps2::guarded_create_light(s_remix.api().CreateLight, &info, &handle) !=
+					REMIXAPI_ERROR_CODE_SUCCESS ||
+				!handle)
+				return;
+
+			zen_light zl{};
+			zl.handle = handle;
+			zl.key = key;
+			zl.last_seen = s_frame_counter;
+			zl.position[0] = pos[0];
+			zl.position[1] = pos[1];
+			zl.position[2] = pos[2];
+			zl.distant = is_distant;
+			s_zen_lights.push_back(zl);
+			++s_zen_lights_created;
+		}
+
+		void refresh_zen_lights()
+		{
+			if (zen_lights_mode() == 0)
+			{
+				if (!s_zen_lights.empty())
+					destroy_zen_lights();
+				return;
+			}
+
+			if (s_zen_snapshot.valid == 0)
+				return;
+
+			const float scale = zen_light_scale();
+			s_zen_lights_sun = 0;
+			s_zen_lights_omni = 0;
+
+			// Directional. dir_dir is TRANSPOSED (four qwords of "component r of light c") and the
+			// direction is stored pre-scaled by -0.5 with w = 0.5, so undoing both is
+			// -2 x (qw48[c], qw49[c], qw50[c]). Colours are one ROW per light and are already
+			// float, with the guest's 0x80 == 1.0 -- so a plain white sun reads 1.0, not 128.
+			for (u32 c = 0; c < 4; ++c)
+			{
+				const float colour[3] = {s_zen_snapshot.dir_colour[c][0] * scale,
+					s_zen_snapshot.dir_colour[c][1] * scale, s_zen_snapshot.dir_colour[c][2] * scale};
+				if (colour[0] <= 0.f && colour[1] <= 0.f && colour[2] <= 0.f)
+					continue; // zenBlackDirectionalLight padding
+
+				float dir[3] = {-2.f * s_zen_snapshot.dir_dir[0][c], -2.f * s_zen_snapshot.dir_dir[1][c],
+					-2.f * s_zen_snapshot.dir_dir[2][c]};
+				const float len = std::sqrt((dir[0] * dir[0]) + (dir[1] * dir[1]) + (dir[2] * dir[2]));
+				if (!std::isfinite(len) || len < 1e-4f)
+					continue;
+				for (float& d : dir)
+					d /= len;
+
+				const float origin[3] = {0.f, 0.f, 0.f};
+				want_zen_light(0, origin, colour, 0.f, dir);
+				++s_zen_lights_sun;
+			}
+
+			// Ambient, as its OWN dome rather than by hijacking refresh_fill_lights()' handle:
+			// that one is shared with Rainbow Six 3 and SOCOM CA, and the hard constraint here is
+			// that neither changes. Turn the generic fill down from the conf (PCSX2_REMIX_AMBIENT /
+			// LIGHTMODE / KEY) as this rig proves out.
+			{
+				const float ambient_scale = zen_ambient_scale();
+				const float colour[3] = {s_zen_snapshot.ambient[0] * ambient_scale,
+					s_zen_snapshot.ambient[1] * ambient_scale, s_zen_snapshot.ambient[2] * ambient_scale};
+				if (colour[0] > 0.f || colour[1] > 0.f || colour[2] > 0.f)
+				{
+					const float dome_origin[3] = {0.f, 0.f, 0.f};
+				const u64 key = zen_light_key(2, dome_origin, colour, 0.f, dome_origin);
+					bool have = false;
+					for (zen_light& zl : s_zen_lights)
+					{
+						if (zl.key == key)
+						{
+							zl.last_seen = s_frame_counter;
+							have = true;
+							break;
+						}
+					}
+
+					if (!have)
+					{
+						remixapi_LightInfoDomeEXT dome{};
+						dome.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DOME_EXT;
+						dome.transform = s_identity_transform;
+						dome.colorTexture = nullptr;
+
+						remixapi_LightInfo info{};
+						info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+						info.pNext = &dome;
+						info.isDynamic = 1;
+						info.hash = 0x9C5241B230000000ull ^ (key & 0x00FFFFFFFFFFFFFFull);
+						info.radiance = {colour[0], colour[1], colour[2]};
+
+						remixapi_LightHandle handle = nullptr;
+						if (remix_ps2::guarded_create_light(s_remix.api().CreateLight, &info, &handle) ==
+								REMIXAPI_ERROR_CODE_SUCCESS &&
+							handle)
+						{
+							zen_light zl{};
+							zl.handle = handle;
+							zl.key = key;
+							zl.last_seen = s_frame_counter;
+							s_zen_lights.push_back(zl);
+							++s_zen_lights_created;
+						}
+					}
+				}
+			}
+
+			// Omnis, from the frame's de-duplicated set. Position rows are transposed and the
+			// fourth row carries 1/radius^2; RedOmniLight::Black padding was already dropped on the
+			// VU side (colour 0, radius 0.01 -> 1/r^2 == 10000).
+			for (u32 i = 0; i < s_zen_omni_count; ++i)
+			{
+				const RemixVU1Capture::ZenOmni& omni = s_zen_omnis[i];
+				if (!(omni.inv_radius_sq > 0.f) || !std::isfinite(omni.inv_radius_sq))
+					continue;
+
+				const float radius = 1.f / std::sqrt(omni.inv_radius_sq);
+				if (!std::isfinite(radius) || radius <= 0.f)
+					continue;
+
+				const float colour[3] = {omni.colour[0] * scale, omni.colour[1] * scale,
+					omni.colour[2] * scale};
+				const float pos[3] = {omni.position[0], omni.position[1], omni.position[2]};
+				const float no_dir[3] = {0.f, 0.f, 0.f};
+				want_zen_light(1, pos, colour, radius, no_dir);
+				++s_zen_lights_omni;
+			}
+
+			// Reap anything that has not been asked for in ZENLIGHTHOLD frames.
+			const u64 hold = static_cast<u64>(zen_light_hold());
+			const remixapi_Interface& api = s_remix.api();
+			for (size_t i = 0; i < s_zen_lights.size();)
+			{
+				const zen_light& zl = s_zen_lights[i];
+				if ((s_frame_counter >= zl.last_seen) && ((s_frame_counter - zl.last_seen) > hold))
+				{
+					if (zl.handle)
+					{
+						remix_ps2::guarded_destroy_light(api.DestroyLight, zl.handle);
+						++s_zen_lights_destroyed;
+					}
+					s_zen_lights[i] = s_zen_lights.back();
+					s_zen_lights.pop_back();
+					continue;
+				}
+				++i;
+			}
+		}
+
 		void place_debug_light(const float (&position)[3], float scene_radius)
 		{
 			if (no_debug_scene())
@@ -5887,6 +6389,22 @@ namespace RemixSubmit
 			s_stats.vu_sliced += frame.sliced_matrices;
 			s_stats.vu_sliced_published += frame.sliced_published;
 
+			// Zen fixed-address snapshot. Cached here, at the one point the VU Frame is latched,
+			// and consumed by the NEXT OnVSync's staging point -- Latch() bumps the VU generation
+			// and starts a new VU-side frame, so it must be called exactly once per window and this
+			// is where that happens. A frame that captured nothing leaves the previous snapshot in
+			// place rather than blanking it: the alternative is the camera dropping to view space
+			// on any window whose kicks all landed mid-SetTransform.
+			s_stats.zen_kicks += frame.zen_kicks;
+			s_stats.zen_persp_ok += frame.zen_persp_ok;
+			if (frame.zen.valid != 0)
+			{
+				std::memcpy(&s_zen_snapshot, &frame.zen, sizeof(s_zen_snapshot));
+				s_zen_omni_count = std::min(frame.zen_omni_count, RemixVU1Capture::max_zen_omnis);
+				s_zen_omni_dropped = frame.zen_omni_dropped;
+				std::memcpy(s_zen_omnis, frame.zen_omnis, sizeof(s_zen_omnis));
+			}
+
 			s_stats.vu_programs_used = std::max(s_stats.vu_programs_used, frame.programs_used);
 			if (frame.programs_limit != 0)
 				s_stats.vu_programs_limit = frame.programs_limit;
@@ -6445,7 +6963,13 @@ namespace RemixSubmit
 			// EECAM 2 owns s_active_camera: it is installed in OnVSync from the game's actor
 			// Location/Rotation, and a VU1 winner accepted here would govern the next window's
 			// draws instead, alternating the scene between two spaces.
-			if (ee_cam_mode() == 2)
+			//
+			// ZENCAM 2 owns it for the identical reason -- it installs the guest's own
+			// CAMERA x PERSP from VU1 at the same point in OnVSync. On Mercenaries the slicer
+			// accepts nothing at all (accept 0 over 231,982 kicks), so this guard is belt and
+			// braces there; it is written anyway because "the solver never wins on this title"
+			// is a measurement, and a measurement can change.
+			if (ee_cam_mode() == 2 || zen_cam_mode() == 2)
 				return;
 
 			s_active_camera = camera;
@@ -12706,6 +13230,12 @@ namespace RemixSubmit
 		// one to free a handle at.
 		refresh_fill_lights();
 
+		// The guest's OWN rig, on the same contract and at the same safe point: nothing in this
+		// window has referenced a light handle yet, and the previous window's use of every handle
+		// was consumed by its Present. Off (the default, and everywhere but SLUS-20932.conf) this
+		// is one env read and a `return`.
+		refresh_zen_lights();
+
 		// Whether this window holds is decided HERE, ahead of submit_camera(), because under
 		// HOLDEMPTY = 2 it changes which camera that call submits. Everything it reads is already
 		// final for the window; see decide_hold_window().
@@ -12862,6 +13392,103 @@ namespace RemixSubmit
 					eeMem ? "ok" : "null", ee_cam_loc_addr());
 		}
 
+		// --- Zen fixed-address camera (PCSX2_REMIX_ZENCAM) -------------------------------------
+		// Staged here and installed after submit_camera() below, exactly as EECAM is, so one matrix
+		// serves this frame's draws and this frame's submission. See build_zen_world_camera().
+		if (const int zen_mode = zen_cam_mode(); zen_mode != 0)
+		{
+			static u32 s_zencam_n = 0;
+
+			if (zen_mode == 2)
+			{
+				if (build_zen_world_camera(s_zen_pending_camera))
+					s_zen_pending_valid = true;
+				else if (s_zen_snapshot.valid != 0)
+					++s_stats.zen_build_failed;
+			}
+
+			if ((s_zencam_n++ % stats_interval_frames()) == 0)
+			{
+				// Everything three unknowns need settling in ONE run: whether CAMERA is
+				// world->view (an orthonormal basis plus an eye that MOVES with the player says
+				// yes; an eye stuck at the origin says PCSX2_REMIX_ZENCAMINV=1), what PERSP's
+				// m[2][3] is (near +-1 means the guest's clip w already IS view depth in its own
+				// units, which is the trap that cost EECAM its depth calibration), and whether the
+				// screen map the vertex loop inverts agrees with the guest's own SCREEN_SCALE /
+				// SCREEN_TRANS. describe_projection / classify_perspective / is_affine are the
+				// existing readers; nothing here computes anything of its own.
+				const remix_ps2::mat4 zview = zen_mat4(s_zen_snapshot.camera);
+				const remix_ps2::mat4 zpersp = zen_mat4(s_zen_snapshot.persp);
+				remix_ps2::projection_params zp{};
+				const bool described = remix_ps2::describe_projection(zpersp, zp);
+
+				remix_ps2::mat4 zview_inv{};
+				const bool have_eye = remix_ps2::mat4_invert(zview, zview_inv);
+
+				// Orthonormality of the 3x3 rotation block: 1.0 means a rigid world->view basis.
+				float row_len[3] = {0.f, 0.f, 0.f};
+				for (u32 i = 0; i < 3; ++i)
+				{
+					row_len[i] = std::sqrt((zview.m[i][0] * zview.m[i][0]) +
+										   (zview.m[i][1] * zview.m[i][1]) +
+										   (zview.m[i][2] * zview.m[i][2]));
+				}
+
+				INFO_LOG("Remix: ZENCAM mode {} snapshot {} kicks {} persp-ok {} | persp fov {:.2f} "
+						 "aspect {:.4f} near {:.5g} class {} m22 {:.6g} m23 {:.6g} m32 {:.6g} | "
+						 "cam basis on {} affine {} rows {:.4f} {:.4f} {:.4f} eye {:.2f} {:.2f} {:.2f} | "
+						 "screen scale {:.3f} {:.3f} {:.3f} trans {:.3f} {:.3f} {:.3f} | "
+						 "omni {} dropped {} | ambient {:.3f} {:.3f} {:.3f} | "
+						 "sun dir {:.4f} {:.4f} {:.4f} w {:.3f} colour {:.3f} {:.3f} {:.3f} | "
+						 "installed {} build-failed {}",
+					zen_mode, s_zen_snapshot.valid, s_stats.zen_kicks, s_stats.zen_persp_ok,
+					described ? zp.fov_y_degrees : 0.f, described ? zp.aspect : 0.f,
+					described ? zp.near_plane : 0.f, remix_ps2::classify_perspective(zpersp),
+					zpersp.m[2][2], zpersp.m[2][3], zpersp.m[3][2],
+					have_eye ? 1 : 0, remix_ps2::is_affine(zview) ? 1 : 0,
+					row_len[0], row_len[1], row_len[2],
+					have_eye ? zview_inv.m[3][0] : 0.f, have_eye ? zview_inv.m[3][1] : 0.f,
+					have_eye ? zview_inv.m[3][2] : 0.f,
+					s_zen_snapshot.screen_scale[0], s_zen_snapshot.screen_scale[1],
+					s_zen_snapshot.screen_scale[2],
+					s_zen_snapshot.screen_trans[0], s_zen_snapshot.screen_trans[1],
+					s_zen_snapshot.screen_trans[2],
+					s_zen_omni_count, s_zen_omni_dropped,
+					s_zen_snapshot.ambient[0], s_zen_snapshot.ambient[1], s_zen_snapshot.ambient[2],
+					// Light 0's direction, undoing SetLights' -0.5 pre-scale and its transpose
+					// (vurender.i:2646-2676). w should read 0.5 for any slot the guest filled.
+					-2.f * s_zen_snapshot.dir_dir[0][0], -2.f * s_zen_snapshot.dir_dir[1][0],
+					-2.f * s_zen_snapshot.dir_dir[2][0], s_zen_snapshot.dir_dir[3][0],
+					s_zen_snapshot.dir_colour[0][0], s_zen_snapshot.dir_colour[0][1],
+					s_zen_snapshot.dir_colour[0][2],
+					s_stats.zen_installed, s_stats.zen_build_failed);
+
+				// DEPTHDIAG is the world-extent-brackets-the-eye read-out step 4 judges the screen
+				// map on, and its accumulation runs for any world-mode draw -- only this REPORT was
+				// gated on EECAM. Widened rather than duplicated.
+				if (s_dd_verts > 0)
+				{
+					INFO_LOG("Remix: DEPTHDIAG verts {} | clip w [{:.6g},{:.6g}] | world x[{:.1f},{:.1f}] "
+							 "y[{:.1f},{:.1f}] z[{:.1f},{:.1f}] | extent {:.1f} | eye {:.1f} {:.1f} {:.1f}",
+						s_dd_verts, s_dd_w_min, s_dd_w_max,
+						s_dd_p_min[0], s_dd_p_max[0], s_dd_p_min[1], s_dd_p_max[1],
+						s_dd_p_min[2], s_dd_p_max[2],
+						std::max(std::max(s_dd_p_max[0] - s_dd_p_min[0], s_dd_p_max[1] - s_dd_p_min[1]),
+							s_dd_p_max[2] - s_dd_p_min[2]),
+						s_active_camera.position[0], s_active_camera.position[1],
+						s_active_camera.position[2]);
+					s_dd_w_min = 1e30f;
+					s_dd_w_max = -1e30f;
+					s_dd_verts = 0;
+					for (u32 k = 0; k < 3; ++k)
+					{
+						s_dd_p_min[k] = 1e30f;
+						s_dd_p_max[k] = -1e30f;
+					}
+				}
+			}
+		}
+
 		if (!skip_present)
 		{
 			submit_camera(hold_camera ? s_held_camera : s_active_camera);
@@ -12878,6 +13505,19 @@ namespace RemixSubmit
 			s_camera_last_accept_frame = s_frame_counter;
 			s_ee_pending_valid = false;
 			++s_ee_installed;
+		}
+
+		// ...and the staged Zen camera, on the same contract and for the same reason. After
+		// EECAM's install rather than before it so that a title with both knobs set behaves
+		// predictably (the later write wins) instead of depending on statement order nobody read.
+		// In practice they are mutually exclusive: EECAM is set only by SLUS-20883.conf and ZENCAM
+		// only by SLUS-20932.conf.
+		if (s_zen_pending_valid)
+		{
+			s_active_camera = s_zen_pending_camera;
+			s_camera_last_accept_frame = s_frame_counter;
+			s_zen_pending_valid = false;
+			++s_stats.zen_installed;
 		}
 
 		// Before Present, and before the beacon's empty-frame test, because a batched frame's
@@ -12972,6 +13612,33 @@ namespace RemixSubmit
 						}
 					}
 					draw_light(ll.handle, "level");
+				}
+
+				// The guest's own rig. Drawn every presented frame like everything else; the set
+				// itself is rebuilt at the top of this same OnVSync by refresh_zen_lights().
+				for (const zen_light& zl : s_zen_lights)
+					draw_light(zl.handle, zl.distant ? "zen sun" : "zen omni");
+
+				if (zen_lights_mode() != 0)
+				{
+					static u32 zl_n = 0;
+					if ((zl_n++ % stats_interval_frames()) == 0)
+					{
+						const float sun[3] = {-2.f * s_zen_snapshot.dir_dir[0][0],
+							-2.f * s_zen_snapshot.dir_dir[1][0], -2.f * s_zen_snapshot.dir_dir[2][0]};
+						const float lum = (s_zen_snapshot.dir_colour[0][0] +
+											  s_zen_snapshot.dir_colour[0][1] +
+											  s_zen_snapshot.dir_colour[0][2]) /
+										  3.f;
+						INFO_LOG("Remix: ZENLIGHTS sun({:.4f} {:.4f} {:.4f}, lum {:.4f}) ambient "
+								 "{:.4f} {:.4f} {:.4f} | dir {} omni {} live {} | created {} "
+								 "destroyed {} | scale {:g} ambient-scale {:g} hold {}",
+							sun[0], sun[1], sun[2], lum, s_zen_snapshot.ambient[0],
+							s_zen_snapshot.ambient[1], s_zen_snapshot.ambient[2], s_zen_lights_sun,
+							s_zen_lights_omni, static_cast<u32>(s_zen_lights.size()),
+							s_zen_lights_created, s_zen_lights_destroyed, zen_light_scale(),
+							zen_ambient_scale(), zen_light_hold());
+					}
 				}
 
 				if (accepted != s_light_draw_last_ok)
@@ -13514,6 +14181,14 @@ namespace RemixSubmit
 		s_fill_params = fill_light_params{};
 		s_fill_params_resolved = false;
 
+		// The guest's own rig describes a world that no longer exists, and its handles would
+		// otherwise outlive it. The snapshot goes with them, so nothing rebuilds from stale VU1
+		// state before the VU side has published against the new scene.
+		destroy_zen_lights();
+		s_zen_snapshot = RemixVU1Capture::ZenSnapshot{};
+		s_zen_omni_count = 0;
+		s_zen_pending_valid = false;
+
 		const size_t dropped = s_meshes.size();
 
 		for (const auto& [hash, entry] : s_meshes)
@@ -13642,6 +14317,11 @@ namespace RemixSubmit
 		// exist, or the next session's first resolve reads "nothing changed" and builds nothing.
 		s_fill_params = fill_light_params{};
 		s_fill_params_resolved = false;
+
+		destroy_zen_lights();
+		s_zen_snapshot = RemixVU1Capture::ZenSnapshot{};
+		s_zen_omni_count = 0;
+		s_zen_pending_valid = false;
 
 		// One last counter block, so a short session still reports what it saw. Emitted before
 		// the material cache is torn down, because its counters are half the answer.
