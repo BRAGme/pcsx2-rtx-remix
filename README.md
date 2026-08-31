@@ -23,15 +23,23 @@ Everything about the base emulator -- compatibility, BIOS requirements, controll
 
 ## Requirements
 
-**This fork does not work with the stock NVIDIA RTX Remix runtime.** It requires the
-**Remix Plus** fork of dxvk-remix:
+**This fork does not work with the stock NVIDIA RTX Remix runtime.** It requires a dxvk-remix
+fork on the extended API line -- Remix Plus, or a build derived from it:
 
 | | |
 |---|---|
-| Runtime | [`RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix), maintainer Kim2091 |
-| Release tag | `remix-plus-1.5.1` (tag object `f4173a9c8b94736363cb27c3bd228059780acbcf`) |
-| Asset | `Remix_Plus_v1.5.1_x64_games_release.zip` |
-| API version | `0.1000.0` (the vendored `remix_c.h`) |
+| Requirement | any dxvk-remix fork on the `0.1000.x` API line that exports `remixapi_CreateTexture` |
+| Known-good source | [`RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix), maintainer Kim2091 |
+| Release tag | `remix-plus-1.5.1` (tag object `f4173a9c8b94736363cb27c3bd228059780acbcf`), asset `Remix_Plus_v1.5.1_x64_games_release.zip` |
+| API version | `0.1000.0` (the vendored `remix_c.h:65-67`) |
+
+**What the measurements in this README were actually taken on is not that tag.** The deployed
+runtime on the development machine reports `dxvk-remix (remix-main+abbae23d)` and carries the
+string `remix-numos3` -- a numos3 build, not Remix Plus 1.5.1. Both sit on the same API line
+(numos3's header is `0.1000.1`, ours is `0.1000.0`, and the handshake only breaks on the minor),
+so either should connect, but only the numos3 build has run this backend for any length of time.
+Treat 1.5.1 as expected-to-work rather than verified, and if you see behaviour this README does
+not describe, the runtime is the first variable to change.
 
 Two independent reasons stock will not do:
 
@@ -43,8 +51,8 @@ Two independent reasons stock will not do:
    texture data it decoded from PS2 memory; there is no on-disk file to point at.
 
 The vendored `pcsx2/GS/Remix/remix_c.h` is never hand-edited -- it is copied wholesale from the
-fork's `public/include/remix/remix_c.h` at the pinned tag, in the same commit that changes the
-deployed runtime. A single missed struct member silently misroutes every interface slot after the
+runtime fork's `public/include/remix/remix_c.h`, in the same commit that changes the deployed
+runtime. A single missed struct member silently misroutes every interface slot after the
 divergence, which fails at runtime rather than at build time.
 
 ### Installing the runtime
