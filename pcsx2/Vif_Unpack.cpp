@@ -234,60 +234,6 @@ _vifT void vifUnpackSetup(const u32 *data) {
 	if (idx && ((addr>>15)&1)) addr += vif1Regs.tops;
 	vifX.tag.addr = (addr<<4) & (idx ? 0x3ff0 : 0xff0);
 
-	// TEMPORARY DIAGNOSTIC (2026-08-27) -- RTX Remix camera hunt, R6 3 save state 07.
-	// Maps the SHAPE of every VIF1 upload: destination address x qword count, with hit
-	// counts. VU1[0x240] turned out to be qword 36 of a 49-qword block written to addr 0
-	// ~84,000 times a run -- a field inside a repeating per-batch record, not a camera slot.
-	// A per-object stream and a once-per-frame camera upload have different shapes: this
-	// prints them so the once-per-frame one can be identified instead of guessed at.
-	if (idx == 1)
-	{
-		struct RemixUnpackShape { u32 addr; u32 num; u64 count; };
-		static RemixUnpackShape s_shapes[1024]{};
-		static u32 s_shape_count = 0;
-		static u64 s_total = 0;
-		static u32 s_overflow = 0;
-
-		const u32 a = vifX.tag.addr;
-		const u32 nq = static_cast<u32>(vifNum);
-
-		bool seen = false;
-		for (u32 i = 0; i < s_shape_count; ++i)
-		{
-			if (s_shapes[i].addr == a && s_shapes[i].num == nq)
-			{
-				++s_shapes[i].count;
-				seen = true;
-				break;
-			}
-		}
-		if (!seen)
-		{
-			if (s_shape_count < 1024)
-				s_shapes[s_shape_count++] = { a, nq, 1 };
-			else
-				++s_overflow; // no silent truncation: report what was dropped
-		}
-
-		if ((++s_total % 40000) == 0)
-		{
-			Console.WriteLn("Remix: VIFMAP total=%llu distinct=%u dropped=%u",
-				(unsigned long long)s_total, s_shape_count, s_overflow);
-			for (u32 i = 0; i < s_shape_count; ++i)
-			{
-				// Only the per-frame band is interesting: a ~30s run is ~1800 frames, so a
-				// once-per-frame upload lands near there. Per-batch streams are in the tens of
-				// thousands and would bury it. Totals above still account for everything.
-				if (s_shapes[i].count < 800 || s_shapes[i].count > 4000)
-					continue;
-				Console.WriteLn("Remix: VIFMAP   addr=%u num=%u count=%llu covers240=%d",
-					s_shapes[i].addr, s_shapes[i].num,
-					(unsigned long long)s_shapes[i].count,
-					(s_shapes[i].addr <= 576u && 576u < s_shapes[i].addr + s_shapes[i].num * 16u) ? 1 : 0);
-			}
-		}
-	}
-
 	VIF_LOG("Unpack VIF%x, QWC %x tagsize %x", idx, vifNum, vifX.tag.size);
 
 	vifX.cl			 = 0;

@@ -114,15 +114,36 @@ material path was rewritten several times over (`8f229137d`, `1952014f4`, `64d2b
 has not had a clean re-measurement. Assume it needs one. No other title has been measured; absence
 from this table means untested, not broken.
 
+Landed since that table was written, each measured on the title named:
+
+| What | Where it was measured |
+|---|---|
+| **The flat-albedo defect was an enum bug, not texture binding.** D3D9 enum values were being written into fields the runtime casts straight to `VkBlendFactor` / `RtTextureArgSource`; `textureColorArg1Source = 2` meant `D3DTA_TEXTURE` to us and `VertexColor0` to the runtime, so the backend asked for vertex colour and ignored the texture. `MODULATE` also read as `Modulate2x`, doubling surface brightness. | `dc6a1934b`, all titles |
+| **The 1-in-3 "flickering triangles" is an empty present window**, not depth precision: the game renders below the vsync rate, so every Nth presented window submits zero geometry. `PCSX2_REMIX_HOLDEMPTY` re-presents the previous window. Period-3 luma signature gone; `offcadence 0` over 14,098 holds. | `f1561a731`, Combined Assault and SOCOM 1 |
+| **PS2 text is drawn as sprites**, and the first classification gate returned on any non-triangle primclass ~900 lines before the UI classifier could see it, discarding all of it. | `dc6a1934b`, all titles |
+| **USD capture was broken for every game by a locale bug.** PCSX2 calls `std::locale::global(std::locale(""))`; the runtime builds prim names with a bare `stringstream`, so hex hashes came out comma-grouped and are invalid USD identifiers. Every capture failed 18 ms in. | `29ddee4a4`; capture now yields 3 meshes / 37 materials / 71 textures on Alcatraz |
+| **The camera is read out of EE memory** on Rainbow Six 3 rather than recovered from VU1. Verified live: position tracks a multi-thousand-unit walk, yaw follows every turn, Z steps on stairs. | `dc6a1934b` / `02e549e70`, Rainbow Six 3 |
+| **The synthetic projection was never validated**, because geometry re-projects to the guest's own clip whatever FOV we use -- only a world-space light exposes the error. `LIGHTFIT` measured the residual between an authored lamp and its fixture: 14.0 units at fov 60, **1.4 at fov 70**. | `1261786e4`, Rainbow Six 3 |
+| **The ghost bodies are the game's shadow pass** -- characters re-rendered from the light's viewpoint, which un-project into duplicate bodies drifting through walls. 1.3% of draws carrying 24% of the vertices. `PCSX2_REMIX_SHADOWPASS` drops them. | `1261786e4`, Rainbow Six 3 |
+| **Sky is classified by depth, not draw ordinal.** Combined Assault's backdrop is draw 982 of 999, so an ordinal gate could never reach it; what the ordinal *did* catch was near-field terrain, which is worse than doing nothing. | `15d12352f`, Combined Assault |
+
 ### Known blockers
 
-**One camera per frame, applied to every draw.** The backend picks a single view-projection from
-the frame's candidate set and uses it for the whole frame. Per-draw camera association is not
-built. This is the headline limitation and it is measurable: on Rainbow Six 3 save state 9 the
-frames that anchor to world space run at 99.84%, but on save state 7 -- which runs a *different*
-VU1 microprogram emitting roughly 20,000 distinct candidate matrices in 30 s -- three 30 s runs
-measured 35.3%, 48.4% and 68.3% (`9c271c790`). The rest fall back to view space. A wall was removed
-there; the job is not finished.
+**One camera per frame, applied to every draw.** The backend picks a single view-projection and
+uses it for the whole frame. Per-draw camera association is not built. It is measurable: on
+Rainbow Six 3 save state 9 the frames that anchor to world space run at 99.84%, but on save state 7
+-- which runs a *different* VU1 microprogram emitting roughly 20,000 distinct candidate matrices in
+30 s -- three 30 s runs measured 35.3%, 48.4% and 68.3% (`9c271c790`). The rest fall back to view
+space.
+
+*Partly superseded for one title.* On Rainbow Six 3 the camera is no longer recovered from VU1 at
+all -- it is read directly out of EE memory (`dc6a1934b`, `02e549e70`), which sidesteps the
+candidate-set problem entirely for that game. The VU1 recovery path below is still what every other
+title uses, and the per-draw limitation still stands everywhere. Worth knowing why: `VIFMAP`, a
+write-side probe over 7.8M VIF1 unpacks, found 360 distinct upload shapes and **none** that writes
+a standalone matrix once per frame. The EE composes per-object MVPs and ships only the product, so
+on that title no pin, slice, TOPS bank or ranking change could ever have recovered a view
+transform. If a title resists the VU1 path, that is the first thing to check.
 
 **Reproducible device loss (`0x60D0DEAD`) on some titles.** On SOCOM the hang lands within a
 fraction of a second of the renderer going live, and loading heavy mission geometry is what
@@ -204,8 +225,43 @@ technique generalises better than the console-specific plumbing around it does.
 
 ## Building
 
-Windows, Visual Studio 2022, x64. This is what
-[`tools/remix-harness/build.cmd`](tools/remix-harness/build.cmd) has always run:
+Windows, Visual Studio 2022, x64.
+
+### Build the dependencies first
+
+**This is the step people miss.** A fresh clone will not build. MSBuild resolves third-party
+libraries from `$(SolutionDir)deps\` (`common/vsprops/DepsDir.props:4`), and `deps/` is gitignored
+(`.gitignore:118-119`) because it is *built*, not committed. Skip this and the build fails looking
+for zlib, libpng, Qt and the rest -- which is upstream PCSX2 behaviour, not something this fork
+introduced.
+
+Run this once, from the repo root:
+
+```bat
+.github\workflows\scripts\windows\build-dependencies.bat
+```
+
+It builds ~28 libraries (Qt 6.11.1, zlib 1.3.2, libpng, FFmpeg, freetype, harfbuzz, shaderc,
+KDDockWidgets and so on) into `deps\`. Expect it to take a while -- it is compiling Qt from
+source. It is the same script CI runs, so if it works there it works here.
+
+It needs these on the machine, at these paths, because the script hardcodes them
+(`build-dependencies.bat:26-28`):
+
+| Tool | Path the script expects |
+|---|---|
+| Visual Studio 2022 | located via `vswhere`; VS2022 is preferred over VS2026 |
+| 7-Zip | `C:\Program Files\7-Zip\7z.exe` |
+| Git for Windows | `C:\Program Files\Git\usr\bin\` (`patch.exe`, `bash.exe`) |
+| CMake, Ninja, Python | on `PATH` |
+
+There are no git submodules -- `.gitmodules` is empty and upstream moved every vendored library
+in-tree, so `git submodule update` is not part of this and will appear to do nothing. That is
+correct, not a failed clone.
+
+### Then build the emulator
+
+This is what [`tools/remix-harness/build.cmd`](tools/remix-harness/build.cmd) has always run:
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
@@ -213,8 +269,8 @@ cd <repo>
 msbuild PCSX2_qt.sln /m /v:m /p:Configuration=Release /p:Platform=x64
 ```
 
-Upstream's normal prerequisites apply; nothing extra is needed for the Remix backend beyond the
-runtime, which is loaded at run time and is not a build dependency.
+Nothing extra is needed for the Remix backend itself beyond the runtime, which is loaded at run
+time and is not a build dependency.
 
 The CMake presets in `CMakePresets.json` want `clang-cl`, which is not installed on the machine
 this fork is developed on, so **the CMake path is untested here**. Use the `sln`.
@@ -229,10 +285,21 @@ setting it from `bin\inis\PCSX2.ini` directly, which is what the test harness do
 Remix settings live in the GUI on their own page
 (`pcsx2-qt/Settings/RemixSettingsWidget.{h,cpp,ui}`).
 
-Per-game Remix settings go in `bin/<serial>.conf`. Two curated examples are tracked:
+Per-game Remix settings go in `bin/<serial>.conf`. Six are tracked. The first two are the
+curated ones, written up from measurements taken on those titles; the rest are transplants and say
+so in their own headers:
 
-- [`bin/SCUS-97545.conf`](bin/SCUS-97545.conf) -- SOCOM: Combined Assault
-- [`bin/SLUS-20883.conf`](bin/SLUS-20883.conf) -- Rainbow Six 3
+| File | Title | Status |
+|---|---|---|
+| [`bin/SCUS-97545.conf`](bin/SCUS-97545.conf) | SOCOM: Combined Assault | measured on this title |
+| [`bin/SLUS-20883.conf`](bin/SLUS-20883.conf) | Rainbow Six 3 | measured on this title |
+| [`bin/SCUS-97134.conf`](bin/SCUS-97134.conf) | SOCOM: U.S. Navy SEALs | sky and `MINRT` measured here; the rest transplanted |
+| [`bin/SCUS-97275.conf`](bin/SCUS-97275.conf) | SOCOM II | transplanted from Combined Assault, unmeasured here |
+| [`bin/SCUS-97474.conf`](bin/SCUS-97474.conf) | SOCOM 3 | starter profile, unmeasured |
+| [`bin/SCUS-97399.conf`](bin/SCUS-97399.conf) | God of War | starter profile, unmeasured, different engine |
+
+None of them arms a diagnostic. If you are adding a profile, keep it that way -- `DRAWDUMP` and
+friends default to 0 and belong in a working copy, not in the repo.
 
 These are read at frame boundaries and pushed through `remixapi_SetConfigVariable`, which writes
 Remix's **user** layer -- so they outrank `rtx.conf` and any Logic-graph layer. Keys spelled
@@ -240,7 +307,7 @@ Remix's **user** layer -- so they outrank `rtx.conf` and any Logic-graph layer. 
 already set always beats the file**, which is deliberate: it keeps A/B harnesses authoritative over
 whatever the GUI last wrote.
 
-Read those two files even if you do not play those games. They are written in the house style --
+Read the two curated files even if you do not play those games. They are written in the house style --
 measured numbers rather than adjectives -- and they record *why* each setting is what it is. For
 example, volumetric fog was not dimming SOCOM but hiding it: with volumetrics on, 2,502,313 lit
 pixels at a uniform grey and 0.00% coloured; with them off, 26,874 lit pixels and 34.31% coloured.

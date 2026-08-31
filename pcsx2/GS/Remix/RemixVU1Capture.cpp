@@ -1309,28 +1309,6 @@ namespace RemixVU1Capture
 				const float slice_rank =
 					(matrix.rows[0].vi_base == 0) ? 1500.f : 1000.f;
 
-				// TEMPORARY DIAGNOSTIC (2026-08-27). Matrix 2 of ucode 0x1045fdf6f596e615 is a
-				// vi00-indexed (constant 0x240) load -- the camera -- and by inspection it should
-				// publish on EVERY kick, yet only 2 of 5,750 dumped candidates carry off=0x0240.
-				// Nothing in the loop above filters it, so the drop is inside read_sliced_matrix
-				// or finite_window. Report both verdicts and the payload. Remove once answered.
-				if (matrix.rows[0].vi_base == 0)
-				{
-					static u32 s_vi0_n = 0;
-					const u32 vn = s_vi0_n++;
-					if (vn < 6 || (vn % 5000) == 0)
-					{
-						float probe[16];
-						u32 probe_off = 0;
-						const bool read_ok =
-							read_sliced_matrix(mem, matrix, false, tops, probe, probe_off);
-						INFO_LOG("Remix: VI0PROBE n={} read={} off={} finite={} imm={} delta={} m0={} m5={} m10={}",
-							vn, read_ok ? 1 : 0, probe_off, read_ok ? (finite_window(probe) ? 1 : 0) : -1,
-							matrix.rows[0].imm, matrix.rows[0].vi_delta,
-							read_ok ? probe[0] : 0.f, read_ok ? probe[5] : 0.f, read_ok ? probe[10] : 0.f);
-					}
-				}
-
 				if (read_sliced_matrix(mem, matrix, false, tops, m, offset) && usable_matrix(m))
 				{
 					insert_candidate(m, ranked(slice_rank, m), offset, start_pc, ucode, 1, flags);
@@ -1393,21 +1371,6 @@ namespace RemixVU1Capture
 		// its contents are rewritten between kicks, and letting every kick contribute a
 		// 1000-scored entry would evict the whole rest of the set.
 		const u32 pinned = s_pinned_offset.load(std::memory_order_relaxed);
-
-		// TEMPORARY DIAGNOSTIC (2026-08-26). src=pinned published ZERO candidates on save
-		// state 07 even with PINOFFSET=576 read and PINKICKS=512, and usable_matrix() is too
-		// weak to be the filter (denormals pass it) -- so the gate below is never satisfied.
-		// This prints its three operands so we stop guessing which one. Remove once answered.
-		{
-			static u32 s_pinprobe_n = 0;
-			const u32 n = s_pinprobe_n++;
-			if (n < 8 || (n % 20000) == 0)
-			{
-				INFO_LOG("Remix: PINPROBE n={} pinned={} is_no_pin={} kicks_scanned={} window={} fits={}",
-					n, pinned, (pinned == s_no_pin) ? 1 : 0, s_frame.kicks_scanned,
-					pinned_kick_window(), ((pinned + s_matrix_bytes) <= VU1_MEMSIZE) ? 1 : 0);
-			}
-		}
 
 		if (pinned != s_no_pin && s_frame.kicks_scanned <= pinned_kick_window() &&
 			(pinned + s_matrix_bytes) <= VU1_MEMSIZE)
