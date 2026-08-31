@@ -93,14 +93,10 @@ this capture and has been cropped out of the right edge.*
 ![SOCOM Combined Assault, textured](docs/Remix/README-assets/pcsx2-socom-textured.jpg)
 
 *SOCOM: U.S. Navy SEALs -- Combined Assault (SCUS-97545). Captured **2026-08-02 23:11**, branch tip
-**`a311a7c5d`** -- six days and ~30 commits before the current tip. **This is not a picture of the
-current build.** SOCOM has not been re-verified since; see the status table. The floating compass
+**`a311a7c5d`** -- 29 days and 83 commits before the current tip. **This is not a picture of the
+current build**, and SOCOM is not playable: it is actively being worked on, and the device loss
+below still ends a session early. 18 of those 83 commits touch this title. The floating compass
 in the top right is the world-space UI problem, not a Remix artefact.*
-
-**Video:** [Ghost Recon 2 under the backend, 13 s, 22 MB](https://github.com/BRAGme/pcsx2-rtx-remix/releases/download/remix-preview-1/pcsx2-rtx-remix-ghost-recon-2.mp4)
--- the same capture the first still is from, so the same date and branch tip apply. It is a release
-asset rather than an embed, so the link downloads rather than streams. Audio is stripped: the source
-capture carries two tracks and one of them is a microphone.
 
 ---
 
@@ -114,13 +110,17 @@ Read this before building anything. The backend renders, and it is not finished.
 |---|---|---|---|
 | Tom Clancy's Ghost Recon 2 | `SLUS-21105` | World geometry, albedo textures, generated vertex normals, path-traced lighting | Capture 2026-08-08 08:58, branch tip `b87dc8e8f` |
 | Tom Clancy's Rainbow Six 3 | `SLUS-20883` | World geometry, albedo textures, characters, path-traced lighting | Capture 2026-08-08 08:24, branch tip `37a25ae09` |
-| SOCOM: U.S. Navy SEALs -- Combined Assault | `SCUS-97545` | World geometry, albedo textures, characters, path-traced lighting | Capture 2026-08-02 23:11, tip `a311a7c5d` -- **not re-verified since** |
+| SOCOM: U.S. Navy SEALs -- Combined Assault | `SCUS-97545` | World geometry, albedo textures, characters, path-traced lighting -- **still being worked on, not playable** | Capture 2026-08-02 23:11, tip `a311a7c5d` -- **not re-verified since** |
 
-SOCOM is listed honestly rather than confidently. Between `a311a7c5d` and the current tip the
-material path was rewritten several times over (`8f229137d`, `1952014f4`, `64d2b28f0`,
-`870e3f991`), and the device loss below makes SOCOM expensive to get into a mission at all, so it
-has not had a clean re-measurement. Assume it needs one. No other title has been measured; absence
-from this table means untested, not broken.
+SOCOM is listed honestly rather than confidently, and it is **not a playable title on this
+backend yet**. Between `a311a7c5d` and the current tip the material path was rewritten several
+times over (`8f229137d`, `1952014f4`, `64d2b28f0`, `870e3f991`), and the device loss below makes
+SOCOM expensive to get into a mission at all, so it has not had a clean re-measurement. It is
+being actively worked on rather than parked -- 18 of the 83 commits since that capture touch it,
+including the render-target gate, the sky classifier and the empty-window fix -- but treat the
+screenshot as a record of what the geometry and material path can do, not as a claim that you can
+sit down and play it. No other title has been measured; absence from this table means untested,
+not broken.
 
 Landed since that table was written, each measured on the title named:
 

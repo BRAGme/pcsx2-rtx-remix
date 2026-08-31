@@ -106,8 +106,13 @@ Seen working:
   Ghost Recon 2 (SLUS-21105)  -- world geometry, albedo textures, generated
                                  vertex normals, path-traced lighting
   Rainbow Six 3 (SLUS-20883)  -- the above plus character models
-  SOCOM: Combined Assault (SCUS-97545) -- verified 2026-08-02 and NOT re-verified
-                                 since. Assume it needs a fresh measurement.
+  SOCOM: Combined Assault (SCUS-97545) -- NOT playable yet. Geometry, textures and
+                                 characters were verified 2026-08-02, but that is 83
+                                 commits back and it has not been re-measured since.
+                                 It is actively being worked on -- 18 of those commits
+                                 touch this title -- but the device loss below still
+                                 ends a session early. Do not download this expecting
+                                 to play SOCOM.
 
 Fixed since the first preview build:
 
