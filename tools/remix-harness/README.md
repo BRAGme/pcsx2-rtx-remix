@@ -10,9 +10,27 @@ defaults to `%TEMP%\remix-harness` and is created if missing; `abcam.ps1` derive
 `-Results` and `-Fingerprint` from it, and `-Stash\armA` / `-Stash\armB` are an **input** you
 populate with the two builds before the run.
 
-Still machine-specific and worth checking before a run: the ISO directory (`E:\PS2 Games`), the
-deployed install `abcam.ps1 -Install` points at, and `build.cmd`'s Visual Studio path. All are
-parameters or one-line edits.
+Two paths are yours, not the repo's, and no default is baked in for either:
+
+| variable | what it is | used by |
+|---|---|---|
+| `PCSX2_TEST_ISO_DIR` | folder holding your PS2 test images | all five launching scripts |
+| `PCSX2_TEST_INSTALL` | the deployed install `abcam.ps1` swaps builds into | `abcam.ps1` |
+
+Set them once per shell (or pass `-IsoDir` / `-Install`):
+
+```powershell
+$env:PCSX2_TEST_ISO_DIR = "D:\PS2 Games"
+$env:PCSX2_TEST_INSTALL = "D:\Emulators\PCSX2 RTX Remix"
+```
+
+A script that needs one and does not have it stops immediately and names the variable. That check
+is deliberate: PCSX2 accepts a bad image path and only reports `Requested filename does not exist`
+seconds later, which reads as a crashed run rather than a typo -- and `abcam.ps1` has been bitten
+by exactly that before. The `-Iso` parameters still default to the title each script was written
+around, so only the folder is yours to supply.
+
+`build.cmd`'s Visual Studio path is still a one-line edit.
 
 ## The scripts
 

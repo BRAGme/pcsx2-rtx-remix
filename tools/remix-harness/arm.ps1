@@ -2,6 +2,8 @@ param(
     [int]$Launches = 20,
     [int]$Slot = 2,
     [string]$Iso = "SOCOM Combined Assault.iso",
+    # Folder holding the test images. Defaults to $env:PCSX2_TEST_ISO_DIR; see the check below.
+    [string]$IsoDir = $env:PCSX2_TEST_ISO_DIR,
     [int]$Live = 25,
     [string]$Name = "arm",
     # The repo build, resolved from this script's location so a fresh checkout needs no editing.
@@ -9,7 +11,15 @@ param(
     [hashtable]$Env = @{}
 )
 
-$isoPath = Join-Path "E:\PS2 Games" $Iso
+# The folder holding your PS2 test images. No default is baked in -- set
+# PCSX2_TEST_ISO_DIR once, or pass -IsoDir, so a fresh checkout needs no editing and no
+# machine's layout ends up in the repo. Checked here rather than at boot because PCSX2
+# accepts a bad path and only reports "Requested filename does not exist" seconds later,
+# which reads as a crashed run rather than a typo.
+if (-not $IsoDir) {
+    throw 'Set PCSX2_TEST_ISO_DIR to the folder holding your PS2 test images, or pass -IsoDir. Example: $env:PCSX2_TEST_ISO_DIR = "D:\PS2 Games"'
+}
+$isoPath = Join-Path $IsoDir $Iso
 
 $t = Get-Content "$Bin\inis\PCSX2.ini" -Raw
 $t = $t -replace '(?m)^Renderer = \d+(?=\r?$)', 'Renderer = 16'

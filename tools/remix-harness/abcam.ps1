@@ -4,7 +4,7 @@
 # save state 9 under a fixed wall-time cap, alternating arm A / arm B every round. Everything else
 # about the configuration stays the user's own.
 #
-# Knobs are passed through the ENVIRONMENT, never by editing the E:\ inis. The backend records
+# Knobs are passed through the ENVIRONMENT, never by editing the install's inis. The backend records
 # which PCSX2_REMIX_* vars were already set before it writes anything and then never overwrites
 # them (RemixPaths.cpp:84-116 "These are never written, ever"; the per-game .conf loses the same
 # way, RemixMaterials.h:100-110). That is the documented A/B control surface. This deliberately
@@ -26,14 +26,18 @@ param(
     # of overwriting launch-01..12, since the log filename is keyed on the round number.
     [int]$StartRound = 1,
     [int]$Live       = 60,
-    [string]$Install = "E:\Emulators\PCSX2 RTX Remix",
+    # The deployed install this swaps builds into. No default is baked in -- set
+    # PCSX2_TEST_INSTALL once, or pass -Install.
+    [string]$Install = $env:PCSX2_TEST_INSTALL,
     # Working area for the run. Anywhere writable will do; $Results is created, $Stash is an INPUT
     # -- populate $Stash\armA and $Stash\armB with the two builds' pcsx2-qtx64.exe (+pdb) first.
     [string]$Scratch = (Join-Path $env:TEMP "remix-harness"),
     [string]$Stash   = (Join-Path $Scratch "stash"),
     [string]$Results = (Join-Path $Scratch "results"),
     [string]$Fingerprint = (Join-Path $Results "fingerprint.txt"),
-    [string]$Iso     = "E:\PS2 Games\Tom Clancy's Rainbow Six 3 (USA).iso",
+    [string]$IsoName = "Tom Clancy's Rainbow Six 3 (USA).iso",
+    # Folder holding the test images. Defaults to $env:PCSX2_TEST_ISO_DIR; checked below.
+    [string]$IsoDir  = $env:PCSX2_TEST_ISO_DIR,
     [int]$Slot       = 9,
     # An explicit state FILE, not a slot index.
     #
@@ -43,11 +47,29 @@ param(
     # "Savestate file does not exist", a clean exit 0 at ~1.0 s, measured here on the smoke round.
     # -statefile takes the path verbatim (QtHost.cpp:2232 -> VMManager.cpp:1383-1384), so it loads
     # the exact file step 1 fingerprinted and touches none of the user's directories.
-    [string]$StatePath = (Join-Path $Install ("sstates\SLUS-20883 (21CC1EC3).{0:D2}.p2s" -f $Slot)),
+    [string]$StatePath = "",
     [int]$Settle     = 6
 )
 
 $ErrorActionPreference = "Stop"
+
+# Neither path is baked in -- set PCSX2_TEST_ISO_DIR and PCSX2_TEST_INSTALL once, or pass
+# -IsoDir and -Install, so a fresh checkout needs no editing and no machine's layout ends up
+# in the repo. Checked here rather than at boot because PCSX2 accepts a bad path and only
+# reports "Requested filename does not exist" seconds later, which reads as a crashed run
+# rather than a typo. $StatePath is derived here too, not in the param block: its default
+# calls Join-Path $Install, which throws during parameter binding when $Install is empty --
+# before any of these checks could run.
+if (-not $IsoDir) {
+    throw 'Set PCSX2_TEST_ISO_DIR to the folder holding your PS2 test images, or pass -IsoDir. Example: $env:PCSX2_TEST_ISO_DIR = "D:\PS2 Games"'
+}
+if (-not $Install) {
+    throw 'Set PCSX2_TEST_INSTALL to your deployed PCSX2 install, or pass -Install. Example: $env:PCSX2_TEST_INSTALL = "D:\Emulators\PCSX2 RTX Remix"'
+}
+$Iso = Join-Path $IsoDir $IsoName
+if (-not $StatePath) {
+    $StatePath = Join-Path $Install ("sstates\SLUS-20883 (21CC1EC3).{0:D2}.p2s" -f $Slot)
+}
 
 function Kill-Emu {
     cmd /c "taskkill /F /T /IM pcsx2-qtx64.exe >nul 2>&1"
@@ -247,7 +269,8 @@ for ($r = $StartRound; $r -le $Rounds; $r++) {
         #
         # Start-Process's array form does not reliably quote elements containing spaces: with both
         # the state path and the iso path carrying spaces, PCSX2 received
-        # "-statefile E:\Emulators\PCSX2" and glued "RTX Remix\...p2s <iso>" together into a single
+        # "-statefile <install-dir-up-to-the-first-space>" and glued the remainder and the
+        # iso path together into a single
         # bogus boot filename ("Requested filename '...' does not exist", measured on the smoke
         # round). A single string is passed to CreateProcess verbatim, so the quotes here are the
         # ones the child actually sees.
