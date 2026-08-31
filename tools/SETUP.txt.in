@@ -1,0 +1,173 @@
+PCSX2 with a native RTX Remix render backend
+============================================
+
+This build submits PlayStation 2 geometry to the RTX Remix runtime through the
+Remix API, so a PS2 title is path traced rather than rasterised. It is a research
+build, not a product. Read "What works" before filing anything.
+
+Source and full documentation:
+  https://github.com/BRAGme/pcsx2-rtx-remix
+
+
+TWO THINGS ARE NOT IN THIS ZIP AND IT WILL NOT RUN WITHOUT THEM
+---------------------------------------------------------------
+
+1. A REMIX RUNTIME ON THE EXTENDED API LINE.
+
+   This backend does NOT work with the stock NVIDIA RTX Remix runtime, for two
+   independent reasons: the version handshake rejects it (the extended line
+   reserves REMIXAPI_VERSION_MINOR = 1000, stock is on the 0.6.x line), and stock
+   has no remixapi_CreateTexture -- which this backend needs, because PS2 textures
+   are decoded out of emulated memory and there is no file on disk to point at.
+
+   Known-good source:
+     https://github.com/RemixProjGroup/dxvk-remix   (maintainer: Kim2091)
+     Release tag: remix-plus-1.5.1
+     Asset:       Remix_Plus_v1.5.1_x64_games_release.zip
+
+   HONEST NOTE ON WHICH RUNTIME WAS ACTUALLY TESTED. The measurements quoted in
+   this file and in the README were taken against a numos3 build of dxvk-remix
+   (it reports "dxvk-remix (remix-main+abbae23d)"), not against the 1.5.1 tag
+   above. Both sit on the same API line -- numos3's header is 0.1000.1, this
+   build's is 0.1000.0, and the handshake only breaks on the minor -- so either
+   should connect. But only the numos3 build has actually run this backend for any
+   length of time. Treat 1.5.1 as expected-to-work rather than verified, and if
+   you see behaviour this file does not describe, the runtime is the first
+   variable to change.
+
+   Unzip it into a subfolder called  remix\  next to pcsx2-qtx64.exe:
+
+     pcsx2-qtx64.exe
+     remix\d3d9.dll
+     remix\...
+
+   DO NOT put d3d9.dll directly beside the executable. Anything else in the
+   process that resolves that name would pick it up. The subfolder is mandatory,
+   not a convention. You can also set PCSX2_REMIX_DLL to a full path, or point
+   RuntimePath under [Remix] in the settings at one.
+
+   It is not bundled here because that folder contains third-party
+   redistributables (nvngx_dlss*.dll, cudart64_13.dll, GFSDK_Aftermath,
+   libxess.dll, amd_fidelityfx_vk.dll) with their own terms, inside someone
+   else's fork build. Get it from the people who made it.
+
+2. A PS2 BIOS. Same as stock PCSX2 -- dump it from a console you own. No BIOS,
+   games or keys are included or ever will be.
+
+
+ENABLING THE BACKEND
+--------------------
+
+  Settings -> Graphics -> Renderer -> RTX Remix
+
+There is also a Settings -> RTX Remix page for the backend's own knobs. Every knob
+also has a PCSX2_REMIX_* environment variable, and an environment variable that is
+already set always beats both the GUI and the per-game file -- deliberately, so an
+A/B harness stays authoritative. The full table is in docs/Remix/KNOBS.md in the
+repository.
+
+Per-game settings go in <serial>.conf next to the exe. Six ship here. Two are
+curated from measurements taken on those titles:
+
+  SCUS-97545.conf  SOCOM: Combined Assault
+  SLUS-20883.conf  Rainbow Six 3
+
+The other four are transplants and say so in their own headers -- they carry the
+engine-independent fixes and nothing that was guessed:
+
+  SCUS-97134.conf  SOCOM: U.S. Navy SEALs   (sky and MINRT measured here)
+  SCUS-97275.conf  SOCOM II                 (transplanted, unmeasured)
+  SCUS-97474.conf  SOCOM 3                  (starter profile, unmeasured)
+  SCUS-97399.conf  God of War               (starter profile, different engine)
+
+They are worth reading even if you do not play those games: they record why each
+setting is what it is, with the measurements behind it. None of them arms a
+diagnostic.
+
+Runtime-generated per-game state goes to RemixGames\<serial>\.
+
+
+THIS BUILD IS PORTABLE
+----------------------
+
+portable.ini is present, so settings, memory cards and save states live in this
+folder rather than Documents\PCSX2. That is deliberate: it means installing this
+next to a normal PCSX2 cannot overwrite that install's configuration. Delete
+portable.ini if you want the usual behaviour.
+
+updater.exe is also deliberately absent. It updates to upstream PCSX2 releases,
+which would overwrite this build with one that has no Remix backend in it.
+
+
+WHAT WORKS, AND WHAT DOES NOT
+-----------------------------
+
+Seen working:
+  Ghost Recon 2 (SLUS-21105)  -- world geometry, albedo textures, generated
+                                 vertex normals, path-traced lighting
+  Rainbow Six 3 (SLUS-20883)  -- the above plus character models
+  SOCOM: Combined Assault (SCUS-97545) -- verified 2026-08-02 and NOT re-verified
+                                 since. Assume it needs a fresh measurement.
+
+Fixed since the first preview build:
+
+  - THE FLAT-ALBEDO DEFECT WAS AN ENUM BUG, not texture binding. D3D9 enum values
+    were being written into fields the runtime casts straight to Vulkan enums, so
+    the backend asked for vertex colour and ignored the texture. MODULATE also
+    read as Modulate2x, doubling surface brightness. Affects every title.
+
+  - THE 1-IN-3 "FLICKERING TRIANGLES" was an empty present window, not depth
+    precision. A game rendering below the vsync rate submits zero geometry on
+    every Nth presented window. PCSX2_REMIX_HOLDEMPTY re-presents the previous
+    window; the period-3 signature is gone, offcadence 0 over 14,098 holds.
+    Confirmed on Combined Assault and SOCOM 1.
+
+  - PS2 TEXT IS DRAWN AS SPRITES, and the first classification gate discarded all
+    of it before the UI classifier could see it.
+
+  - USD CAPTURE was broken for every game by a locale bug: PCSX2 sets a grouping
+    locale, the runtime builds prim names with a bare stringstream, and hex hashes
+    came out comma-separated -- invalid USD identifiers. Every capture failed
+    18 ms in. Captures now work.
+
+  - ON RAINBOW SIX 3 THE CAMERA IS READ OUT OF EE MEMORY rather than recovered
+    from VU1, which sidesteps the candidate-set problem entirely for that title.
+    Its shadow pass is dropped, its baked lightmaps are folded in, and the
+    synthetic projection was calibrated against a physical target for the first
+    time (lamp-to-fixture residual 14.0 units at fov 60, 1.4 at fov 70).
+
+Known blockers, in order of how much they will bother you:
+
+  - ONE CAMERA PER FRAME, applied to every draw. The backend picks a single
+    view-projection from the frame's candidates and uses it for the whole frame;
+    per-draw camera association is not built. On Rainbow Six 3 save state 9,
+    99.84% of frames anchor to world space -- but on save state 7, which runs a
+    different VU1 microprogram, three runs measured 35.3%, 48.4% and 68.3%. The
+    rest fall back to view space and geometry welds to the screen.
+
+    Partly superseded on Rainbow Six 3 only, by the EE-memory camera above. Every
+    other title still uses the VU1 recovery path.
+
+  - REPRODUCIBLE DEVICE LOSS (0x60D0DEAD) on some titles. On SOCOM the hang lands
+    within a fraction of a second of the renderer going live. Not tuneable from
+    the outside.
+
+  - VERTEX EXPLOSIONS on some draws -- white shards across the frame.
+    PCSX2_REMIX_POSLIMIT is a blunt mitigation; the decode is not fully solved.
+
+  - Only the titles above have been measured. The four transplanted .conf files
+    have NOT been tested on their own titles. Anything else is untested, which is
+    not the same as broken.
+
+The sibling project, RPCS3 with the same kind of backend, is further along:
+  https://github.com/BRAGme/rpcs3-rtx
+
+
+BUILD PROVENANCE
+----------------
+
+  pcsx2-qtx64.exe built from  BRAGme/pcsx2-rtx-remix  branch remix-backend,
+  commit @GIT_SHORT@. It reports @GIT_REV@ in Help -> About, so you can check.
+
+PCSX2 is GPL-3.0. This is a modified fork; the complete corresponding source is
+the repository linked at the top.
