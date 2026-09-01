@@ -1,8 +1,11 @@
 blank_issues_enabled: true
 contact_links:
-  - name: RTX Remix Showcase (Discord)
+  - name: PCSX2 thread on the RTX Remix Discord
+    url: https://discord.com/channels/1028444667789967381/1535734598317637782
+    about: "Where this fork is discussed. Goes straight to the thread if you are already in the server; if not, use the invite below first."
+  - name: Join the RTX Remix Showcase Discord
     url: https://discord.gg/qdJ58ks3m
-    about: "The community server for RTX Remix modding, where this project gets discussed. Good for questions and quick help; use an issue here for anything that needs to be tracked."
+    about: "The community server for RTX Remix modding. Good for quick questions; open an issue here for anything that needs tracking, because Discord scrolls and issues do not."
   - name: Upstream PCSX2 support
     url: https://forums.pcsx2.net/index.php
     about: "Emulation problems that also happen on stock PCSX2 belong upstream, not here. Test with the Remix renderer OFF first."
