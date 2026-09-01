@@ -79,7 +79,7 @@ what the branch tip was at that moment**. Nothing here is a render of a build th
 ![Ghost Recon 2, outdoor river valley, path traced](docs/Remix/README-assets/pcsx2-gr2-valley.jpg)
 
 *Tom Clancy's Ghost Recon 2 (SLUS-21105). Captured 2026-08-08 08:58; branch tip `b87dc8e8f` --
-41 commits before the current tip, and **not re-verified since**. Textures, vertex normals and
+40 commits before the preview-2 build, and **not re-verified since**. Textures, vertex normals and
 path-traced lighting; the near-black sky is the game's own.*
 
 ![Rainbow Six 3, a squad moving through a lodge interior, path traced](docs/Remix/README-assets/pcsx2-r6-3-squad.jpg)
@@ -123,7 +123,7 @@ screenshot as a record of what the geometry and material path can do, not as a c
 sit down and play it.
 
 Ghost Recon 2 carries the same caveat for a duller reason: nothing has gone wrong with it, but its
-capture is 41 commits old and nobody has booted it since. The blend-enum fix and the sprite-text
+capture is 40 commits behind the preview-2 build and nobody has booted it since. The blend-enum fix and the sprite-text
 gate both landed after that capture and both change what every title submits, so treat its row as
 "was working, unverified against the current build" rather than as a current result. Rainbow Six 3
 is the exception -- its camera, shadow-pass and lightmap work was measured on the current tip.

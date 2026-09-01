@@ -105,7 +105,7 @@ WHAT WORKS, AND WHAT DOES NOT
 Seen working:
   Ghost Recon 2 (SLUS-21105)  -- world geometry, albedo textures, generated
                                  vertex normals, path-traced lighting. NOT
-                                 re-verified since: that capture is 41 commits
+                                 re-verified since: that capture is 40 commits
                                  back and nobody has booted it since. Nothing is
                                  known to be wrong with it, but the blend-enum
                                  fix and the sprite-text gate both landed after

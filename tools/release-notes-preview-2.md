@@ -85,7 +85,7 @@ They're worth reading even if you don't play those games: they record *why* each
 | Rainbow Six 3 | `SLUS-20883` | The above plus character models, EE-memory camera, shadow pass dropped, baked lightmaps folded in |
 | SOCOM: Combined Assault | `SCUS-97545` | **Being worked on, not playable.** See below. |
 
-**On Ghost Recon 2:** nothing is known to be wrong with it, but its capture is 41 commits old and nobody has booted it since. The blend-enum fix and the sprite-text gate both landed after that capture and both change what every title submits, so read that row as "was working, unverified against this build" rather than as a current result. Rainbow Six 3 is the exception -- its camera, shadow-pass and lightmap work was measured on this tip.
+**On Ghost Recon 2:** nothing is known to be wrong with it, but its capture is 40 commits behind this build and nobody has booted it since. The blend-enum fix and the sprite-text gate both landed after that capture and both change what every title submits, so read that row as "was working, unverified against this build" rather than as a current result. Rainbow Six 3 is the exception -- its camera, shadow-pass and lightmap work was measured on this tip.
 
 **On SOCOM specifically:** geometry, textures and characters were verified on 2026-08-02, but that is 83 commits back and it has not been re-measured since. It is actively being worked on rather than parked — 18 of those 83 commits touch this title, including the render-target gate, the sky classifier and the empty-window fix — but the device loss below still ends a session early. Do not download this expecting to play SOCOM.
 
