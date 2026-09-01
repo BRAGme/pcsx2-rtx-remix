@@ -81,6 +81,11 @@ branch, so a fork lands on it automatically. Merging keeps your name as the auth
 
 Either way you are credited, and anything merged ships in the next release.
 
+**To just ask something:** this project gets discussed in the
+[RTX Remix Showcase Discord](https://discord.gg/qdJ58ks3m), the community server for Remix modding
+generally. Good for a quick question. Open an issue here for anything that should be tracked or
+acted on, because Discord scrolls and issues do not.
+
 ---
 
 ## Style, if you are writing prose or comments

@@ -19,6 +19,10 @@ Everything about the base emulator -- compatibility, BIOS requirements, controll
 -- is unchanged and is documented in
 [upstream's README](https://github.com/PCSX2/pcsx2/blob/master/README.md).
 
+Testing a game, or want to send a config for one? [CONTRIBUTING.md](CONTRIBUTING.md) covers it --
+a per-game `.conf` needs no git and no code, and is the single most useful thing to send. The
+project is discussed in the [RTX Remix Showcase Discord](https://discord.gg/qdJ58ks3m).
+
 ---
 
 ## Requirements

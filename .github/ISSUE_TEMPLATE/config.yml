@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: RTX Remix Showcase (Discord)
+    url: https://discord.gg/qdJ58ks3m
+    about: "The community server for RTX Remix modding, where this project gets discussed. Good for questions and quick help; use an issue here for anything that needs to be tracked."
   - name: Upstream PCSX2 support
     url: https://forums.pcsx2.net/index.php
     about: "Emulation problems that also happen on stock PCSX2 belong upstream, not here. Test with the Remix renderer OFF first."
