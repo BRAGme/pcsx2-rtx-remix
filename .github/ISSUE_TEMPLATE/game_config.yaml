@@ -1,0 +1,66 @@
+name: Per-game config
+description: Share a `<serial>.conf` you tuned for a title, so it can ship with the next build
+labels: ["config"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the most useful thing you can send. A config touches no code, cannot break another
+        title, and the release packager picks up `bin/*.conf` automatically.
+
+        You do not need git for this — paste the file below and it gets committed with you credited
+        as co-author. Open a pull request instead if you would rather do it yourself.
+
+        **One rule, and it is the whole thing:** only write down numbers you actually measured on
+        that title. A guess labelled as a measurement is worse than no measurement, because the next
+        person tunes against it and has no way to know. Say "transplanted from X, unmeasured here"
+        when that is what happened — [`bin/SCUS-97275.conf`](https://github.com/BRAGme/pcsx2-rtx-remix/blob/remix-backend/bin/SCUS-97275.conf)
+        is the model for how to do that honestly.
+
+  - type: input
+    id: game
+    attributes:
+      label: Game and serial
+      placeholder: "Ratchet & Clank — SCUS-97199"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: state
+    attributes:
+      label: How well does it run with this config?
+      options:
+        - Renders and is broadly playable
+        - Renders, but with the problems described below
+        - Renders briefly, then crashes or hangs
+        - Barely renders, but this config is better than nothing
+    validations:
+      required: true
+
+  - type: textarea
+    id: conf
+    attributes:
+      label: The config file
+      description: "Paste the whole file, comments and all. The comments explaining *why* a value is what it is are the valuable part — a bare list of knobs helps nobody tune the next title."
+      render: ini
+    validations:
+      required: true
+
+  - type: textarea
+    id: measured
+    attributes:
+      label: What did you actually measure, and what did you copy?
+      description: |
+        Be specific and it will be taken at face value. For example: "MINRT I read off a draw dump on
+        this game — its render target is 256x256 against a 512x448 framebuffer. HOLDEMPTY I copied
+        from the SOCOM config and did not verify."
+    validations:
+      required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: Build and runtime it was tuned on
+      placeholder: "remix-preview-2, dxvk-remix (remix-main+abbae23d)"
+    validations:
+      required: true

@@ -1,0 +1,63 @@
+name: Remix backend bug
+description: Something renders wrong, crashes, or behaves oddly with the RTX Remix renderer
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Check this first:** does it also happen with the Remix renderer turned off
+        (`Settings → Graphics → Renderer` set to anything else)? If it does, it is an upstream
+        PCSX2 issue and they can help you far better than we can.
+
+  - type: input
+    id: game
+    attributes:
+      label: Game and serial
+      description: The serial is in the window title and in the log. Both, please — the serial is what a config file is keyed on.
+      placeholder: "Tom Clancy's Rainbow Six 3 — SLUS-20883"
+    validations:
+      required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: "`Help → About` reports it, e.g. `remix-preview-2`."
+      placeholder: "remix-preview-2"
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Remix runtime
+      description: "Which dxvk-remix build is in your `remix\\` folder. Right-click `d3d9.dll` → Properties → Details → Product name."
+      placeholder: "dxvk-remix (remix-main+abbae23d), or remix-plus-1.5.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you see, and what you expected instead. Screenshots or a short clip help more than a description.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        `logs\emulog.txt` next to the executable. Attach the whole file if you can — the interesting lines are
+        usually not the ones near the error.
+
+        If per-game files are not appearing, the answer is almost always one of three lines in there:
+        `no disc serial at runtime init`, `per-game files disabled`, or `per-game files for '<SERIAL>'`.
+      render: shell
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Anything non-default
+      description: "Knobs you changed, a `<serial>.conf` you wrote, `PCSX2_REMIX_*` environment variables, or edits to `rtx.conf` / `user.conf`. An environment variable beats both the GUI and the config file, so it matters."

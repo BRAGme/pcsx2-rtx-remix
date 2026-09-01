@@ -1,11 +1,8 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
-  - name: Support Forums
+  - name: Upstream PCSX2 support
     url: https://forums.pcsx2.net/index.php
-    about: For community support and answers
-  - name: Discord
-    url: https://discord.com/invite/TCz3t9k
-    about: Get direct support and hang out with us
-  - name: Wiki
-    url: https://wiki.pcsx2.net/Main_Page
-    about: For user provided information and reports
+    about: "Emulation problems that also happen on stock PCSX2 belong upstream, not here. Test with the Remix renderer OFF first."
+  - name: How to build this fork
+    url: https://github.com/BRAGme/pcsx2-rtx-remix#building
+    about: "A fresh clone fails on every third-party library at once until you supply deps/. This explains it."
