@@ -145,12 +145,22 @@ Landed since that table was written, each measured on the title named:
 
 ### Known blockers
 
-**One camera per frame, applied to every draw.** The backend picks a single view-projection and
-uses it for the whole frame. Per-draw camera association is not built. It is measurable: on
+**One camera per frame, applied to every draw -- by default.** The backend picks a single
+view-projection and uses it for the whole frame. Per-draw placement IS built (`PCSX2_REMIX_PERDRAWCAM`,
+step 4A) and the knob is live, so it can be turned on mid-run by adding one `.conf` line -- it ships
+off deliberately, measurement before behaviour, not because it is missing. It is measurable: on
 Rainbow Six 3 save state 9 the frames that anchor to world space run at 99.84%, but on save state 7
 -- which runs a *different* VU1 microprogram emitting roughly 20,000 distinct candidate matrices in
 30 s -- three 30 s runs measured 35.3%, 48.4% and 68.3% (`9c271c790`). The rest fall back to view
 space.
+
+What a wrong camera looks like is worth stating precisely, because it is not what it sounds like.
+Un-projection inverts a view-projection, so applying the wrong inverse is a PROJECTIVE error, not a
+rigid one: near vertices barely move, far vertices swing hard, and a triangle spanning depth becomes
+a spike. The damage therefore stays inside scene scale rather than flinging geometry to infinity
+(extent-reject reads 0 in every stats block). On SOCOM CA specifically, per-draw placement would not
+help at all -- `sol = 1` on all 114 non-empty windows measured, i.e. one camera per window is already
+correct there.
 
 *Partly superseded for one title.* On Rainbow Six 3 the camera is no longer recovered from VU1 at
 all -- it is read directly out of EE memory (`dc6a1934b`, `02e549e70`), which sidesteps the

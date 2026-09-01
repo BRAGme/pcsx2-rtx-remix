@@ -14,7 +14,7 @@
 ⚠️ Issues:
 • SOCOM: Combined Assault is not playable, device loss still ends the session early
 • Ghost Recon 2 hasn't been re-checked in 40 commits, so treat its screenshot as old
-• One camera per frame, so on some titles geometry welds to the screen
+• One camera per frame by default, which shatters geometry that spans depth — per-draw placement is built and live-tunable, it just ships off
 • Geometry can still land in the wrong place on an untested title — the render-target gate that fixes it (MINRT) is off by default and set per game
-• Only three titles have been measured *at all* — anything else is untested, not broken
+• Only three titles have been verified as rendering — anything else is untested, not broken
 • Needs a Remix Plus / extended-API-line runtime (stock Remix won't connect) plus your own BIOS
