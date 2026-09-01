@@ -116,3 +116,10 @@ There are no git submodules. `.gitmodules` is empty and upstream moved every ven
 ---
 
 PCSX2 is GPL-3.0. This is a modified fork; the complete corresponding source is this repository.
+
+---
+
+`pcsx2-rtx-remix-e89ed7295-win64.zip`
+SHA256 `5b8ab5a985b98b2d7c67d87ba831ca667b1b021483ab9fee2795a596d13418ba`
+
+Built from `remix-backend` commit `e89ed7295`, tagged `remix-preview-2`. Reports `remix-preview-2` in Help -> About, so you can check.
