@@ -1,20 +1,20 @@
-**PCSX2 RTX Remix — preview 2 is up**
+**PCSX2 RTX Remix — preview 2**
 <https://github.com/BRAGme/pcsx2-rtx-remix/releases/tag/remix-preview-2>
 
-Three weeks on from preview 1. The headline: **the flat, untextured look was an enum bug, not texture binding.** D3D9 enum values were landing in fields the runtime casts straight to Vulkan enums — `textureColorArg1Source = 2` meant "use the texture" to us and "vertex colour" to Remix, so the backend ignored textures entirely. `MODULATE` also read as `Modulate2x`, doubling brightness.
+✅ Fixed:
+• Textures were being ignored entirely — a D3D9/Vulkan enum mismatch had the backend asking for vertex colour instead, which is the flat untextured look
+• The flickering "z-fighting" triangles were an empty present window, not depth precision
+• PS2 text is drawn as sprites and the classifier was throwing all of it away
+• USD capture never worked for anyone — a locale bug was making Remix's prim names invalid
+• Rainbow Six 3's camera now comes straight from EE memory, its shadow pass is dropped and its baked lightmaps are folded in
+• Sky is classified by depth instead of draw order
+• Six per-game configs, up from two
+• Building from source works — a fresh clone used to fail on every third-party lib at once
 
-**Also fixed**
-- **Flickering / "z-fighting" triangles** — not depth precision. A game running below the vsync rate submits zero geometry on every Nth present, and that empty frame got presented. Now held as a true duplicate.
-- **PS2 text was invisible** — it's drawn as sprites, and the first classifier gate discarded all of it.
-- **USD capture never worked, for anyone** — PCSX2 sets a grouping locale, so Remix's hex prim names came out comma-separated, which is invalid USD. Every capture died 18 ms in.
-- **Rainbow Six 3** — camera read straight from EE memory, shadow pass dropped (those duplicate bodies drifting through walls), baked lightmaps folded in, and FOV finally calibrated: lamp-to-fixture error 14.0 → **1.4 units**.
-- Sky classified by depth, not draw order; render-to-texture passes no longer submitted as world geometry.
-- **Six per-game configs**, up from two.
-- **Building it works now** — a fresh clone used to fail on every third-party lib at once. README points at the prebuilt deps.
-
-**Straight about the state** — still a research build; nothing is playable start to finish.
-- **SOCOM: Combined Assault is not playable** — device loss still ends a session early. Actively worked on, not parked.
-- **Ghost Recon 2's screenshot is 40 commits behind this build** and hasn't been re-checked.
-- **Rainbow Six 3** is the one title measured against this actual build.
-
-Needs a Remix Plus / extended-API-line runtime (stock Remix won't connect) plus your own BIOS.
+⚠️ Issues:
+• SOCOM: Combined Assault is not playable, device loss still ends the session early
+• Ghost Recon 2 hasn't been re-checked in 40 commits, so treat its screenshot as old
+• One camera per frame, so on some titles geometry welds to the screen
+• Vertex explosions on some draws show up as white shards
+• Only three titles have been measured *at all* — anything else is untested, not broken
+• Needs a Remix Plus / extended-API-line runtime (stock Remix won't connect) plus your own BIOS
