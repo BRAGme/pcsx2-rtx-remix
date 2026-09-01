@@ -3,11 +3,11 @@
 
 ✅ Fixed:
 • Surfaces looked flat and washed out because the texture stage was misconfigured — a D3D9-vs-Remix enum mismatch had colour coming from vertex colour at double brightness
-• The flickering "z-fighting" triangles were an empty present window, not depth precision
+• The flickering "z-fighting" triangles were an empty present window, not depth precision — active on the SOCOM/GoW profiles, which set the BATCH mode it rides on
 • PS2 text is drawn as sprites and the classifier was throwing all of it away
-• USD capture never worked for anyone — a locale bug was making Remix's prim names invalid
-• Rainbow Six 3's camera now comes straight from EE memory, its shadow pass is dropped and its baked lightmaps are folded in
-• Sky is classified by depth instead of draw order
+• USD capture was broken on any system with digit grouping — a locale bug made Remix's hex prim names comma-separated, which is invalid USD
+• Rainbow Six 3 gets an EE-memory camera, its shadow pass dropped and a calibrated FOV — **the code is in preview 2 but its config was not, so this only lands in the next build**
+• Sky is classified by depth instead of draw order, on the two SOCOM profiles that set the threshold
 • Six per-game configs, up from two
 • Building from source works — a fresh clone used to fail on every third-party lib at once
 
