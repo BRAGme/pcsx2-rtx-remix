@@ -2,7 +2,7 @@
 <https://github.com/BRAGme/pcsx2-rtx-remix/releases/tag/remix-preview-2>
 
 ✅ Fixed:
-• Textures were being ignored entirely — a D3D9/Vulkan enum mismatch had the backend asking for vertex colour instead, which is the flat untextured look
+• Surfaces looked flat and washed out because the texture stage was misconfigured — a D3D9-vs-Remix enum mismatch had colour coming from vertex colour at double brightness
 • The flickering "z-fighting" triangles were an empty present window, not depth precision
 • PS2 text is drawn as sprites and the classifier was throwing all of it away
 • USD capture never worked for anyone — a locale bug was making Remix's prim names invalid
