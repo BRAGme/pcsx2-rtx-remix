@@ -23,7 +23,7 @@ Testing a game, or want to send a config for one? [CONTRIBUTING.md](CONTRIBUTING
 a per-game `.conf` needs no git and no code, and is the single most useful thing to send. The
 project is discussed in the
 [PCSX2 thread](https://discord.com/channels/1028444667789967381/1535734598317637782) on the RTX Remix
-Showcase Discord -- [join here](https://discord.gg/qdJ58ks3m) first if that link does not open for you.
+Showcase Discord -- [join here](https://discord.gg/j6sh7JD3v9) first if that link does not open for you.
 
 ---
 

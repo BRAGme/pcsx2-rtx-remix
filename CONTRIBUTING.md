@@ -84,7 +84,7 @@ Either way you are credited, and anything merged ships in the next release.
 **To just ask something:** this fork has a
 [PCSX2 thread](https://discord.com/channels/1028444667789967381/1535734598317637782) on the RTX
 Remix Showcase Discord, the community server for Remix modding generally. That link only opens if
-you are already in the server -- [join here](https://discord.gg/qdJ58ks3m) if not.
+you are already in the server -- [join here](https://discord.gg/j6sh7JD3v9) if not.
 
 Good for a quick question. Open an issue here for anything that should be tracked or acted on,
 because Discord scrolls and issues do not.
