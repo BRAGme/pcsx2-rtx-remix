@@ -101,7 +101,7 @@ Partly superseded on Rainbow Six 3 only, by the EE-memory camera above. Every ot
 
 **Reproducible device loss (`0x60D0DEAD`) on some titles.** On SOCOM the hang lands within a fraction of a second of the renderer going live, and loading heavy mission geometry is what triggers it. Not tuneable from the outside — four different entry strategies were measured and the ceiling is the crash, not the navigation.
 
-**Vertex explosions on some draws** — white shards across the frame. `PCSX2_REMIX_POSLIMIT` is a blunt mitigation; the decode is not fully solved.
+**Misplaced geometry on untested titles.** The two known instances were root-caused and fixed, not mitigated. SOCOM's geometry scatter was a 128x128 render-to-texture pass submitted as world geometry; `PCSX2_REMIX_MINRT` rejects those and took maxpos from 151,966 to 14,613 — but **it defaults to 0 and is set per game**, so a title without a shipped `.conf` can still show it. The white shards were a separate fault (blended draws reaching Remix as opaque against a 4x4 white untextured material, 210 of 1,874 draws on SOCOM Winterblade) and `ALPHASTATE` now defaults to 2, so that one is fixed everywhere. "Vertex explosions" was measured and rejected as the explanation for either: `PCSX2_REMIX_EXPLODEK` peaked at 3.7x against a 32x limit while the screen was visibly in pieces.
 
 **Only the titles above have been measured.** The four transplanted `.conf` files have not been tested on their own titles. Anything else is untested, which is not the same as broken.
 

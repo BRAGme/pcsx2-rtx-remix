@@ -167,9 +167,23 @@ triggers it. This is not tuneable from the harness side -- four different entry 
 measured and the ceiling is the crash, not the navigation. The measurements are written up in
 [`tools/remix-harness/README.md`](tools/remix-harness/README.md).
 
-**Vertex explosions on some draws.** Geometry occasionally lands at runaway positions and reads as
-white shards across the frame. `PCSX2_REMIX_POSLIMIT` drops vertices past a distance threshold as a
-blunt mitigation; the underlying decode is not fully solved.
+**Misplaced geometry on untested titles.** Two instances of this were root-caused and fixed rather
+than mitigated, and both fixes are worth knowing about because only one of them is on by default:
+
+- SOCOM's *geometry scatter* was a 128x128 render-to-texture pass being submitted as world
+  geometry. `PCSX2_REMIX_MINRT` rejects small off-screen targets and took maxpos from 151,966 to
+  14,613 (`d507b3f50`). **It defaults to 0 and is set per game**, so a title without a `.conf` can
+  still show this.
+- The *white shards* were a different fault: at `ALPHASTATE = 0` every blended draw reached Remix
+  as opaque, and the shared untextured material is a 4x4 WHITE albedo, so blended untextured draws
+  composited as solid white -- 210 of 1,874 draws on SOCOM Winterblade (`5accbf48f`). `ALPHASTATE`
+  now defaults to 2, so this one is fixed everywhere.
+
+Note that "vertex explosions" was measured and **rejected** as the explanation for either.
+`PCSX2_REMIX_EXPLODEK` exists to answer exactly that question and peaked at 3.7x against a 32x
+limit while the screen was visibly in pieces: a draw can be perfectly compact and still be placed
+100,000 units from where it belongs. `PCSX2_REMIX_POSLIMIT` remains as a blunt distance cut, but it
+is not the fix for anything currently known.
 
 **A binary build is available** -- see [Releases](https://github.com/BRAGme/pcsx2-rtx-remix/releases).
 Everything above is still true of it: it is a research build, not a finished one. It does not include
