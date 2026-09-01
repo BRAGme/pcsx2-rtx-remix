@@ -78,8 +78,9 @@ what the branch tip was at that moment**. Nothing here is a render of a build th
 
 ![Ghost Recon 2, outdoor river valley, path traced](docs/Remix/README-assets/pcsx2-gr2-valley.jpg)
 
-*Tom Clancy's Ghost Recon 2 (SLUS-21105). Captured 2026-08-08 08:58; branch tip `b87dc8e8f`.
-Textures, vertex normals and path-traced lighting; the near-black sky is the game's own.*
+*Tom Clancy's Ghost Recon 2 (SLUS-21105). Captured 2026-08-08 08:58; branch tip `b87dc8e8f` --
+41 commits before the current tip, and **not re-verified since**. Textures, vertex normals and
+path-traced lighting; the near-black sky is the game's own.*
 
 ![Rainbow Six 3, a squad moving through a lodge interior, path traced](docs/Remix/README-assets/pcsx2-r6-3-squad.jpg)
 
@@ -108,7 +109,7 @@ Read this before building anything. The backend renders, and it is not finished.
 
 | Title | Serial | What was verified | When, and on what |
 |---|---|---|---|
-| Tom Clancy's Ghost Recon 2 | `SLUS-21105` | World geometry, albedo textures, generated vertex normals, path-traced lighting | Capture 2026-08-08 08:58, branch tip `b87dc8e8f` |
+| Tom Clancy's Ghost Recon 2 | `SLUS-21105` | World geometry, albedo textures, generated vertex normals, path-traced lighting | Capture 2026-08-08 08:58, branch tip `b87dc8e8f` -- **not re-verified since** |
 | Tom Clancy's Rainbow Six 3 | `SLUS-20883` | World geometry, albedo textures, characters, path-traced lighting | Capture 2026-08-08 08:24, branch tip `37a25ae09` |
 | SOCOM: U.S. Navy SEALs -- Combined Assault | `SCUS-97545` | World geometry, albedo textures, characters, path-traced lighting -- **still being worked on, not playable** | Capture 2026-08-02 23:11, tip `a311a7c5d` -- **not re-verified since** |
 
@@ -119,8 +120,15 @@ SOCOM expensive to get into a mission at all, so it has not had a clean re-measu
 being actively worked on rather than parked -- 18 of the 83 commits since that capture touch it,
 including the render-target gate, the sky classifier and the empty-window fix -- but treat the
 screenshot as a record of what the geometry and material path can do, not as a claim that you can
-sit down and play it. No other title has been measured; absence from this table means untested,
-not broken.
+sit down and play it.
+
+Ghost Recon 2 carries the same caveat for a duller reason: nothing has gone wrong with it, but its
+capture is 41 commits old and nobody has booted it since. The blend-enum fix and the sprite-text
+gate both landed after that capture and both change what every title submits, so treat its row as
+"was working, unverified against the current build" rather than as a current result. Rainbow Six 3
+is the exception -- its camera, shadow-pass and lightmap work was measured on the current tip.
+
+No other title has been measured; absence from this table means untested, not broken.
 
 Landed since that table was written, each measured on the title named:
 

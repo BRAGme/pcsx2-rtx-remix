@@ -104,7 +104,12 @@ WHAT WORKS, AND WHAT DOES NOT
 
 Seen working:
   Ghost Recon 2 (SLUS-21105)  -- world geometry, albedo textures, generated
-                                 vertex normals, path-traced lighting
+                                 vertex normals, path-traced lighting. NOT
+                                 re-verified since: that capture is 41 commits
+                                 back and nobody has booted it since. Nothing is
+                                 known to be wrong with it, but the blend-enum
+                                 fix and the sprite-text gate both landed after
+                                 it and both change what every title submits.
   Rainbow Six 3 (SLUS-20883)  -- the above plus character models
   SOCOM: Combined Assault (SCUS-97545) -- NOT playable yet. Geometry, textures and
                                  characters were verified 2026-08-02, but that is 83
