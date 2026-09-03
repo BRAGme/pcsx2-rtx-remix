@@ -3978,6 +3978,48 @@ namespace RemixSubmit
 		int s_camyflip_sign_active = remix_ps2::sign_policy_shipped;
 		int s_camyflip_logged_mode = -1;
 
+		// PCSX2_REMIX_CAMYDOWN -- prefer the hypotheses that read the guest's clip y as pointing
+		// DOWN the screen (gs, px, ndcY, auto, r6: every table entry with scale_y < 0) over the two
+		// that read it as up (ndc, autoY).
+		//
+		// MEASURED with the remix-homebrew test scene (remix-homebrew/README.md, 2026-09-03), which
+		// publishes its camera, matrices and geometry in EE RAM every frame so the recovered world
+		// can be checked against numbers instead of against a game. For a VU1 matrix that folds the
+		// GS y-flip -- clip y down the screen, the form a retail title carries -- the shipped
+		// election takes `ndc` over `ndcY` by exactly the 0.5 handedness dock, and the recovered
+		// world is the true world REFLECTED through the plane through the eye whose normal is the
+		// camera's up vector: a landmark quad at (40, 10, -300) with normal +Z came back at
+		// (40.2, -113.4, -277.5) with normal (0, 0.352, 0.936), which is that reflection's
+		// prediction to the decimal (0.352 = sin 2*pitch). The same scene emitting a y-up matrix
+		// elected `ndcY` unaided and read (40.2, 10.2, -300.0), normal (0, 0, 1.000). The picture
+		// cannot show the difference -- the published camera mirrors with the world -- but every
+		// world-space light, shadow and derived normal is computed in the mirror, which is the
+		// SOCOM MOONFIT "elevation right, azimuth 180 off" symptom.
+		//
+		//   0 = the shipped election.
+		//   1 = DEFAULT. +1.0 to every hypothesis with scale_y < 0. Larger than the 0.5 dock it
+		//       has to overcome, smaller than the 10/100 source bonuses, so it only ever reorders
+		//       one matrix's own readings and never promotes a weaker candidate. Needs proper
+		//       testing on retail titles: a title whose microcode negates y in its post-divide
+		//       scale (a genuinely y-up clip matrix) would want 0 in its per-game .conf.
+		//
+		// Read LIVE once per camera resolve, like CAMYFLIP; the per-draw solver reads the latched
+		// s_camydown_active and never the environment. (AI-assisted.)
+		int s_camydown_active = 1;
+		int s_camydown_logged_mode = -1;
+
+		int camydown_mode()
+		{
+			return std::clamp(env_int_live(L"PCSX2_REMIX_CAMYDOWN", 1), 0, 1);
+		}
+
+		// Applied at both scoring sites -- the frame election and the per-draw solver -- so they
+		// rank a matrix's readings identically.
+		float camydown_bonus(const camera_hypothesis& hyp)
+		{
+			return (s_camydown_active > 0 && hyp.scale_y < 0.f) ? 1.f : 0.f;
+		}
+
 		// PCSX2_REMIX_CAMSCALE, cached the same way and for a second reason.
 		//
 		// It was `static const float value = env_float(...)`, i.e. LATCHED AT FIRST USE -- and the
@@ -6370,6 +6412,21 @@ namespace RemixSubmit
 
 				s_camyflip_active = yflip_mode;
 				s_camyflip_sign_active = camyflip_sign_policy(yflip_mode);
+
+				const int ydown_mode = camydown_mode();
+				if (s_camydown_logged_mode != ydown_mode)
+				{
+					s_camydown_logged_mode = ydown_mode;
+					INFO_LOG("Remix: PCSX2_REMIX_CAMYDOWN = {} ({}). Every hypothesis with scale_y < 0 "
+							 "(gs, px, ndcY, auto, r6 -- the readings under which the guest's clip y points "
+							 "down the screen) {} +1.0 in the election and the per-draw solver. Measured on "
+							 "the remix-homebrew scene: the shipped election takes ndc over ndcY by the 0.5 "
+							 "handedness dock and recovers the world reflected through the camera's "
+							 "horizontal plane.",
+						ydown_mode, (ydown_mode > 0) ? "on: prefer clip-y-down readings" : "off: shipped election",
+						(ydown_mode > 0) ? "receives" : "would receive");
+				}
+				s_camydown_active = ydown_mode;
 			}
 
 			RemixVU1Capture::Frame frame{};
@@ -6537,6 +6594,7 @@ namespace RemixSubmit
 
 						float score = remix_ps2::score_perspective(split.projection, reference_aspect,
 							s_camyflip_sign_active);
+						score += camydown_bonus(hyp); // PCSX2_REMIX_CAMYDOWN, see camydown_mode()
 						if (dump)
 							fmt::format_to(std::back_inserter(detail), " {}/{}={:.2f}", hyp.name, major ? 'C' : 'R', score);
 
@@ -7424,7 +7482,7 @@ namespace RemixSubmit
 					// a per-draw camera scored under a different sign policy than the frame camera
 					// can prefer a different hypothesis and place its draws in a different world.
 					const float score = remix_ps2::score_perspective(split.projection, reference_aspect,
-						s_camyflip_sign_active);
+						s_camyflip_sign_active) + camydown_bonus(hyp); // same bonus as the frame election
 					if (!(score > 0.f))
 						continue;
 
