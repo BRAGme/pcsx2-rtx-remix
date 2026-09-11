@@ -37,16 +37,19 @@
 //                   this re-vendor -- only the runtime moved. The byte count and SHA-256 the
 //                   old text of this block carried, 54643 and 25296449...AE0, did NOT describe
 //                   blob 3f4acf5f and never matched the file on disk; corrected here.)
-//   Runtime asset : LOCAL release build of that commit, worktree GitHub\dxvk-remix-remixplus,
-//                   _Comp64Release. NOT a CI artifact -- rebuild it there, do not go looking
-//                   for a GitHub Actions run. Deployed to <AppRoot>\remix\, which
-//                   RemixPaths.cpp resolves to the INSTALL root, not this source tree --
-//                   bin\remix\ here is a decoy that is never the DLL a play session loads.
-//                   d3d9.dll is 241755136 bytes,
-//                   SHA-256 CB2C0AE1063FD120FEF71BD3A18C343CF7FF0FDD6906A3DEE278FFE7AEC6FE63,
-//                   and log_dll_identity prints "size=241755136 fnv1a=6c0d467421fbd23a".
-//                   This build is 17 commits ahead of the 9303c633 CI build that briefly sat
-//                   here; remix_c.h is byte-identical across that span, so nothing re-vendored.
+//   Runtime asset : GitHub Actions run 34609858028 of that commit (BRAGme/dxvk-remix),
+//                   artifact rtx-remix-for-x64-games-1-9cc8f3e-release. Deployed to
+//                   <AppRoot>\remix\, which RemixPaths.cpp resolves to the INSTALL root,
+//                   not this source tree -- bin\remix\ here is a decoy that is never the
+//                   DLL a play session loads.
+//                   d3d9.dll is 241757184 bytes,
+//                   SHA-256 B555A5C39B8CD6296793F84822EDF475A24080C49F81C081AD147EF81483EBD6,
+//                   and log_dll_identity prints "size=241757184 fnv1a=f877f25d65a74ca1".
+//                   NOTE: a local _Comp64Release build of THIS SAME COMMIT is a DIFFERENT
+//                   binary -- 241755136 bytes, SHA-256 CB2C0AE1...FE63 -- and reports the
+//                   identical ProductName. ProductName identifies the COMMIT, not the
+//                   BINARY; only the hash tells the two apart. Reproduce this one with
+//                   `gh workflow run build.yml --repo BRAGme/dxvk-remix --ref fresnel-grazing-f90`.
 //
 // ABI CHANGE carried by this re-vendor: remixapi_StartupInfo grew a trailing
 // 'combineGuiInFinalColor' field, taking sizeof() from 36 to 40. remixapi_Startup() forwards
