@@ -19,20 +19,38 @@
 
 // ---------------------------------------------------------------------------------------------
 // Runtime provenance. The vendored header and the deployed runtime MUST come from the same
-// release tag, always in the same commit -- the API's version gate only compares the minor
+// source commit, always in the same commit -- the API's version gate only compares the minor
 // number, so two builds of the same minor with a different interface layout would pass the
 // check and then misroute every slot after the first divergence.
 //
-//   Fork          : RemixProjGroup/dxvk-remix ("Remix Plus", maintainer Kim2091)
-//   Release tag   : remix-plus-1.5.1        (tag object f4173a9c8b94736363cb27c3bd228059780acbcf)
-//   Tagged commit : 8afa36fdecc60e8d3ec57b360e5fd14158b39aea
+//   Fork          : Kim2091/dxvk-remix ("Remix Plus", maintainer Kim2091)
+//   Source commit : 9303c633eced41d7d903c485d3d35c01d3a9df5a, branch revised-9-10
 //   API version   : 0.1000.0
-//   remix_c.h     : blob 3f4acf5f476bf96d71bdd09354ef0602b0a8e239, 54643 bytes
-//                   SHA-256 25296449789A483745E65E8A0110AACF134EA77E3AB608991DAA12A0FC9E7AE0
-//                   (byte-identical to public/include/remix/remix_c.h at that tag)
-//   Runtime asset : Remix_Plus_v1.5.1_x64_games_release.zip, deployed to <exe dir>\remix\
+//   remix_c.h     : blob 3f4acf5f476bf96d71bdd09354ef0602b0a8e239, 55895 bytes
+//                   SHA-256 15DC98AACEF5398A5E653B99E0AF0978C8E48183DB47839755B907E5710BB064
+//                   (byte-identical to public/include/remix/remix_c.h at that commit, and to
+//                   the copy RPCS3's backend vendors. This header did not change between
+//                   remix-plus-1.5.1 and revised-9-10, so the vendored bytes are untouched by
+//                   this re-vendor -- only the runtime moved. The byte count and SHA-256 the
+//                   old text of this block carried, 54643 and 25296449...AE0, did NOT describe
+//                   blob 3f4acf5f and never matched the file on disk; corrected here.)
+//   Runtime asset : GitHub Actions run 34558891381 of that commit, artifact
+//                   rtx-remix-for-x64-games-17-9303c63-release. Deployed to <AppRoot>\remix\,
+//                   which RemixPaths.cpp resolves to the INSTALL root, not this source tree --
+//                   bin\remix\ here is a decoy that is never the DLL a play session loads.
+//                   d3d9.dll is 241412096 bytes,
+//                   SHA-256 4499878918D884ADD2F0600A144821E8DB3D375F93459CC07702E64972AB0D39,
+//                   and log_dll_identity prints "size=241412096 fnv1a=4f9a11fbc016e3f8".
 //
-// Never update bin\remix\ without re-vendoring remix_c.h in the same commit.
+// ABI CHANGE carried by this re-vendor: remixapi_StartupInfo grew a trailing
+// 'combineGuiInFinalColor' field, taking sizeof() from 36 to 40. remixapi_Startup() forwards
+// the caller's struct to remixapi_dxvk_CreateD3D9(), which reads that field into
+// dxvk::g_combineGuiInFinalColor; that global gates whether the Remix ImGui overlay is
+// composited into the final colour buffer in D3D9SwapchainExternal::Present(). The vendored
+// header already carried the field, but value-initialising the struct leaves it false, which
+// silently costs the dev menu -- initialize() now sets it explicitly.
+//
+// Never update <AppRoot>\remix\ without re-vendoring remix_c.h in the same commit.
 // ---------------------------------------------------------------------------------------------
 
 namespace remix_ps2
@@ -187,6 +205,10 @@ namespace remix_ps2
 		startup_info.disableSrgbConversionForOutput = 0;
 		startup_info.forceNoVkSwapchain = 0;
 		startup_info.editorModeEnabled = 0;
+		// Must be set explicitly: the runtime reads this to decide whether to composite its own
+		// ImGui overlay into the final colour buffer, and zero-init would turn the dev menu off.
+		// See the ABI note in the provenance block at the top of this file.
+		startup_info.combineGuiInFinalColor = 1;
 
 		if (!m_storage.api.Startup)
 		{
