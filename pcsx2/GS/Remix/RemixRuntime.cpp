@@ -24,7 +24,10 @@
 // check and then misroute every slot after the first divergence.
 //
 //   Fork          : Kim2091/dxvk-remix ("Remix Plus", maintainer Kim2091)
-//   Source commit : 9303c633eced41d7d903c485d3d35c01d3a9df5a, branch revised-9-10
+//   Source commit : 9cc8f3e52ecc075c60f6ea5deed1ac8434b2fb90, branch fresnel-grazing-f90
+//                   (BRAGme/dxvk-remix) = Kim2091/dxvk-remix `revised-9-10` tip 52755122a with
+//                   one commit cherry-picked on top: the f90 / specular-level patch that kills
+//                   the white grazing sheen on legacy materials. Pushed for Kim to pick up.
 //   API version   : 0.1000.0
 //   remix_c.h     : blob 3f4acf5f476bf96d71bdd09354ef0602b0a8e239, 55895 bytes
 //                   SHA-256 15DC98AACEF5398A5E653B99E0AF0978C8E48183DB47839755B907E5710BB064
@@ -34,13 +37,16 @@
 //                   this re-vendor -- only the runtime moved. The byte count and SHA-256 the
 //                   old text of this block carried, 54643 and 25296449...AE0, did NOT describe
 //                   blob 3f4acf5f and never matched the file on disk; corrected here.)
-//   Runtime asset : GitHub Actions run 34558891381 of that commit, artifact
-//                   rtx-remix-for-x64-games-17-9303c63-release. Deployed to <AppRoot>\remix\,
-//                   which RemixPaths.cpp resolves to the INSTALL root, not this source tree --
+//   Runtime asset : LOCAL release build of that commit, worktree GitHub\dxvk-remix-remixplus,
+//                   _Comp64Release. NOT a CI artifact -- rebuild it there, do not go looking
+//                   for a GitHub Actions run. Deployed to <AppRoot>\remix\, which
+//                   RemixPaths.cpp resolves to the INSTALL root, not this source tree --
 //                   bin\remix\ here is a decoy that is never the DLL a play session loads.
-//                   d3d9.dll is 241412096 bytes,
-//                   SHA-256 4499878918D884ADD2F0600A144821E8DB3D375F93459CC07702E64972AB0D39,
-//                   and log_dll_identity prints "size=241412096 fnv1a=4f9a11fbc016e3f8".
+//                   d3d9.dll is 241755136 bytes,
+//                   SHA-256 CB2C0AE1063FD120FEF71BD3A18C343CF7FF0FDD6906A3DEE278FFE7AEC6FE63,
+//                   and log_dll_identity prints "size=241755136 fnv1a=6c0d467421fbd23a".
+//                   This build is 17 commits ahead of the 9303c633 CI build that briefly sat
+//                   here; remix_c.h is byte-identical across that span, so nothing re-vendored.
 //
 // ABI CHANGE carried by this re-vendor: remixapi_StartupInfo grew a trailing
 // 'combineGuiInFinalColor' field, taking sizeof() from 36 to 40. remixapi_Startup() forwards
