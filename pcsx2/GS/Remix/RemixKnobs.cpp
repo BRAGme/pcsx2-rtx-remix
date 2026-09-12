@@ -207,6 +207,14 @@ namespace remix_ps2
 				"Recovers depth for draws that use FST texture coordinates.", false},
 			{"FSTFLAT", "Geometry and Filtering", "Accept flat-Z FST draws", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr, "Allows FST recovery on draws whose Z barely varies.", false},
+			{"SPRITE3D", "Geometry and Filtering", "Sprites are geometry", knob_type::Boolean, 0, 0, 1, 1,
+				nullptr,
+				"Expands each GS sprite into a quad and submits it as geometry the path tracer can "
+				"light, instead of discarding it. The PS2 draws 2D screens -- menus, the BIOS -- almost "
+				"entirely as sprites, so without this such a screen submits nothing and Remix keeps "
+				"re-presenting the last frame it was given. Turn it off for a game whose HUD should "
+				"stay a flat overlay.",
+				false},
 
 			// ------------------------------------------------------------------ Mesh Identity
 			{"STABLEID", "Mesh Identity", "Stable mesh identity", knob_type::Boolean, 0, 0, 1, 1, nullptr,

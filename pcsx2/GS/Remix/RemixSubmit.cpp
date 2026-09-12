@@ -782,6 +782,7 @@ namespace RemixSubmit
 		u64 s_overlay_texels = 0;     // texels actually written
 		u64 s_overlay_presents = 0;   // frames handed to DrawScreenOverlay
 		u64 s_overlay_fullscreen = 0; // sprites refused as full-target blits, not UI
+		u64 s_sprite_geometry_draws = 0; // sprite draws submitted as geometry under SPRITE3D
 		u64 s_screen_ui_seen = 0;     // draws classified as screen UI
 		u64 s_screen_ui_nomat = 0;    // ... dropped: no material bound
 		u64 s_screen_ui_nondc = 0;    // ... dropped: no NDC captured
@@ -795,6 +796,25 @@ namespace RemixSubmit
 		int ui_raster_mode()
 		{
 			static live_int value(L"PCSX2_REMIX_UIRASTER", 0, 0, 1);
+			return value.get();
+		}
+
+		// PCSX2_REMIX_SPRITE3D -- submit sprite-class draws as GEOMETRY, not as a 2D overlay.
+		//
+		// The overlay above composites a CPU bitmap over the final image, so nothing it draws is
+		// ever path traced. For a screen that is ENTIRELY sprites that is not a HUD, it is the
+		// whole picture: measured on the PS2 BIOS (serial 20080220-175343), once OSDSYS reaches
+		// the main menu the guest issues ~66 draws per frame of which 64 are GS_SPRITE_CLASS.
+		// The primclass gate refused all 64, one draw per frame survived, and Remix re-presented
+		// a single stale surface -- the frozen frame.
+		//
+		//   0 = off: sprites are overlay candidates only (shipped behaviour)
+		//   1 = expand each sprite into a quad and run it through the normal geometry path
+		//
+		// Takes precedence over the overlay for sprite draws, so it does not need UIRASTER off.
+		int sprite_geometry_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_SPRITE3D", 0, 0, 1);
 			return value.get();
 		}
 
@@ -9711,13 +9731,17 @@ namespace RemixSubmit
 			bool is_cutout = false;
 		};
 
+		// deny_sky is the sprite path's veto. classify_sky is evaluated twice per draw -- once in
+		// OnDrawPrims to choose the solver, once here to set the instance category -- and the two
+		// have to agree, so the exclusion has to be passed in rather than applied at one site.
 		draw_state build_draw_state(const draw_regs& regs, u64 material_hash, u64 draw_ordinal,
-			bool untextured, bool force_sky)
+			bool untextured, bool force_sky, bool deny_sky)
 		{
 			const bool depth_read = regs.depth_read;
 			const bool depth_write = regs.depth_write;
-			const bool is_sky = force_sky || classify_sky(depth_read, depth_write, draw_ordinal,
-				regs.samples_target, regs.min_w);
+			const bool is_sky = !deny_sky &&
+				(force_sky || classify_sky(depth_read, depth_write, draw_ordinal,
+					regs.samples_target, regs.min_w));
 
 			// The user's own tags, from the Remix conf layers. dxvk-remix only applies its hash
 			// lists on the native D3D9 path (setupCategoriesForTexture, rtx_types.cpp:348, whose one
@@ -10630,13 +10654,13 @@ namespace RemixSubmit
 			const int hold_mode_now = hold_empty_mode();
 			INFO_LOG("Remix: overlay {}x{} | screen-ui seen {} nomat {} nondc {} | "
 					 "raster draws {} nopixels {} texels {} fullscreen {} | presents {} | "
-					 "DrawScreenOverlay {} | uiraster {} uimode {}",
+					 "DrawScreenOverlay {} | uiraster {} uimode {} | sprite3d {} draws {}",
 				s_overlay_w, s_overlay_h,
 				s_screen_ui_seen, s_screen_ui_nomat, s_screen_ui_nondc,
 				s_overlay_draws, s_overlay_nopixels, s_overlay_texels, s_overlay_fullscreen,
 				s_overlay_presents,
 				(s_remix.api().DrawScreenOverlay != nullptr) ? "available" : "NULL IN INTERFACE",
-				ui_raster_mode(), ui_mode());
+				ui_raster_mode(), ui_mode(), sprite_geometry_mode(), s_sprite_geometry_draws);
 
 			INFO_LOG("Remix: hold-empty {} | empty windows {} held {} cam-held {} skipped-present {} "
 					 "instances {} | "
@@ -11117,8 +11141,14 @@ namespace RemixSubmit
 		const bool sprite_class = (r.m_vt.m_primclass == GS_SPRITE_CLASS);
 		const bool sprite_ui_probe = sprite_class && r.m_process_texture &&
 			ui_mode() != 0 && ui_raster_mode() != 0;
+		// SPRITE3D admits the same draws for the opposite reason: not to composite them over the
+		// image but to submit them as geometry the path tracer can light.
+		const bool sprite_geometry = sprite_class && r.m_process_texture &&
+			sprite_geometry_mode() != 0;
+		// Either way the draw needs the two-vertices-per-primitive treatment below.
+		const bool sprite_quad = sprite_ui_probe || sprite_geometry;
 
-		if (r.m_vt.m_primclass != GS_TRIANGLE_CLASS && !sprite_ui_probe)
+		if (r.m_vt.m_primclass != GS_TRIANGLE_CLASS && !sprite_quad)
 		{
 			++s_stats.skip_not_triangle;
 			return;
@@ -11546,10 +11576,19 @@ namespace RemixSubmit
 			}
 		}
 
-		const u32 vertex_count = r.m_vertex->next;
-		const u32 index_count = r.m_index->tail;
+		// NOT const: a sprite draw's stream is replaced by the expansion further down, which
+		// turns 2 vertices per primitive into 4 and 2 indices into 6.
+		u32 vertex_count = r.m_vertex->next;
+		u32 index_count = r.m_index->tail;
 
-		if (vertex_count < 3 || index_count < 3)
+		// A GS sprite is TWO vertices naming opposite corners, so a draw carrying exactly one
+		// sprite has vertex_count == index_count == 2. Demanding three of each refused it here
+		// as "empty" ~650 lines before the expansion below could turn it into a quad -- measured
+		// on the BIOS menu as 45 of the 48 admitted sprite draws per frame, which is why the
+		// overlay path appeared to do nothing even with UIMODE and UIRASTER both on.
+		const u32 min_elements = sprite_quad ? 2u : 3u;
+
+		if (vertex_count < min_elements || index_count < min_elements)
 		{
 			++s_stats.skip_empty;
 			return;
@@ -11656,7 +11695,96 @@ namespace RemixSubmit
 		sky_solver.bias[1] = 0.f;
 		sky_solver.bias[2] = 0.f;
 
-		const GSVertex* const verts = r.m_vertex->buff;
+		// --- sprite expansion ---------------------------------------------------------------
+		// A GS sprite is TWO vertices naming opposite corners of a screen-aligned rectangle, and
+		// everything below this point assumes three indices per primitive. Expand it HERE, before
+		// the un-projection, into four real vertices and two triangles, so the quad's corners go
+		// through exactly the same placement, colour, texcoord, normal and degeneracy code as
+		// every other vertex in the backend.
+		//
+		// Doing it afterwards, on the finished vertices, is what shipped and it could not work:
+		// the two synthesised corners were copies of vertex b with only their TEXCOORDS crossed,
+		// so both triangles carried two coincident POSITIONS and the degenerate-area cull dropped
+		// every one of them. Measured on the BIOS menu with SPRITE3D on: alldegen 48 draws per
+		// frame, sprite3d draws 0, screen still blank. The overlay rasteriser never noticed
+		// because it reads NDC, which that block did set correctly.
+		//
+		// The GS shades a sprite flat from its SECOND vertex, so all four corners take b's
+		// colour, Z and Q; only XY and the texture coordinates vary.
+		static std::vector<GSVertex> s_sprite_vertices;
+		static std::vector<u32> s_sprite_indices;
+
+		if (sprite_quad)
+		{
+			const GSVertex* const guest_verts = r.m_vertex->buff;
+			const u16* const guest_indices = r.m_index->buff;
+			const u32 guest_vertex_count = r.m_vertex->next;
+
+			// A sprite spanning essentially the whole target is a background or framebuffer blit,
+			// not content. NDC spans 2.0 across the target, so the old overlay test's 1.8 is 90%
+			// of an axis; the raw XY here is 12.4 fixed point in target pixels.
+			const int blit_x = ((rt_unscaled_width << 4) * 9) / 10;
+			const int blit_y = ((rt_unscaled_height << 4) * 9) / 10;
+
+			s_sprite_vertices.clear();
+			s_sprite_indices.clear();
+
+			for (u32 i = 0; (i + 1) < index_count; i += 2)
+			{
+				const u32 ia = guest_indices[i];
+				const u32 ib = guest_indices[i + 1];
+				if (ia >= guest_vertex_count || ib >= guest_vertex_count)
+					continue;
+
+				const GSVertex& va = guest_verts[ia];
+				const GSVertex& vb = guest_verts[ib];
+
+				if (std::abs(static_cast<int>(va.XYZ.X) - static_cast<int>(vb.XYZ.X)) >= blit_x &&
+					std::abs(static_cast<int>(va.XYZ.Y) - static_cast<int>(vb.XYZ.Y)) >= blit_y)
+				{
+					++s_overlay_fullscreen;
+					continue;
+				}
+
+				const u32 base = static_cast<u32>(s_sprite_vertices.size());
+
+				// 0:(xa,ya)  1:(xb,ya)  2:(xb,yb)  3:(xa,yb)
+				for (int c = 0; c < 4; ++c)
+				{
+					const bool right = (c == 1 || c == 2);
+					const bool bottom = (c == 2 || c == 3);
+
+					GSVertex q = vb;
+					q.XYZ.X = right ? vb.XYZ.X : va.XYZ.X;
+					q.XYZ.Y = bottom ? vb.XYZ.Y : va.XYZ.Y;
+					q.U = right ? vb.U : va.U;
+					q.V = bottom ? vb.V : va.V;
+					q.ST.S = right ? vb.ST.S : va.ST.S;
+					q.ST.T = bottom ? vb.ST.T : va.ST.T;
+					s_sprite_vertices.push_back(q);
+				}
+
+				s_sprite_indices.push_back(base);
+				s_sprite_indices.push_back(base + 1);
+				s_sprite_indices.push_back(base + 2);
+				s_sprite_indices.push_back(base);
+				s_sprite_indices.push_back(base + 2);
+				s_sprite_indices.push_back(base + 3);
+			}
+
+			if (s_sprite_indices.empty() ||
+				s_sprite_vertices.size() > s_max_vertices_per_mesh ||
+				s_sprite_indices.size() > s_max_indices_per_mesh)
+			{
+				++s_stats.skip_empty;
+				return;
+			}
+
+			vertex_count = static_cast<u32>(s_sprite_vertices.size());
+			index_count = static_cast<u32>(s_sprite_indices.size());
+		}
+
+		const GSVertex* const verts = sprite_quad ? s_sprite_vertices.data() : r.m_vertex->buff;
 
 		// The baked lightmap for this surface, sampled from the masked channel passes that
 		// re-drew these same vertices. Complete only once all three channels have been seen.
@@ -11770,7 +11898,19 @@ namespace RemixSubmit
 		// here and there -- the min w passed there is the vertex loop's own, which the scan above
 		// reproduces exactly -- so the two agree by construction. The two forced paths
 		// (cloud_sky_draw, hash_sky_draw) are handed to it as force_sky for the same reason.
-		const bool sky_draw = sky_camera_enabled() &&
+		//
+		// A SPRITE IS NEVER SKY, and this is not a preference -- it crashes the runtime.
+		// classify_sky's default rule is "the depth test and depth writes are both off", which is
+		// the exact signature of a 2D screen sprite as well as of a backdrop. Measured on the PS2
+		// BIOS: with SPRITE3D on and SKY at its default of 1, the very first sprite submitted as
+		// geometry killed the process asynchronously inside dxvk::DxvkBuffer::DxvkBuffer with
+		// STATUS_INTEGER_DIVIDE_BY_ZERO (a zero-BYTE buffer; crash RVA 0x1BE0D4 in d3d9.dll,
+		// symbolised against its PDB). Bisected: with the sky classifier off the same draw is
+		// submitted and the run is stable, and re-enabling SKY alone brings the crash back --
+		// ALPHASTATE, TEXSTAGE, STABLEID, CUTOUT, SMOOTHNORMALS and the opacity-micromap path were
+		// each cleared by the same bisect. Semantically it was wrong anyway: a screen-space quad
+		// is the one thing that is definitely not a backdrop at infinity.
+		const bool sky_draw = sky_camera_enabled() && !sprite_quad &&
 			(cloud_sky_draw || hash_sky_draw ||
 				classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(),
 					s_submitted_this_frame, draw_samples_render_target(tex_source), sky_gate_min_w));
@@ -11847,7 +11987,9 @@ namespace RemixSubmit
 		u32 max_vertex_alpha = 0;
 
 		// The overlay rasteriser needs screen-space positions, which only exist inside this loop.
-		if (ui_raster_mode() != 0)
+		// So does the sprite expansion, which reads them to place the two synthesised corners --
+		// so SPRITE3D has to fill this even with the rasteriser off.
+		if (ui_raster_mode() != 0 || sprite_quad)
 			s_scratch_ndc.resize((size_t)vertex_count * 2);
 		else
 			s_scratch_ndc.clear();
@@ -12167,69 +12309,31 @@ namespace RemixSubmit
 		}
 
 		// Indices are already a triangle list for GS_TRIANGLE_CLASS (indices_per_prim == 3,
-		// GSRendererHW.cpp:5557-5562). Widen u16 -> u32 and bounds-check as we go.
-		const u16* const src_indices = r.m_index->buff;
-		const u32 triangle_indices = index_count - (index_count % 3);
-
+		// GSRendererHW.cpp:5557-5562). Widen u16 -> u32 and bounds-check as we go. A sprite draw
+		// was turned into a triangle list by the expansion above and needs neither step.
 		s_scratch_indices.clear();
-		s_scratch_indices.resize(triangle_indices);
 
-		for (u32 i = 0; i < triangle_indices; ++i)
+		if (sprite_quad)
 		{
-			const u32 index = src_indices[i];
-			if (index >= vertex_count)
-			{
-				++s_stats.skip_empty;
-				return;
-			}
-
-			s_scratch_indices[i] = index;
+			s_scratch_indices = s_sprite_indices;
 		}
-
-		// A GS sprite is TWO vertices naming opposite corners of a screen-aligned quad, so the
-		// buffer above (which assumes indices_per_prim == 3) yields nothing usable. Rebuild it
-		// as a triangle list, synthesising the two off-diagonal corners per sprite and taking
-		// the flat colour from the second vertex, which is what the GS shades a sprite with.
-		if (sprite_ui_probe)
+		else
 		{
-			s_scratch_indices.clear();
-			const u32 sprite_indices = index_count - (index_count % 2);
-			for (u32 i = 0; i + 1 < sprite_indices; i += 2)
-			{
-				const u32 a = src_indices[i];
-				const u32 b = src_indices[i + 1];
-				if (a >= vertex_count || b >= vertex_count || s_scratch_ndc.size() < (size_t)vertex_count * 2)
-					continue;
+			const u16* const src_indices = r.m_index->buff;
+			const u32 triangle_indices = index_count - (index_count % 3);
 
-				const float xa = s_scratch_ndc[(size_t)a * 2], ya = s_scratch_ndc[((size_t)a * 2) + 1];
-				const float xb = s_scratch_ndc[(size_t)b * 2], yb = s_scratch_ndc[((size_t)b * 2) + 1];
-				// A sprite spanning essentially the whole target is a background/framebuffer blit,
-				// not UI. Admitting those made the overlay repaint itself once per frame (measured
-				// 1.04x overdraw) and paint over the very glyphs this path exists to composite.
-				// NDC spans -1..1, so 1.8 is 90% of an axis; real HUD/text elements are far smaller.
-				if (std::abs(xb - xa) >= 1.8f && std::abs(yb - ya) >= 1.8f)
+			s_scratch_indices.resize(triangle_indices);
+
+			for (u32 i = 0; i < triangle_indices; ++i)
+			{
+				const u32 index = src_indices[i];
+				if (index >= vertex_count)
 				{
-					++s_overlay_fullscreen;
-					continue;
+					++s_stats.skip_empty;
+					return;
 				}
 
-				const remixapi_HardcodedVertex& va = s_scratch_vertices[a];
-				const remixapi_HardcodedVertex& vb = s_scratch_vertices[b];
-
-				const u32 c1 = (u32)s_scratch_vertices.size();
-				remixapi_HardcodedVertex corner = vb;
-				corner.texcoord[0] = vb.texcoord[0]; corner.texcoord[1] = va.texcoord[1];
-				s_scratch_vertices.push_back(corner);
-				s_scratch_ndc.push_back(xb); s_scratch_ndc.push_back(ya);
-
-				const u32 c2 = (u32)s_scratch_vertices.size();
-				corner = vb;
-				corner.texcoord[0] = va.texcoord[0]; corner.texcoord[1] = vb.texcoord[1];
-				s_scratch_vertices.push_back(corner);
-				s_scratch_ndc.push_back(xa); s_scratch_ndc.push_back(yb);
-
-				s_scratch_indices.push_back(a);  s_scratch_indices.push_back(c1); s_scratch_indices.push_back(b);
-				s_scratch_indices.push_back(a);  s_scratch_indices.push_back(b);  s_scratch_indices.push_back(c2);
+				s_scratch_indices[i] = index;
 			}
 		}
 
@@ -12256,7 +12360,34 @@ namespace RemixSubmit
 		// area and therefore scales as length squared, and a world unit means something
 		// different per title (maxpos ~2,500 on Rainbow Six 3, ~5,300 on SOCOM). A fixed 1e-12
 		// is meaningless in both.
-		const float degenerate_scale = std::max(s_last_bounds.radius(), 1.f);
+		//
+		// ...and the scale it is measured against has to be the draw's OWN, not the scene's,
+		// for anything placed in the 2D tier. A sprite quad's positions come from NDC at w = 1,
+		// so its edges are ~1 unit however big the world is; multiplying the epsilon by the BIOS
+		// intro's 27,000-unit scene radius declared every single one of them degenerate. Measured
+		// on the BIOS menu: alldegen 3 per frame, raster draws frozen at 2,252 -- not one sprite
+		// ever reached the rasteriser. Only sprite quads take the per-draw scale; world geometry
+		// keeps the scene-relative threshold the device-loss note above was measured with.
+		float degenerate_scale = std::max(s_last_bounds.radius(), 1.f);
+
+		if (sprite_quad)
+		{
+			float lo[3] = {1e30f, 1e30f, 1e30f};
+			float hi[3] = {-1e30f, -1e30f, -1e30f};
+
+			for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+			{
+				for (int a = 0; a < 3; ++a)
+				{
+					lo[a] = std::min(lo[a], v.position[a]);
+					hi[a] = std::max(hi[a], v.position[a]);
+				}
+			}
+
+			const float extent = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]});
+			degenerate_scale = std::isfinite(extent) ? std::max(extent, 1e-3f) : 1.f;
+		}
+
 		const float degenerate_edge = degenerate_area_epsilon() * degenerate_scale;
 		const float degenerate_cross = degenerate_edge * degenerate_edge;
 
@@ -12383,7 +12514,7 @@ namespace RemixSubmit
 		}
 
 		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok &&
-			material.content_hash != 0 && !s_scratch_ndc.empty())
+			!sprite_geometry && material.content_hash != 0 && !s_scratch_ndc.empty())
 		{
 			// Size the buffer to the guest's own target the first time a UI draw appears, so the
 			// overlay is authored at native resolution and Remix scales it once, at the end.
@@ -12405,13 +12536,50 @@ namespace RemixSubmit
 			return;
 		}
 
-		// A sprite was admitted past the primclass gate ONLY as an overlay candidate. If the
-		// raster path above did not consume it, refuse it here exactly as that gate would have:
-		// it must never reach mesh identity or geometry submission as world geometry.
-		if (sprite_ui_probe)
+		// A sprite admitted past the primclass gate ONLY as an overlay candidate. If the raster
+		// path above did not consume it, refuse it here exactly as that gate would have: it must
+		// never reach mesh identity or geometry submission as world geometry. SPRITE3D is the
+		// deliberate exception -- that is the whole point of it -- so it falls through.
+		if (sprite_quad && !sprite_geometry)
 		{
 			++s_stats.skip_not_triangle;
 			return;
+		}
+
+		// A sprite whose texture did not bind is a framebuffer blit or an unsupported format --
+		// the guest sampling its own render target, not menu art. Submitting it as geometry adds
+		// a full-screen untextured quad in front of the eye at best, and it is the draw the
+		// runtime died on at worst (see the divide-by-zero note below), so refuse it here.
+		if (sprite_geometry && material.material == nullptr)
+		{
+			++s_stats.skip_not_triangle;
+			return;
+		}
+
+		if (sprite_geometry)
+		{
+			++s_sprite_geometry_draws;
+
+			// The first sprite draw ever submitted as geometry crashed the runtime inside
+			// dxvk::DxvkBuffer::DxvkBuffer with STATUS_INTEGER_DIVIDE_BY_ZERO -- DXVK divides by
+			// the slice stride, which is zero only for a zero-BYTE buffer. Dump what we are about
+			// to hand over so the zero can be named rather than guessed at.
+			if (s_sprite_geometry_draws <= 16)
+			{
+				INFO_LOG("Remix: SPRITE3D draw {} | verts {} idx {} | mat {} hash {:016X} | "
+						 "w [{:.6g},{:.6g}] | bbox [{:.3f},{:.3f},{:.3f}]..[{:.3f},{:.3f},{:.3f}] | "
+						 "PSM {:#x} TW {} TH {} FST {} target {} | scale {:.6g}",
+					s_sprite_geometry_draws,
+					s_scratch_vertices.size(), s_scratch_indices.size(),
+					material.material ? 1 : 0, material.content_hash, min_w, max_w,
+					draw_bounds.min[0], draw_bounds.min[1], draw_bounds.min[2],
+					draw_bounds.max[0], draw_bounds.max[1], draw_bounds.max[2],
+					static_cast<u32>(r.m_cached_ctx.TEX0.PSM),
+					static_cast<u32>(r.m_cached_ctx.TEX0.TW), static_cast<u32>(r.m_cached_ctx.TEX0.TH),
+					fst_draw ? 1 : 0,
+					(source && (source->m_target || source->m_from_target)) ? 1 : 0,
+					degenerate_scale);
+			}
 		}
 
 		// --- mesh identity ------------------------------------------------------------------
@@ -12668,7 +12836,7 @@ namespace RemixSubmit
 		regs.alpha = r.m_context->ALPHA;
 
 		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame,
-			untex_draw, cloud_sky_draw || hash_sky_draw);
+			untex_draw, cloud_sky_draw || hash_sky_draw, sprite_quad);
 
 		// A lightmap pass sits exactly on the surface it modulates, so it has to be a decal or it
 		// z-fights -- that is what made the FBMSK gate necessary in the first place. Static, because
