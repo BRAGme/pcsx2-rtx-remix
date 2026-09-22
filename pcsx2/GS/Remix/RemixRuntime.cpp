@@ -250,6 +250,25 @@ namespace remix_ps2
 		else
 			ERROR_LOG("Remix: fork features disabled -- running geometry-only (no textures, no UI compositor)");
 
+		// Optional fork exports. These are resolved by name rather than read from the
+		// interface table: the fork ships them as plain DLL exports (d3d9.def @134-@136)
+		// and leaves the public interface struct's ABI untouched, so a runtime without
+		// them simply resolves null and the feature reports itself unavailable.
+		if (m_dll)
+		{
+			m_guest_vision = reinterpret_cast<guest_vision_function>(
+				::GetProcAddress(m_dll, "remixapi_SetGuestVisionMode"));
+			m_guest_thermal = reinterpret_cast<guest_thermal_function>(
+				::GetProcAddress(m_dll, "remixapi_SetGuestThermalFrame"));
+			m_premultiplied_overlay = reinterpret_cast<PFN_remixapi_DrawScreenOverlay>(
+				::GetProcAddress(m_dll, "remixapi_DrawScreenOverlayPremultiplied"));
+		}
+
+		INFO_LOG("Remix: guest vision {}, guest thermal {}, premultiplied overlay {}",
+			m_guest_vision ? "available" : "unavailable",
+			m_guest_thermal ? "available" : "unavailable",
+			m_premultiplied_overlay ? "available" : "unavailable");
+
 		INFO_LOG("Remix: runtime initialized on HWND {}", static_cast<void*>(hwnd));
 		return true;
 	}
@@ -611,5 +630,73 @@ namespace remix_ps2
 		}();
 
 		return value;
+	}
+	u32 runtime::set_guest_vision(u32 mode)
+	{
+		if (!m_ok || !m_guest_vision)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+
+		return guarded_set_guest_vision(m_guest_vision, mode);
+	}
+
+	u32 runtime::set_guest_thermal(const void* bgra_pixels, u32 width, u32 height, u32 row_pitch)
+	{
+		if (!m_ok || !m_guest_thermal)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+
+		return guarded_set_guest_thermal(m_guest_thermal, bgra_pixels, width, height, row_pitch);
+	}
+
+	u32 runtime::draw_premultiplied_overlay(const void* pixels, u32 width, u32 height, remixapi_Format format, float opacity)
+	{
+		if (!m_ok || !m_premultiplied_overlay)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+
+		return guarded_draw_screen_overlay(m_premultiplied_overlay, pixels, width, height, format, opacity);
+	}
+
+	u32 guarded_set_guest_vision(guest_vision_function fn, u32 mode)
+	{
+		if (!fn)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+
+		__try
+		{
+			return fn(mode);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_set_guest_thermal(guest_thermal_function fn, const void* bgra_pixels, u32 width, u32 height, u32 row_pitch)
+	{
+		if (!fn)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+
+		__try
+		{
+			return fn(bgra_pixels, width, height, row_pitch);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_set_default_output(PFN_remixapi_dxvk_SetDefaultOutput fn, remixapi_dxvk_CopyRenderingOutputType type, const remixapi_Float4D* color)
+	{
+		if (!fn)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+
+		__try
+		{
+			return fn(type, color);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
 	}
 } // namespace remix_ps2

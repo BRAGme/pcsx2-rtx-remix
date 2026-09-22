@@ -34,6 +34,9 @@ namespace remix_ps2
 		u8 slack[interface_slack_bytes]{};
 	};
 
+	using guest_vision_function = remixapi_ErrorCode (REMIXAPI_CALL*)(u32 mode);
+	using guest_thermal_function = remixapi_ErrorCode (REMIXAPI_CALL*)(const void* bgra_pixels, u32 width, u32 height, u32 row_pitch);
+
 	// Owns the dxvk-remix module and its interface table.
 	// Nothing here throws: a missing or broken runtime degrades the renderer to a no-op.
 	class runtime
@@ -56,6 +59,12 @@ namespace remix_ps2
 		// succeeded. Everything beyond raw geometry is gated on this; false means the
 		// backend runs in geometry-only mode.
 		bool fork_features() const { return m_fork_features; }
+		bool guest_vision_available() const { return m_ok && m_guest_vision; }
+		u32 set_guest_vision(u32 mode);
+		bool guest_thermal_available() const { return m_ok && m_guest_thermal; }
+		u32 set_guest_thermal(const void* bgra_pixels, u32 width, u32 height, u32 row_pitch);
+		bool premultiplied_overlay_available() const { return m_ok && m_premultiplied_overlay; }
+		u32 draw_premultiplied_overlay(const void* pixels, u32 width, u32 height, remixapi_Format format, float opacity);
 
 	private:
 		bool check_fork_slots();
@@ -65,6 +74,9 @@ namespace remix_ps2
 		HMODULE m_dll = nullptr;
 		bool m_ok = false;
 		bool m_fork_features = false;
+		guest_vision_function m_guest_vision = nullptr;
+		guest_thermal_function m_guest_thermal = nullptr;
+		PFN_remixapi_DrawScreenOverlay m_premultiplied_overlay = nullptr;
 	};
 
 	// SEH-guarded leaf calls. POD parameters only: __try/__except cannot coexist with
@@ -83,6 +95,9 @@ namespace remix_ps2
 	u32 guarded_create_texture(PFN_remixapi_CreateTexture fn, const remixapi_TextureInfo* info, remixapi_TextureHandle* out_handle);
 	u32 guarded_destroy_texture(PFN_remixapi_DestroyTexture fn, remixapi_TextureHandle handle);
 	u32 guarded_draw_screen_overlay(PFN_remixapi_DrawScreenOverlay fn, const void* pixels, u32 width, u32 height, remixapi_Format format, float opacity);
+	u32 guarded_set_default_output(PFN_remixapi_dxvk_SetDefaultOutput fn, remixapi_dxvk_CopyRenderingOutputType type, const remixapi_Float4D* color);
+	u32 guarded_set_guest_vision(guest_vision_function fn, u32 mode);
+	u32 guarded_set_guest_thermal(guest_thermal_function fn, const void* bgra_pixels, u32 width, u32 height, u32 row_pitch);
 	u32 guarded_set_config_variable(PFN_remixapi_SetConfigVariable fn, const char* key, const char* value);
 
 	// Readable name for a remixapi_ErrorCode or for error_code_faulted.
