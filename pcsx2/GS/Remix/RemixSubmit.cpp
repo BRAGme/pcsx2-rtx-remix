@@ -7713,6 +7713,26 @@ namespace RemixSubmit
 		// Runs after Present, so the camera resolved here is the one both the next frame's
 		// draws and the next frame's SetupCamera use -- geometry and camera always reference
 		// the same matrix (RPCS3's one-frame latch).
+		// Candidate sources, enumerated in RemixVU1Capture.h next to ProgramEntry::source. This was
+		// an inline conditional chain that stopped at 3 and labelled EVERYTHING above it "SOCOM CA
+		// fixed VU block" -- so a slice-vf register matrix winning on Black was reported as a
+		// SOCOM-specific hardcoded block, on a title whose ucode hash that block cannot match.
+		const char* candidate_source_name(u32 source)
+		{
+			switch (source)
+			{
+				case 0: return "window scan";
+				case 1: return "ucode back-slice";
+				case 2: return "ucode back-slice (TOPS)";
+				case 3: return "pinned back-slice address";
+				case 4: return "title-specific fixed VU block";
+				case 5: return "GS-side synthetic probe";
+				case 6: return "ucode back-slice (auto-increment base)";
+				case 7: return "VF register file (slice-vf)";
+				default: return "unknown source";
+			}
+		}
+
 		void resolve_world_camera()
 		{
 			// PCSX2_REMIX_CAMTEST scores the window that just ended against the candidate solvers
@@ -8498,10 +8518,7 @@ namespace RemixSubmit
 						 "fovY {:.1f} deg, near {:.5g}, far {:.5g}, eye ({:.3f}, {:.3f}, {:.3f}), "
 						 "depth scale {:.4g} (anisotropy {:.3g}x) "
 						 "[matrix-implied near {:.5g}, not used]",
-					(best_source == 0) ? "window scan" :
-						((best_source == 1) ? "ucode back-slice" :
-							((best_source == 2) ? "ucode back-slice (TOPS)" :
-								((best_source == 3) ? "pinned back-slice address" : "SOCOM CA fixed VU block"))),
+					candidate_source_name(best_source),
 					best_name, best_transposed ? "column-major" : "row-major", best_score,
 					params.fov_y_degrees, camera.near_plane, camera.far_plane,
 					camera.position[0], camera.position[1], camera.position[2],
