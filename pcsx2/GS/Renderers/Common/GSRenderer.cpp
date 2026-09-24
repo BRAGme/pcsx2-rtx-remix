@@ -230,6 +230,10 @@ bool GSRenderer::Merge(int field)
 		static_cast<int>(static_cast<float>(resolution.y) * GetUpscaleMultiplier()));
 
 	m_real_size = GSVector2i(fs.x, fs.y);
+	// NOT m_real_size: that is resolution * GetUpscaleMultiplier(), so at 2x it is 1280x896 and
+	// at 3x it is 1920x1344. The movie overlay downloads whatever size it is handed, every frame
+	// a movie is playing, and reading back 4x or 9x the pixels for a 640x448 video buys nothing.
+	m_remix_native_size = resolution;
 
 	if ((tex[0] == tex[1]) && (src_gs_read[0] == src_gs_read[1]).alltrue() && (dst[0] == dst[1]).alltrue() &&
 		(PCRTCDisplays.PCRTCDisplays[0].displayRect == PCRTCDisplays.PCRTCDisplays[1].displayRect).alltrue() &&
@@ -662,7 +666,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			remix_current = nullptr;
 	}
 	RemixSubmit::OnVSync(remix_current, remix_crop.x, remix_crop.y, remix_crop.z, remix_crop.w,
-		m_real_size.x, m_real_size.y);
+		m_remix_native_size.x, m_remix_native_size.y);
 #endif
 
 	// Skip presentation when running uncapped while vsync is on.

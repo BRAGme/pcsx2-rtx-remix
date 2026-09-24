@@ -27,6 +27,10 @@ private:
 
 protected:
 	GSVector2i m_real_size{0, 0};
+	// The guest display resolution WITHOUT the upscale multiplier that m_real_size carries.
+	// The Remix movie overlay resolves into this, so its per-frame GPU readback does not scale
+	// with the internal resolution setting.
+	GSVector2i m_remix_native_size{0, 0};
 
 	virtual GSTexture* GetOutput(int i, float& scale, int& y_offset) = 0;
 	virtual GSTexture* GetFeedbackOutput(float& scale) { return nullptr; }

@@ -401,7 +401,27 @@ void GSclose()
 
 	CloseGSRenderer();
 	CloseGSDevice(true);
-	Host::ReleaseRenderWindow();
+
+#if defined(_WIN32) && defined(_M_X64)
+	// KEEP THE RENDER WINDOW ALIVE IN REMIX MODE, and this is not an optimisation -- without it,
+	// shutting a game down and starting another one leaves a blank white window.
+	//
+	// Remix binds to the HWND once and cannot re-bind: OnAcquireWindow refuses a different handle
+	// outright, logs "the render window was recreated ... rendering has stopped", and clears
+	// s_live. Releasing here destroys the widget, so the next boot acquires a NEW handle, hits
+	// that guard, and submits nothing for the rest of the session -- measured as frame 0, seen 0,
+	// mat live 0, vu kicks 0 after the second boot, with the runtime still presenting.
+	//
+	// The guard itself is right: the old window really is gone and every later Present would
+	// fault against it. The fix is not to destroy the window in the first place. Holding it means
+	// the next AcquireRenderWindow hands back the same HWND and the binding stays valid.
+	//
+	// Scope: this is the normal close path only. The two error paths above still release, since
+	// there the device failed to come up and there is nothing bound to preserve. At process exit
+	// the widget goes with the process.
+	if (!RemixSubmit::Armed())
+#endif
+		Host::ReleaseRenderWindow();
 }
 
 void GSreset(bool hardware_reset)
