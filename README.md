@@ -345,7 +345,7 @@ setting it from `bin\inis\PCSX2.ini` directly, which is what the test harness do
 Remix settings live in the GUI on their own page
 (`pcsx2-qt/Settings/RemixSettingsWidget.{h,cpp,ui}`).
 
-Per-game Remix settings go in `bin/<serial>.conf`. Six are tracked. The first two are the
+Per-game Remix settings go in `bin/<serial>.conf`. Seven are tracked. The first two are the
 curated ones, written up from measurements taken on those titles; the rest are transplants and say
 so in their own headers:
 
@@ -357,6 +357,7 @@ so in their own headers:
 | [`bin/SCUS-97275.conf`](bin/SCUS-97275.conf) | SOCOM II | transplanted from Combined Assault, unmeasured here |
 | [`bin/SCUS-97474.conf`](bin/SCUS-97474.conf) | SOCOM 3 | starter profile, unmeasured |
 | [`bin/SCUS-97399.conf`](bin/SCUS-97399.conf) | God of War | starter profile, unmeasured, different engine |
+| [`bin/SLUS-21376.conf`](bin/SLUS-21376.conf) | Black | menu counters from one user log; the fix itself is unconfirmed |
 
 None of them arms a diagnostic. If you are adding a profile, keep it that way -- `DRAWDUMP` and
 friends default to 0 and belong in a working copy, not in the repo.
