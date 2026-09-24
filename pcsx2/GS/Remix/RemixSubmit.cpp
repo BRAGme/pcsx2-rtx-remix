@@ -8017,15 +8017,22 @@ namespace RemixSubmit
 
 						float score = remix_ps2::score_perspective(split.projection, reference_aspect,
 							s_camyflip_sign_active);
-						score += camydown_bonus(hyp); // PCSX2_REMIX_CAMYDOWN, see camydown_mode()
-						if (dump)
-							fmt::format_to(std::back_inserter(detail), " {}/{}={:.2f}", hyp.name, major ? 'C' : 'R', score);
 
+						// BEFORE the CAMYDOWN bonus. score_perspective returns 0 as a VETO -- not a
+						// perspective, or an FOV outside 15..150 deg -- and the bonus used to be added
+						// first, so any hypothesis with scale_y < 0 was resurrected from a hard rejection
+						// at score 1.0 and then collected +10 for its source and +100 for feeding the
+						// divide. Measured on Black: an ndcY reading with fovY 0.2 deg won the election at
+						// exactly 111.00. A tie-break must not outrank a veto.
 						if (!(score > 0.f))
 						{
 							++s_stats.cam_reject_score;
 							continue;
 						}
+
+						score += camydown_bonus(hyp); // PCSX2_REMIX_CAMYDOWN, see camydown_mode()
+						if (dump)
+							fmt::format_to(std::back_inserter(detail), " {}/{}={:.2f}", hyp.name, major ? 'C' : 'R', score);
 
 						// Latch hysteresis: prefer the matrix that already won, so a tie does
 						// not make the world snap between two equally plausible anchors.
@@ -8935,10 +8942,14 @@ namespace RemixSubmit
 					// as s_camdepth_active above -- the draw path must not read the environment, and
 					// a per-draw camera scored under a different sign policy than the frame camera
 					// can prefer a different hypothesis and place its draws in a different world.
-					const float score = remix_ps2::score_perspective(split.projection, reference_aspect,
-						s_camyflip_sign_active) + camydown_bonus(hyp); // same bonus as the frame election
-					if (!(score > 0.f))
+					// Veto first, bonus second, exactly as the frame election does -- the two must rank a
+					// matrix identically or a draw lands in a different world than the frame camera.
+					const float shape = remix_ps2::score_perspective(split.projection, reference_aspect,
+						s_camyflip_sign_active);
+					if (!(shape > 0.f))
 						continue;
+
+					const float score = shape + camydown_bonus(hyp);
 
 					// Strict >, so the FIRST hypothesis achieving the best score wins -- the same
 					// tie-break resolve_world_camera uses, over the same ordering.
