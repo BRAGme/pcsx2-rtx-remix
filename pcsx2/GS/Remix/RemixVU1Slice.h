@@ -141,7 +141,10 @@ namespace RemixVU1Slice
 	};
 
 	// Straight-line decode from start_pc to the first E-bit (or the end of micro memory).
-	void Analyze(const u8* micro, u32 start_pc, Program& out);
+	//
+	// open_on_w: a chain that opens on its w term, MULAw ACC, m3, vf00w, binds its vertex to the
+	// first real operand instead of to vf00. Off by default -- see PCSX2_REMIX_SLICEW0.
+	void Analyze(const u8* micro, u32 start_pc, Program& out, bool open_on_w = false);
 
 	// Disassembly of the sliced instructions -- the chains and the loads feeding them.
 	// This is the artefact a null result ships, the way RPCS3 dumps the HPOS slice for a

@@ -916,7 +916,14 @@ namespace RemixVU1Capture
 			entry.used = true;
 			entry.ucode_hash = ucode_hash;
 			entry.start_pc = start_pc;
-			RemixVU1Slice::Analyze(micro, start_pc, entry.program);
+			// PCSX2_REMIX_SLICEW0 -- slice chains that open on their w term (MULAw ACC, m3, vf00w),
+			// the translation-first transform the Zen note below documents for Mercenaries. On
+			// Black's dumped microcode it recovers 113 matrices where there were none.
+			// DEFAULT 0 because it CHANGES THE PICTURE: SOCOM CA's mission program gains two
+			// memory-resident chains per entry point, and memory-resident slices are electable at
+			// DIVCAM 0. Read at the cache miss, like MAXPROGRAMS: a program analysed before the
+			// per-game conf lands keeps its first result.
+			RemixVU1Slice::Analyze(micro, start_pc, entry.program, env_flag_live(L"PCSX2_REMIX_SLICEW0"));
 
 			s_frame.programs_used = s_program_count;
 

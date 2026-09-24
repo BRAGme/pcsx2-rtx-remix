@@ -372,7 +372,7 @@ namespace RemixVU1Slice
 		}
 	} // namespace
 
-	void Analyze(const u8* micro, u32 start_pc, Program& out)
+	void Analyze(const u8* micro, u32 start_pc, Program& out, bool open_on_w)
 	{
 		out = Program{};
 
@@ -427,6 +427,12 @@ namespace RemixVU1Slice
 
 			if (active.open && (kind == Upper::MulaBc || kind == Upper::MaddaBc || kind == Upper::MaddBc))
 			{
+				// A chain may OPEN on its w term, MULAw ACC, m3, vf00w, because that term does not
+				// wait on the vertex load. vf00 is never the vertex, so bind the first real operand
+				// -- otherwise vertex_vf stays 0 and every x/y/z row fails the test below.
+				if (open_on_w && active.vertex_vf == 0)
+					active.vertex_vf = ft;
+
 				// vf00 is the constant (0,0,0,1), so a w term written as MADDw fd, m3, vf00
 				// is the same chain -- it is how a point with an implicit w of 1 is folded in.
 				if (ft == active.vertex_vf || ft == 0)
