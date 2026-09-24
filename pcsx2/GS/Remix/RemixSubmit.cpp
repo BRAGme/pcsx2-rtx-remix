@@ -16479,7 +16479,15 @@ namespace RemixSubmit
 		// drought accounting has to stay honest -- but nothing is submitted for it.
 		if (!skip_present)
 		{
-			if (s_empty_frame_streak >= s_beacon_after_empty_frames)
+			// ... and only when nothing else is carrying the frame. A window that submits no
+			// GEOMETRY but does present an overlay is not a drought -- it is a 2D screen, composited
+			// rather than traced, which is exactly what UIRASTER and the movie path exist to do. The
+			// beacon answers "is the runtime alive with no geometry?" and on such a screen the answer
+			// is yes and the picture is already correct, so firing puts a white triangle through a
+			// menu that is working. Measured on the PS2 BIOS with SPRITE3D = 0: every sprite goes to
+			// the rasteriser, geometry is legitimately zero every frame, and the beacon covered the
+			// screen.
+			if (s_empty_frame_streak >= s_beacon_after_empty_frames && !s_overlay_used)
 				submit_debug_triangle();
 
 			// The return code used to be discarded here, and that was the single remaining blind
