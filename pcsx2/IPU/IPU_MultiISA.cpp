@@ -1609,7 +1609,11 @@ __fi static bool mpeg2_slice()
 __fi static bool ipuVDEC(u32 val)
 {
 #if defined(_WIN32) && defined(_M_X64)
-	RemixSubmit::OnGuestMovieDecode();
+	// Armed() first: this sits on the IPU decode path of EVERY PS2 game, Remix selected or not,
+	// and without the check each ipuVDEC pays a cross-TU call and an atomic read-modify-write for
+	// a backend that is not running. Every other Remix hook is guarded the same way.
+	if (RemixSubmit::Armed())
+		RemixSubmit::OnGuestMovieDecode();
 #endif
 	static int count = 0;
 	if (count++ > 5) {

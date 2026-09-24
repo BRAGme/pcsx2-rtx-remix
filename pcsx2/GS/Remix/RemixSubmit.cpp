@@ -814,6 +814,8 @@ namespace RemixSubmit
 		u64 s_sprite_skip_untex = 0;     // ... refused: untextured and the mode does not take them
 		u64 s_sprite_skip_nomat = 0;     // ... refused: textured, but the material did not bind
 		u64 s_sprite_skip_blit = 0;      // ... refused: spans the whole target (see SPRITEBLIT)
+		u64 s_movie_frames = 0;          // frames the movie overlay presented (MOVIE)
+		u64 s_movie_refused = 0;         // ... wanted, but the readback could not be completed
 		u64 s_screen_ui_seen = 0;     // draws classified as screen UI
 		u64 s_screen_ui_nomat = 0;    // ... dropped: no material bound
 		u64 s_screen_ui_nondc = 0;    // ... dropped: no NDC captured
@@ -875,6 +877,30 @@ namespace RemixSubmit
 		int sprite_blit_mode()
 		{
 			static live_int value(L"PCSX2_REMIX_SPRITEBLIT", 0, 0, 1);
+			return value.get();
+		}
+
+		// PCSX2_REMIX_MOVIE -- present the emulator's own merged output while the guest plays a movie.
+		//
+		// A .PSS is MPEG-2 decoded by the emulated IPU into EE RAM, uploaded to GS memory and, in the
+		// usual case, blitted by a single full-target textured SPRITE. That draw is refused at the
+		// primclass gate (skip_not_triangle) and, were it admitted, refused again as a full-target
+		// blit -- and rightly so both times. But a game may instead upload the decoded frame straight
+		// into the DISPFB the PCRTC scans out, issuing no GS primitive at all. Then nothing is drawn,
+		// nothing is counted, and Remix re-presents a stale surface. Both styles end the same way on
+		// screen: black, one instance, no lights.
+		//
+		// So this does not classify draws. It takes the MERGED frame -- what the emulator would have
+		// shown -- and hands it to DrawScreenOverlay, which composites AFTER path tracing and
+		// denoising. Both styles are caught, because the merged output exists either way.
+		//
+		// The trade-off is stated plainly because it is not a defect: an FMV presented this way is
+		// NOT path traced, and will look like ordinary emulator output over the traced image. That is
+		// the correct treatment for pre-rendered video -- tracing it would denoise and temporally
+		// accumulate footage that is already final, which smears motion -- but it is not RTX video.
+		int movie_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_MOVIE", 0, 0, 1);
 			return value.get();
 		}
 
@@ -3010,11 +3036,47 @@ namespace RemixSubmit
 				(map.empty() && movie);
 		}
 
+		// The generic form of the above, for any title, behind PCSX2_REMIX_MOVIE. Deliberately does
+		// NOT require UIMODE/UIRASTER: those gate Rainbow Six 3's own menu compositing and have
+		// nothing to do with whether a movie is playing.
+		//
+		// THE 7-DECODE SLOP IS LOAD-BEARING, and is not a magic number. IPU decode runs on the EE
+		// thread; this is read on the GS thread; MTGS lets the GS run up to a ring depth behind the
+		// EE; and both hooks are relaxed atomics with no ordering against a frame boundary. The state
+		// flag alone would therefore flip a few frames early or late. Requiring a RUN of decodes turns
+		// that race into hysteresis: it costs a few frames of latency at each end of a movie, and in
+		// exchange it cannot flicker. Presentation mode must not be switched on an exact frame from a
+		// cross-thread flag -- if that is ever wanted it has to go through MTGS::RunOnGSThread, the
+		// way Counters.cpp already routes the software-renderer FMV switch.
+		bool movie_frame_active()
+		{
+			if (movie_mode() == 0)
+				return false;
+			return s_guest_movie_active.load(std::memory_order_relaxed) &&
+				s_guest_movie_decodes.load(std::memory_order_relaxed) - s_guest_movie_reset_decodes >= 7;
+		}
+
+		// dst_width/dst_height are the guest's own display size, NOT the merged texture's size: the
+		// merged texture carries the internal-resolution multiplier, and downloading it at 4x or 9x
+		// would multiply a per-frame GPU readback that is already the expensive part of this path.
+		// The crop is resolved into a native-sized target first, so the cost is independent of the
+		// upscale. 640x448 was hardcoded here for NTSC Rainbow Six 3; PAL movies are commonly 640x512
+		// and plenty of titles use 512x224 or 512x448.
 		void merged_frame_present(const void* merged_texture, int crop_left, int crop_top,
-			int crop_right, int crop_bottom, bool active)
+			int crop_right, int crop_bottom, int dst_width, int dst_height, bool active)
 		{
 			if (!active)
 			{
+				merged_frame_reset(true);
+				return;
+			}
+			// The guest owns these registers and can point them anywhere, including at nothing.
+			// 1280x1024 is past any real PS2 display mode, so beyond it this is a bad read rather
+			// than an exotic one -- and sizing an allocation from a bad read is how a guest register
+			// becomes an out-of-memory.
+			if (dst_width <= 0 || dst_height <= 0 || dst_width > 1280 || dst_height > 1024)
+			{
+				++s_movie_refused;
 				merged_frame_reset(true);
 				return;
 			}
@@ -3033,16 +3095,23 @@ namespace RemixSubmit
 				fail();
 				return;
 			}
+			// The download texture is cached across frames, so it has to be dropped when the guest
+			// changes display mode -- otherwise a movie that switches resolution reads back through a
+			// stale, wrongly sized staging buffer.
+			if (s_merged_frame_download && (s_merged_frame_download->GetWidth() != dst_width ||
+					s_merged_frame_download->GetHeight() != dst_height))
+				s_merged_frame_download.reset();
 			if (!s_merged_frame_download)
-				s_merged_frame_download = g_gs_device->CreateDownloadTexture(640, 448, GSTexture::Format::Color);
+				s_merged_frame_download = g_gs_device->CreateDownloadTexture(dst_width, dst_height, GSTexture::Format::Color);
 			GSTexture* const native = s_merged_frame_download ?
-				g_gs_device->CreateRenderTarget(640, 448, GSTexture::Format::Color, false) : nullptr;
+				g_gs_device->CreateRenderTarget(dst_width, dst_height, GSTexture::Format::Color, false) : nullptr;
 			if (!native)
 			{
+				++s_movie_refused;
 				fail();
 				return;
 			}
-			const GSVector4i rect(0, 0, 640, 448);
+			const GSVector4i rect(0, 0, dst_width, dst_height);
 			const GSVector4 source = GSVector4(GSVector4i(crop_left, crop_top, crop_right, crop_bottom)) /
 				GSVector4(texture->GetSize()).xyxy();
 			g_gs_device->StretchRect(texture, source, native, GSVector4(rect), ShaderConvert::COPY, Biln);
@@ -3051,23 +3120,26 @@ namespace RemixSubmit
 			s_merged_frame_download->Flush();
 			if (!s_merged_frame_download->Map(rect))
 			{
+				++s_movie_refused;
 				fail();
 				return;
 			}
 			const u8* pixels = s_merged_frame_download->GetMapPointer();
 			const u32 pitch = s_merged_frame_download->GetMapPitch();
-			if (!pixels || pitch < 640u * 4u)
+			const u32 row_bytes = static_cast<u32>(dst_width) * 4u;
+			if (!pixels || pitch < row_bytes)
 			{
 				s_merged_frame_download->Unmap();
+				++s_movie_refused;
 				fail();
 				return;
 			}
-			overlay_reset(640, 448);
-			for (u32 y = 0; y < 448; ++y)
+			overlay_reset(static_cast<u32>(dst_width), static_cast<u32>(dst_height));
+			for (u32 y = 0; y < static_cast<u32>(dst_height); ++y)
 			{
 				const u8* src = pixels + static_cast<size_t>(y) * pitch;
-				u8* dst = s_overlay.data() + static_cast<size_t>(y) * 640 * 4;
-				for (u32 x = 0; x < 640; ++x, src += 4, dst += 4)
+				u8* dst = s_overlay.data() + static_cast<size_t>(y) * row_bytes;
+				for (u32 x = 0; x < static_cast<u32>(dst_width); ++x, src += 4, dst += 4)
 				{
 					dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = 255;
 				}
@@ -3076,10 +3148,11 @@ namespace RemixSubmit
 			s_overlay_frame = s_frame_counter;
 			s_overlay_used = s_merged_frame_owned = true;
 			s_vision_background_frame = ~0ull;
+			++s_movie_frames;
 			static u32 reports = 0;
 			if ((reports++ % 300) == 0)
-				INFO_LOG("Remix: guest movie/menu/loading frame640x448 crop({},{})-({},{})",
-					crop_left, crop_top, crop_right, crop_bottom);
+				INFO_LOG("Remix: guest movie/menu/loading frame {}x{} crop({},{})-({},{})",
+					dst_width, dst_height, crop_left, crop_top, crop_right, crop_bottom);
 		}
 
 		void destroy_level_lights()
@@ -12378,14 +12451,18 @@ namespace RemixSubmit
 			INFO_LOG("Remix: overlay {}x{} | screen-ui seen {} nomat {} nondc {} | "
 					 "raster draws {} nopixels {} texels {} fullscreen {} | presents {} | "
 					 "DrawScreenOverlay {} | uiraster {} uimode {} | "
-					 "sprite3d {} draws {} | sprite skip: untex {} nomat {} blit {}",
+					 "sprite3d {} draws {} | sprite skip: untex {} nomat {} blit {} | "
+					 "movie {} active {} decodes {} presented {} refused {}",
 				s_overlay_w, s_overlay_h,
 				s_screen_ui_seen, s_screen_ui_nomat, s_screen_ui_nondc,
 				s_overlay_draws, s_overlay_nopixels, s_overlay_texels, s_overlay_fullscreen,
 				s_overlay_presents,
 				(s_remix.api().DrawScreenOverlay != nullptr) ? "available" : "NULL IN INTERFACE",
 				ui_raster_mode(), ui_mode(), sprite_geometry_mode(), s_sprite_geometry_draws,
-				s_sprite_skip_untex, s_sprite_skip_nomat, s_sprite_skip_blit);
+				s_sprite_skip_untex, s_sprite_skip_nomat, s_sprite_skip_blit,
+				movie_mode(), s_guest_movie_active.load(std::memory_order_relaxed) ? 1 : 0,
+				s_guest_movie_decodes.load(std::memory_order_relaxed) - s_guest_movie_reset_decodes,
+				s_movie_frames, s_movie_refused);
 
 			INFO_LOG("Remix: hold-empty {} | empty windows {} held {} cam-held {} skipped-present {} "
 					 "instances {} | "
@@ -16020,7 +16097,8 @@ namespace RemixSubmit
 		vision_reset();
 	}
 
-	void OnVSync(const void* merged_texture, int crop_left, int crop_top, int crop_right, int crop_bottom)
+	void OnVSync(const void* merged_texture, int crop_left, int crop_top, int crop_right, int crop_bottom,
+		int native_width, int native_height)
 	{
 		const bool trace_world_seen = s_camera_trace_world_seen;
 		s_camera_trace_world_seen = false;
@@ -16059,7 +16137,11 @@ namespace RemixSubmit
 		r6_view_camera trace_camera{};
 		const bool trace_ready = trace_requested && trace_world_seen && read_r6_view_camera(trace_camera);
 		RemixCameraTrace::SetRequested(trace_requested, trace_ready);
-		const bool merged_frame_active = rs3_merged_frame_active();
+		// Either the Rainbow Six 3 menu/loading route or the generic movie route. Both end in the
+		// same overlay and the same ownership flag, so the two must feed ONE boolean: native_sky and
+		// the vision pass each read it to stand down, and a parallel flag would leave them
+		// compositing over a frame the overlay already owns.
+		const bool merged_frame_active = rs3_merged_frame_active() || movie_frame_active();
 		if (!merged_frame_active)
 			merged_frame_reset(true);
 
@@ -16475,7 +16557,8 @@ namespace RemixSubmit
 
 			native_sky_present(merged_frame_active, hold_camera);
 			vision_end_frame(merged_frame_active);
-			merged_frame_present(merged_texture, crop_left, crop_top, crop_right, crop_bottom, merged_frame_active);
+			merged_frame_present(merged_texture, crop_left, crop_top, crop_right, crop_bottom,
+				native_width, native_height, merged_frame_active);
 
 			// The HUD, composited over the traced image. Submitted before Present so the runtime
 			// has it for this frame; the buffer is cleared at the top of the next one.

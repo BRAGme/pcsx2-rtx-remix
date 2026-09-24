@@ -220,6 +220,16 @@ namespace remix_ps2
 				"admits the guest sampling its own render target, which is usually a blit and not "
 				"content. Turn it off for a game whose HUD should stay a flat overlay.",
 				false},
+			{"MOVIE", "Geometry and Filtering", "Present FMVs as a screen overlay", knob_type::Boolean, 0, 0, 1, 1,
+				nullptr,
+				"Presents the emulator own merged output over the traced image while the guest is "
+				"playing a .PSS movie. Pre-rendered video must not be path traced -- it would be "
+				"denoised and temporally accumulated, which smears motion -- so this composites it "
+				"after tracing instead. It also catches the case where a game uploads the decoded "
+				"frame straight to the display buffer and issues no GS draw at all, which nothing "
+				"that inspects draws can ever see. FMVs will look like ordinary emulator output, "
+				"because that is what they are.",
+				false},
 			{"SPRITEBLIT", "Geometry and Filtering", "Sprites may span the screen", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr,
 				"Admits a sprite covering essentially the whole render target. Normally such a sprite "

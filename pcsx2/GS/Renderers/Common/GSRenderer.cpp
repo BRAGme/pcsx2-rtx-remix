@@ -661,7 +661,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		else
 			remix_current = nullptr;
 	}
-	RemixSubmit::OnVSync(remix_current, remix_crop.x, remix_crop.y, remix_crop.z, remix_crop.w);
+	RemixSubmit::OnVSync(remix_current, remix_crop.x, remix_crop.y, remix_crop.z, remix_crop.w,
+		m_real_size.x, m_real_size.y);
 #endif
 
 	// Skip presentation when running uncapped while vsync is on.

@@ -77,7 +77,11 @@ namespace RemixSubmit
 
 	// Frame boundary, from GSRenderer::VSync after Merge() and before the present block.
 	// Null on a blank/failed merge; crop is the renderer's exact visible merged source rectangle.
-	void OnVSync(const void* merged_texture, int crop_left, int crop_top, int crop_right, int crop_bottom);
+	// native_width/height are the guest OWN display size (GSRenderer::m_real_size), NOT the merged
+	// texture size -- the merged texture carries the internal upscale. The movie overlay resolves
+	// to the native size so a resolution multiplier does not multiply the per-frame readback cost.
+	void OnVSync(const void* merged_texture, int crop_left, int crop_top, int crop_right, int crop_bottom,
+		int native_width, int native_height);
 
 	// A save state was loaded: GS local memory, and with it the guest's entire world, has just
 	// been replaced in a single step. Called from the FreezeAction::Load branch of GSfreeze
