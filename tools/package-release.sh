@@ -48,7 +48,18 @@ cp -r -- "$BIN/translations" "$OUT/translations"
 find "$OUT" -type f -name '*.pdb' -delete
 
 # --- per-game Remix configs (tracked in git, measured settings) ----------
-for c in "$BIN"/[A-Z][A-Z][A-Z][A-Z]-[0-9][0-9][0-9][0-9][0-9].conf; do
+# TWO shapes, because a PS2 profile is not always a disc serial. A game is SLUS-20883; the
+# BIOS is its console serial, 20080220-175343, which is digits where a disc serial has
+# letters. The original glob matched only the disc shape, so bin/20080220-175343.conf -- the
+# profile that makes the BIOS menu render at all, by admitting the 64 sprite draws of 66 that
+# it is drawn from -- was silently dropped from every release. The BIOS work shipped without
+# the one file that switches it on.
+#
+# Kept as two explicit patterns rather than one loose *.conf: bin/ also holds rtx.conf,
+# user.conf and qt.conf, none of which may ship, and a glob that cannot tell them apart is how
+# a developer install leaks into a release.
+for c in "$BIN"/[A-Z][A-Z][A-Z][A-Z]-[0-9][0-9][0-9][0-9][0-9].conf \
+         "$BIN"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].conf; do
   [ -e "$c" ] && cp -- "$c" "$OUT/$(basename "$c")"
 done
 
