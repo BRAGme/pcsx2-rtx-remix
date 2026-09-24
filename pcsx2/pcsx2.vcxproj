@@ -204,6 +204,7 @@
     <ClCompile Include="DEV9\net.cpp" />
     <ClCompile Include="DEV9\Win32\tap-win32.cpp" />
     <ClCompile Include="GameList.cpp" />
+    <ClCompile Include="GameRichPresence.cpp" />
     <ClCompile Include="GS\GSDrawingEnvironment.cpp" />
     <ClCompile Include="GS\Remix\RemixMaterials.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
@@ -221,6 +222,12 @@
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="GS\Remix\RemixVU1Capture.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="GS\Remix\RemixSocomCamera.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="GS\Remix\RemixSocomLighting.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="GS\Remix\RemixVU1Slice.cpp">
@@ -675,6 +682,7 @@
     <ClInclude Include="DEV9\Win32\pcap_io_win32_funcs.h" />
     <ClInclude Include="DEV9\Win32\tap.h" />
     <ClInclude Include="GameList.h" />
+    <ClInclude Include="GameRichPresence.h" />
     <ClInclude Include="GS\GSVector4i_arm64.h" />
     <ClInclude Include="GS\GSVector4_arm64.h" />
     <ClInclude Include="GS\Remix\remix_c.h">
@@ -695,9 +703,15 @@
     <ClInclude Include="GS\Remix\RemixSubmit.h">
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
     </ClInclude>
-    <ClInclude Include="GS\Remix\RemixVU1Capture.h">
+      <ClInclude Include="GS\Remix\RemixVU1Capture.h">
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
-    </ClInclude>
+      </ClInclude>
+      <ClInclude Include="GS\Remix\RemixSocomCamera.h">
+        <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
+      </ClInclude>
+      <ClInclude Include="GS\Remix\RemixSocomLighting.h">
+        <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
+      </ClInclude>
     <ClInclude Include="GS\Remix\RemixVU1Slice.h">
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
     </ClInclude>

@@ -16,6 +16,7 @@
 #include "GSDumpReplayer.h"
 #include "GameDatabase.h"
 #include "GameList.h"
+#include "GameRichPresence.h"
 #include "Host.h"
 #include "INISettingsInterface.h"
 #include "ImGui/FullscreenUI.h"
@@ -1156,6 +1157,7 @@ void VMManager::UpdateDiscDetails(bool booting)
 	if (!GSDumpReplayer::IsReplayingDump())
 	{
 		Achievements::GameChanged(s_disc_crc, s_current_crc);
+		GameRichPresence::GameChanged(s_disc_serial, s_current_crc);
 		ReloadPINE();
 		UpdateDiscordPresence(s_state.load(std::memory_order_relaxed) == VMState::Initializing);
 		FileMcd_Reopen(memcardFilters.empty() ? s_disc_serial : memcardFilters);
@@ -1182,6 +1184,7 @@ void VMManager::HandleELFChange(bool verbose_patches_if_changed)
 
 	ReportGameChangeToHost();
 	Achievements::GameChanged(s_disc_crc, crc_to_report);
+	GameRichPresence::GameChanged(s_disc_serial, crc_to_report);
 
 	Console.WriteLn(Color_StrongOrange, fmt::format("ELF changed, active CRC {:08X} ({})", crc_to_report, s_elf_path));
 	Patch::ReloadPatches(s_disc_serial, crc_to_report, false, false, false, verbose_patches_if_changed);
@@ -1367,6 +1370,7 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 		ClearDiscDetails();
 
 		Achievements::GameChanged(0, 0);
+		GameRichPresence::GameChanged(std::string(), 0);
 		FullscreenUI::GameChanged(s_title, std::string(), s_disc_serial, 0, 0);
 		UpdateDiscordPresence(true);
 		Host::OnGameChanged(s_title, std::string(), std::string(), s_disc_serial, 0, 0);
@@ -1688,6 +1692,7 @@ void VMManager::Shutdown(bool save_resume_state)
 	}
 
 	Achievements::GameChanged(0, 0);
+	GameRichPresence::GameChanged(std::string(), 0);
 	FullscreenUI::GameChanged(s_title, std::string(), s_disc_serial, 0, 0);
 	UpdateDiscordPresence(true);
 	Host::OnGameChanged(s_title, std::string(), std::string(), s_disc_serial, 0, 0);
@@ -3823,6 +3828,23 @@ void VMManager::UpdateDiscordPresence(bool update_session_time)
 			rp.state = (state_string = StringUtil::Ellipsise(Achievements::GetRichPresenceString(), 128)).c_str();
 	}
 
+	// A game we have mapped says what mode and map is running, which is more
+	// than the title or RetroAchievements' own presence string gives. The mode
+	// joins the title on line one, the map and the players take line two.
+	std::string details_string;
+	if (GameRichPresence::HasPresence())
+	{
+		const std::string& mode = GameRichPresence::GetDetails();
+		if (!mode.empty())
+		{
+			details_string = rp_title.empty() ? mode : fmt::format("{} \xE2\x80\xA2 {}", rp_title, mode);
+			rp.details = (details_string = StringUtil::Ellipsise(details_string, 128)).c_str();
+		}
+
+		if (const std::string& state = GameRichPresence::GetState(); !state.empty())
+			rp.state = (state_string = StringUtil::Ellipsise(state, 128)).c_str();
+	}
+
 	Discord_UpdatePresence(&rp);
 	Discord_RunCallbacks();
 }
@@ -3831,6 +3853,11 @@ void VMManager::PollDiscordPresence()
 {
 	if (!s_discord_presence_active)
 		return;
+
+	// Only pushes when the mode, map or player setup actually changed, and no
+	// faster than Discord's IPC will take it.
+	if (GameRichPresence::Poll())
+		UpdateDiscordPresence(false);
 
 	Discord_RunCallbacks();
 }

@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/Remix/RemixSubmit.h"
+#include "GS/Remix/RemixCameraTrace.h"
 #include "GS/Remix/RemixMaterials.h"
 #include "GS/Remix/RemixPaths.h"
 #include "GS/Remix/RemixRuntime.h"
 #include "GS/Remix/RemixTransforms.h"
 #include "GS/Remix/RemixVU1Capture.h"
+#include "GS/Remix/RemixSocomCamera.h"
+#include "GS/Remix/RemixSocomLighting.h"
 
 #include "MemoryTypes.h"
+#include "VMManager.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
 
 #include "Config.h"
@@ -21,12 +25,14 @@
 #include "fmt/format.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -342,6 +348,9 @@ namespace RemixSubmit
 			int width = 0;
 			int height = 0;
 			u32 weight = 0; // vertex count of the draw that supplied it
+			u64 target = 0;
+			u64 target_frame = ~0ull;
+			u32 zbp = 0;
 		};
 
 		struct world_camera
@@ -359,6 +368,7 @@ namespace RemixSubmit
 			// visible rather than implied.
 			float depth_scale = 0.f;
 			float depth_anisotropy = 0.f;
+			bool socom_raster = false;
 		};
 
 		remix_ps2::runtime s_remix;
@@ -396,6 +406,7 @@ namespace RemixSubmit
 		// is distinct from generation 0 and keeps the first frame from flushing an empty cache.
 		u64 s_knob_generation_seen = ~0ull;
 		u64 s_submitted_this_frame = 0;
+		bool s_camera_trace_world_seen = false;
 		u64 s_drawdump_frames_left = 0;
 		u64 s_drawdump_skipped = 0; // qualifying frames passed over while DRAWDUMPAFTER counts down
 		bool s_drawdump_started = false;
@@ -413,10 +424,18 @@ namespace RemixSubmit
 		// Mesh hashes already submitted this frame, cleared at each VSync. See the dedupe gate.
 		std::unordered_set<u64> s_frame_submitted_hashes;
 
-		// The same, with the material contribution removed: "these triangles in this place",
-		// whatever texture is bound. A second hit here that was NOT a dedupe hit is a multitexture
-		// pass. Diagnostic only; see stat_counters::multipass_overlay.
+		// Submitted positions and indices, independent of material, UVs and vertex colour.
 		std::unordered_set<u64> s_frame_geometry_hashes;
+
+		// The immediately preceding accepted opaque draw, for a coincident additive pass.
+		bool s_overlay_base_valid = false;
+		u64 s_overlay_base_frame = ~0ull;
+		u64 s_overlay_base_target = 0;
+		u64 s_overlay_base_test = 0;
+		u64 s_overlay_base_zbuf = 0;
+		u64 s_overlay_base_scissor = 0;
+		std::vector<remixapi_HardcodedVertex> s_overlay_base_vertices;
+		std::vector<u32> s_overlay_base_indices;
 
 		// Distinct mesh *keys* instanced this frame. Under stable identity the dedupe set above
 		// also carries a quantized centroid, so two instances of one object appear twice in it
@@ -444,6 +463,7 @@ namespace RemixSubmit
 		{
 			u64 material_hash = 0;
 			remixapi_MaterialHandle material = nullptr;
+			bool partition_material = false;
 			std::vector<remixapi_HardcodedVertex> vertices;
 			std::vector<u32> indices;
 		};
@@ -478,6 +498,8 @@ namespace RemixSubmit
 		{
 			remixapi_MeshHandle handle = nullptr;
 			u64 created_frame = 0;
+			u64 mesh_hash = 0;
+			std::vector<u8> payload;
 		};
 
 		std::vector<batch_mesh> s_batch_meshes;
@@ -487,7 +509,10 @@ namespace RemixSubmit
 		// static geometry holding its world position to 1.4 units while the player turns. Recreating
 		// it hands Remix a new mesh handle every frame, so nothing has a stable identity, the denoiser
 		// gets no temporal history, and the texture-categorisation UI has nothing to hover.
-		std::unordered_map<u64, batch_mesh> s_batch_mesh_cache;
+		std::unordered_multimap<u64, batch_mesh> s_batch_mesh_cache;
+		constexpr size_t s_batch_payload_budget = 64 * 1024 * 1024;
+		size_t s_batch_payload_bytes = 0;
+		std::vector<u8> s_batch_payload_scratch;
 		u64 s_batch_reused = 0;
 		std::vector<remixapi_MeshInfoSurfaceTriangles> s_batch_surface_scratch;
 
@@ -557,6 +582,8 @@ namespace RemixSubmit
 
 		// Reused across draws to keep the hot path allocation free.
 		std::vector<remixapi_HardcodedVertex> s_scratch_vertices;
+		std::vector<remixapi_HardcodedVertex> s_flat_normal_vertices;
+		std::vector<u8> s_scratch_referenced;
 		std::vector<u32> s_scratch_indices;
 		// NDC x/y per scratch vertex, kept for the 2D overlay rasteriser.
 		std::vector<float> s_scratch_ndc;
@@ -690,7 +717,8 @@ namespace RemixSubmit
 		int light_mode()
 		{
 			static live_int value(L"PCSX2_REMIX_LIGHTMODE", 1, 0, 2);
-			return value.get();
+			const int mode = value.get();
+			return mode == 2 && remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()) ? 1 : mode;
 		}
 
 		// PCSX2_REMIX_WORLDROT -- the world-anchor correction.
@@ -783,6 +811,9 @@ namespace RemixSubmit
 		u64 s_overlay_presents = 0;   // frames handed to DrawScreenOverlay
 		u64 s_overlay_fullscreen = 0; // sprites refused as full-target blits, not UI
 		u64 s_sprite_geometry_draws = 0; // sprite draws submitted as geometry under SPRITE3D
+		u64 s_sprite_skip_untex = 0;     // ... refused: untextured and the mode does not take them
+		u64 s_sprite_skip_nomat = 0;     // ... refused: textured, but the material did not bind
+		u64 s_sprite_skip_blit = 0;      // ... refused: spans the whole target (see SPRITEBLIT)
 		u64 s_screen_ui_seen = 0;     // draws classified as screen UI
 		u64 s_screen_ui_nomat = 0;    // ... dropped: no material bound
 		u64 s_screen_ui_nondc = 0;    // ... dropped: no NDC captured
@@ -792,6 +823,18 @@ namespace RemixSubmit
 		// on the first UI draw OF A FRAME. A frame with no UI draws then keeps the previous
 		// content and is presented again, which is exactly what the geometry path already does.
 		u64 s_overlay_frame = ~0ull;
+		u64 s_socom_hud_frame = ~0ull;
+		u64 s_socom_hud_target = 0;
+		std::vector<u32> s_socom_hud_depth;
+		struct socom_hud_vertex { float q; u32 z; };
+		std::vector<socom_hud_vertex> s_socom_hud_vertices;
+		void socom_hud_reset()
+		{
+			s_socom_hud_frame = ~0ull;
+			s_frame_viewport.target_frame = ~0ull;
+			s_socom_hud_depth.clear();
+			s_socom_hud_vertices.clear();
+		}
 
 		int ui_raster_mode()
 		{
@@ -812,9 +855,26 @@ namespace RemixSubmit
 		//   1 = expand each sprite into a quad and run it through the normal geometry path
 		//
 		// Takes precedence over the overlay for sprite draws, so it does not need UIRASTER off.
+		//   0 = off: sprites are overlay candidates only (shipped behaviour)
+		//   1 = textured sprites whose material bound
+		//   2 = ... plus UNTEXTURED sprites (white material, the guest's vertex colour). The PS2
+		//       paints flat panels and gradients this way -- the BIOS menu background is one.
+		//   3 = ... plus sprites whose texture did NOT bind, i.e. the guest sampling its own
+		//       render target. Those are framebuffer blits; admitting them is a diagnostic.
 		int sprite_geometry_mode()
 		{
-			static live_int value(L"PCSX2_REMIX_SPRITE3D", 0, 0, 1);
+			static live_int value(L"PCSX2_REMIX_SPRITE3D", 0, 0, 3);
+			return value.get();
+		}
+
+		// Whether a sprite spanning essentially the whole target is admitted. It is normally a
+		// background or framebuffer blit rather than content, and for the OVERLAY that was always
+		// the right call -- it repainted itself over the glyphs it existed to composite. As
+		// geometry the answer is less obvious: on a 2D screen the full-target quad may BE the
+		// backdrop.
+		int sprite_blit_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_SPRITEBLIT", 0, 0, 1);
 			return value.get();
 		}
 
@@ -839,11 +899,694 @@ namespace RemixSubmit
 
 		// Rasterise the current scratch draw (positions in s_scratch_ndc, UVs and colour in
 		// s_scratch_vertices, triangles in s_scratch_indices) into the overlay.
-		void overlay_raster(u64 content_hash)
+		enum class overlay_blend_mode
+		{
+			SourceOver,
+			DestinationMultiply,
+			Additive,
+		};
+
+		struct overlay_raster_options
+		{
+			overlay_blend_mode blend = overlay_blend_mode::SourceOver;
+			bool untextured = false;
+			bool texture_alpha = true;
+			bool gs_modulation = false;
+			bool native_sampler = false;
+			bool socom_hud = false;
+			bool perspective_texture = false;
+			bool depth_write = false;
+			u32 depth_test = ZTST_ALWAYS;
+			u32 depth_mask = 0xFFFFFFFFu;
+			u32 texture_width = 0;
+			u32 texture_height = 0;
+			int texture_origin_x = 0;
+			int texture_origin_y = 0;
+			GIFRegCLAMP clamp{};
+			GIFRegSCISSOR scissor{};
+		};
+
+		overlay_raster_options overlay_native_options(const GSDrawingContext& context,
+			const GSTextureCache::Source* source)
+		{
+			overlay_raster_options options;
+			options.texture_alpha = context.TEX0.TCC != 0;
+			options.native_sampler = true;
+			options.texture_width = 1u << context.TEX0.TW;
+			options.texture_height = 1u << context.TEX0.TH;
+			options.clamp = context.CLAMP;
+			options.scissor = context.SCISSOR;
+			if (source)
+			{
+				const GSVector4i rect = source->m_region.GetRect(
+					1 << source->m_TEX0.TW, 1 << source->m_TEX0.TH);
+				options.texture_origin_x = rect.left;
+				options.texture_origin_y = rect.top;
+			}
+			return options;
+		}
+
+		int overlay_sample_coordinate(int coordinate, int size, u32 mode, u32 minimum, u32 maximum)
+		{
+			switch (mode)
+			{
+				case 1:
+					return std::clamp(coordinate, 0, size - 1);
+				case 2:
+					return std::clamp(coordinate, static_cast<int>(minimum), static_cast<int>(maximum));
+				case 3:
+					return (coordinate & static_cast<int>(minimum)) | static_cast<int>(maximum);
+				default:
+					coordinate %= size;
+					return coordinate < 0 ? coordinate + size : coordinate;
+			}
+		}
+
+		void overlay_source_over(u8* destination, const u32* source, u32 alpha)
+		{
+			for (u32 k = 0; k < 3; ++k)
+				destination[k] = static_cast<u8>(
+					((source[k] * alpha) + (static_cast<u32>(destination[k]) * (255u - alpha))) / 255u);
+			destination[3] = static_cast<u8>(alpha +
+				(static_cast<u32>(destination[3]) * (255u - alpha)) / 255u);
+		}
+
+		bool overlay_apply_texel(u8* destination, const u8* texel, u32 vertex_color,
+			const overlay_raster_options& options)
+		{
+			const u32 vertex_alpha = (vertex_color >> 24) & 255u;
+			const u32 alpha = options.texture_alpha ?
+				(static_cast<u32>(texel[3]) * vertex_alpha) / 255u : vertex_alpha;
+			u32 color[3]{};
+			if (options.blend == overlay_blend_mode::DestinationMultiply)
+			{
+				if (alpha == 255u)
+					return false;
+				overlay_source_over(destination, color, 255u - alpha);
+				return true;
+			}
+			for (u32 k = 0; k < 3; ++k)
+			{
+				const u32 channel = (vertex_color >> (k * 8)) & 255u;
+				color[k] = options.untextured ? channel :
+					std::min(255u, (static_cast<u32>(texel[k]) * channel) /
+						(options.gs_modulation ? 128u : 255u));
+			}
+			if (options.blend == overlay_blend_mode::Additive)
+			{
+				if ((color[0] | color[1] | color[2]) == 0)
+					return false;
+				for (u32 k = 0; k < 3; ++k)
+					destination[k] = static_cast<u8>(std::min(255u,
+						static_cast<u32>(destination[k]) +
+						(options.socom_hud ? color[k] * alpha / 255u : color[k])));
+				// The optional premultiplied compositor retains additive RGB at zero alpha.
+				// Preserve the legacy encoding when the installed runtime lacks that capability.
+				if (!options.socom_hud || !s_remix.premultiplied_overlay_available())
+					destination[3] = std::max(destination[3],
+						std::max(destination[0], std::max(destination[1], destination[2])));
+				return true;
+			}
+			if (alpha == 0)
+				return false;
+			overlay_source_over(destination, color, alpha);
+			return true;
+		}
+
+		const u8* overlay_straight_pixels()
+		{
+			static std::vector<u8> pixels;
+			pixels.resize(s_overlay.size());
+			for (size_t i = 0; i + 3 < s_overlay.size(); i += 4)
+			{
+				const u32 alpha = s_overlay[i + 3];
+				for (u32 k = 0; k < 3; ++k)
+					pixels[i + k] = alpha ? static_cast<u8>(std::min(255u,
+						(static_cast<u32>(s_overlay[i + k]) * 255u + alpha / 2u) / alpha)) : 0;
+				pixels[i + 3] = static_cast<u8>(alpha);
+			}
+			return pixels.data();
+		}
+		bool overlay_display_extent(const GSRendererHW& r, int& width, int& height)
+		{
+			width = 0;
+			height = 0;
+			// Render targets may include padding beyond the guest display's last pixel.
+			for (int i = 0; i < 2; ++i)
+			{
+				if (i == 0 ? r.m_regs->PMODE.EN1 : r.m_regs->PMODE.EN2)
+				{
+					const auto& display = r.m_regs->DISP[i].DISPLAY;
+					const auto& framebuffer = r.m_regs->DISP[i].DISPFB;
+					int read_height = (display.DH + 1) / (display.MAGV + 1);
+					if (r.m_regs->SMODE2.INT && r.m_regs->SMODE2.FFMD)
+						read_height = (read_height + 1) / 2;
+					width = std::max(width, (int)framebuffer.DBX + (int)(display.DW + 1) / (int)(display.MAGH + 1));
+					height = std::max(height, (int)framebuffer.DBY + read_height);
+				}
+			}
+			return width > 0 && height > 0;
+		}
+
+		void rs3_native_viewport(const GSRendererHW& r, u32 fbw, int& width, int& height)
+		{
+			int display_width, display_height;
+			if (remix_ps2::paths::game_id() == "SLUS-20883" && fbw == 10 &&
+				overlay_display_extent(r, display_width, display_height) &&
+				display_width == 640 && display_height == 448 && width >= 640 && height >= 448)
+			{
+				width = display_width;
+				height = display_height;
+			}
+		}
+
+		bool overlay_begin_draw(const GSRendererHW& r, int rt_width, int rt_height)
+		{
+			int width = rt_width, height = rt_height;
+			if (remix_ps2::paths::game_id() == "SLUS-20883")
+			{
+				int display_width, display_height;
+				if (overlay_display_extent(r, display_width, display_height))
+				{
+					width = display_width;
+					height = display_height;
+				}
+			}
+			if (width <= 0 || height <= 0)
+				return false;
+
+			if (s_overlay_w != (u32)width || s_overlay_h != (u32)height)
+			{
+				overlay_reset((u32)width, (u32)height);
+				s_overlay_frame = ~0ull;
+			}
+			if (s_overlay_frame != s_frame_counter)
+			{
+				s_overlay_frame = s_frame_counter;
+				std::fill(s_overlay.begin(), s_overlay.end(), (u8)0);
+				s_overlay_used = false;
+			}
+			return true;
+		}
+
+		void overlay_ndc_from_gs(u16 raw_x, u16 raw_y, u16 ofx, u16 ofy, float& ndc_x, float& ndc_y)
+		{
+			const float sx = 2.f / ((float)s_overlay_w * 16.f);
+			const float sy = 2.f / ((float)s_overlay_h * 16.f);
+			ndc_x = ((float)raw_x - (float)ofx - 0.05f) * sx + 1.f / (float)s_overlay_w - 1.f;
+			ndc_y = -(((float)raw_y - (float)ofy - 0.05f) * sy + 1.f / (float)s_overlay_h - 1.f);
+		}
+
+		void overlay_rebase_ndc(int rt_width, int rt_height)
+		{
+			if ((u32)rt_width == s_overlay_w && (u32)rt_height == s_overlay_h)
+				return;
+			for (size_t i = 0; i + 1 < s_scratch_ndc.size(); i += 2)
+			{
+				s_scratch_ndc[i] = (s_scratch_ndc[i] + 1.f) * (float)rt_width / (float)s_overlay_w - 1.f;
+				s_scratch_ndc[i + 1] = 1.f - (1.f - s_scratch_ndc[i + 1]) * (float)rt_height / (float)s_overlay_h;
+			}
+		}
+
+		enum class rs3_vision_kind { None, Night, Thermal };
+		struct rs3_vision_draw
+		{
+			u32 prim = 0, tme = 0, abe = 0, fst = 0, fb = 0, fbw = 0, fpsm = 0, mask = 0;
+			u32 tbp = 0, tbw = 0, psm = 0, tw = 0, th = 0, tcc = 0, tfx = 0;
+			u64 alpha = 0;
+			bool effect_test = false, hud = false, source_rt = false, unit_color = false, red_clear = false, scope_indices = false;
+			u32 zmsk = 0, min_z = 0, max_z = 0, clamp_u = 0, clamp_v = 0;
+			float min_x = 0, min_y = 0, max_x = 0, max_y = 0, min_u = 0, min_v = 0, max_u = 0, max_v = 0;
+			u32 scissor_w = 0, scissor_h = 0;
+		};
+		struct rs3_vision_sequence
+		{
+			u64 frame = ~0ull;
+			u32 night = 0, thermal = 0, main_bp = 0, auxiliary_bp = 0;
+			rs3_vision_kind pending = rs3_vision_kind::None;
+		};
+		rs3_vision_sequence s_vision_sequence;
+
+		bool vision_extent(const rs3_vision_draw& d, float width, float height)
+		{
+			return std::abs(d.min_x) < 0.1f && std::abs(d.min_y) < 0.1f &&
+				std::abs(d.max_x - width) < 0.1f && std::abs(d.max_y - height) < 0.1f;
+		}
+
+		bool vision_scope_boundary(const rs3_vision_draw& d)
+		{
+			// The completed goggle postprocess precedes scope masking, then HUD, in the ADS captures.
+			// Exact saturated-depth scope fans are boundaries only after a complete effect sequence.
+			return d.scope_indices && d.prim == GS_TRIANGLEFAN && d.fst && d.tme && d.abe && d.effect_test &&
+				d.fbw == 10 && d.fpsm == PSMCT32 && !d.mask && !d.zmsk &&
+				d.min_z == 0xFFFFu && d.max_z == 0xFFFFu &&
+				d.tfx == TFX_MODULATE && d.tcc && d.tw == 8 && d.th == 7 && d.tbw == 4 &&
+				(d.psm == PSMT8 || d.psm == PSMT4) && d.clamp_u == 3 && d.clamp_v == 3 &&
+				d.alpha == 0x0000008000000089ull && d.scissor_w == 640 && d.scissor_h == 448 &&
+				std::abs(d.min_y) < 0.1f && std::abs(d.max_y - 448.f) < 0.1f;
+		}
+
+		rs3_vision_kind vision_observe(rs3_vision_sequence& s, const rs3_vision_draw& d, u64 frame)
+		{
+			if (s.frame != frame)
+			{
+				s = rs3_vision_sequence{};
+				s.frame = frame;
+			}
+			if (s.pending != rs3_vision_kind::None)
+			{
+				const rs3_vision_kind kind = s.pending;
+				s.pending = rs3_vision_kind::None;
+				return (d.hud || vision_scope_boundary(d)) && d.fb == s.main_bp && d.fbw == 10 && d.fpsm == 0 ? kind : rs3_vision_kind::None;
+			}
+			const bool sprite = d.prim == 6 && d.fst && d.tme && d.effect_test;
+			const bool texture32 = sprite && d.psm == 0 && d.tw == 10 && d.th == 9 &&
+				d.tbw == 10 && d.unit_color && d.clamp_u == 1 && d.clamp_v == 1;
+			const bool source32 = texture32 && d.source_rt;
+			const bool full = vision_extent(d, 640.f, 448.f) && d.scissor_w == 640 && d.scissor_h == 448;
+			const bool square = vision_extent(d, 256.f, 256.f) && d.scissor_w == 256 && d.scissor_h == 256;
+			const bool green = source32 && full && d.fb == s.main_bp && d.tbp == s.auxiliary_bp &&
+				d.fbw == 10 && d.fpsm == 0 && d.mask == 0xFFFF00FFu && d.abe && d.zmsk &&
+				d.alpha == 0x000000F000000068ull && !d.tcc && d.tfx == 0;
+			// Cd * FIX reads only the destination; the GS renderer omits its unused texture source.
+			const bool blue = texture32 && full && d.fb == s.main_bp && d.tbp == s.auxiliary_bp &&
+				d.fbw == 10 && d.fpsm == 0 && d.mask == 0xFF00FF00u && d.abe && d.zmsk &&
+				d.alpha == 0x00000040000000A9ull && !d.tcc && d.tfx == 0;
+			const bool noise = sprite && full && d.fb == s.main_bp && d.fbw == 10 && d.fpsm == 0 &&
+				!d.mask && d.psm == 0x13 && d.tw == 8 && d.th == 8 && d.tbw == 4 && d.tcc &&
+				d.tfx == 0 && d.unit_color && d.abe && !d.zmsk && d.min_z == 65535 && d.max_z == 65535 &&
+				d.alpha == 0x0000008000000089ull && d.clamp_u == 0 && d.clamp_v == 0 &&
+				std::abs(d.max_u - d.min_u - 384.f) < 0.1f && std::abs(d.max_v - d.min_v - 384.f) < 0.1f;
+			if (s.night == 1 && d.red_clear && d.fb == s.main_bp && d.fbw == 10 && full &&
+				d.mask == 0xFFFFFF00u && d.effect_test && d.zmsk)
+				return rs3_vision_kind::None;
+			// Constant red clears may be handled before DrawPrims by TryTargetClear.
+			if ((s.night == 1 || s.night == 2) && green)
+			{
+				s.night = 2;
+				return rs3_vision_kind::None;
+			}
+			if (s.night == 2 && blue)
+			{
+				s.night = 3;
+				return rs3_vision_kind::None;
+			}
+			if (s.night == 3 && noise)
+			{
+				s.night = 0;
+				s.pending = rs3_vision_kind::Night;
+				return rs3_vision_kind::None;
+			}
+			const bool blur_square = d.min_x >= -3.f && d.min_x <= 3.f && d.min_y >= -3.f && d.min_y <= 3.f &&
+				d.max_x >= 253.f && d.max_x <= 259.f && d.max_y >= 253.f && d.max_y <= 259.f &&
+				d.scissor_w == 256 && d.scissor_h == 256;
+			const bool blur = source32 && blur_square && d.fb == s.auxiliary_bp && d.tbp == s.main_bp &&
+				d.fbw == 4 && d.fpsm == 0 && !d.mask && d.abe && d.zmsk &&
+				d.alpha == 0x0000002000000064ull && !d.tcc && d.tfx == 1;
+			if ((s.thermal == 1 || s.thermal == 2) && blur)
+			{
+				s.thermal = 2;
+				return rs3_vision_kind::None;
+			}
+			const bool upsample = sprite && d.source_rt && full && d.fb == s.main_bp &&
+				d.tbp == s.auxiliary_bp && d.fbw == 10 && d.fpsm == 0 && !d.mask && (!d.abe || d.alpha == 0) && d.zmsk &&
+				d.psm == 0 && d.tw == 9 && d.th == 8 && d.tbw == 4 && d.tcc && d.tfx == 1 && d.unit_color &&
+				d.clamp_u == 1 && d.clamp_v == 1 && std::abs(d.min_u - 0.5f) < 0.1f &&
+				std::abs(d.max_u - 256.5f) < 0.1f && std::abs(d.min_v - 0.5f) < 0.1f &&
+				std::abs(d.max_v - 256.5f) < 0.1f;
+			if (s.thermal == 2 && upsample)
+			{
+				s.thermal = 3;
+				return rs3_vision_kind::None;
+			}
+			if (s.thermal == 3 && noise)
+			{
+				s.thermal = 0;
+				s.pending = rs3_vision_kind::Thermal;
+				return rs3_vision_kind::None;
+			}
+			s.night = s.thermal = 0;
+			if (source32 && (!d.abe || d.alpha == 0) && !d.tcc && d.tfx == 1 && !d.mask && d.zmsk &&
+				d.fpsm == 0 && d.fb != d.tbp && d.min_z == 0 && d.max_z == 0)
+			{
+				if (full && d.fbw == 10)
+					s.night = 1;
+				else if (square && d.fbw == 4)
+					s.thermal = 1;
+				if (s.night || s.thermal)
+				{
+					s.main_bp = d.tbp;
+					s.auxiliary_bp = d.fb;
+				}
+			}
+			return rs3_vision_kind::None;
+		}
+
+		std::unique_ptr<GSDownloadTexture> s_vision_download;
+		u64 s_vision_attempt_frame = ~0ull, s_vision_background_frame = ~0ull, s_vision_draw_frame = ~0ull;
+
+
+		int rtx_vision_mode()
+		{
+			static live_int value(L"PCSX2_REMIX_RTXVISION", 0, 0, 2);
+			return value.get();
+		}
+
+		bool rtx_vision_enabled()
+		{
+			return ui_mode() != 0 && ui_raster_mode() != 0 && sprite_geometry_mode() == 0 &&
+				remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3;
+		}
+
+		u32 rtx_vision_request(rs3_vision_kind kind)
+		{
+			if (!rtx_vision_enabled())
+				return 0;
+			if (kind == rs3_vision_kind::Night && rtx_vision_mode() >= 1)
+				return 1;
+			if (kind == rs3_vision_kind::Thermal && rtx_vision_mode() == 2)
+				return 2;
+			return 0;
+		}
+
+		u64 s_rtx_vision_frame = ~0ull;
+		rs3_vision_kind s_rtx_vision_kind = rs3_vision_kind::None;
+		rs3_vision_kind s_rtx_vision_held_kind = rs3_vision_kind::None;
+		std::vector<u8> s_guest_thermal_frame;
+		u64 s_guest_thermal_upload_frame = ~0ull;
+
+		void rtx_vision_reset()
+		{
+			if (s_remix.guest_vision_available())
+				s_remix.set_guest_vision(0);
+			s_rtx_vision_frame = ~0ull;
+			s_rtx_vision_kind = s_rtx_vision_held_kind = rs3_vision_kind::None;
+			s_guest_thermal_frame.clear();
+			s_guest_thermal_upload_frame = ~0ull;
+		}
+
+		void vision_reset()
+		{
+			rtx_vision_reset();
+			if (s_vision_background_frame != ~0ull)
+			{
+				overlay_reset(s_overlay_w, s_overlay_h);
+				s_overlay_frame = ~0ull;
+			}
+			s_vision_sequence = rs3_vision_sequence{};
+			s_vision_download.reset();
+			s_vision_attempt_frame = s_vision_background_frame = s_vision_draw_frame = ~0ull;
+		}
+
+		rs3_vision_draw vision_draw_info(const GIFRegPRIM& prim, const GSDrawingContext& ctx,
+			const GSVertex* vertices, u32 count, const u16* indices, u32 index_count, bool source_rt, u32 scanmask)
+		{
+			rs3_vision_draw d;
+			d.prim = prim.PRIM; d.tme = prim.TME; d.abe = prim.ABE; d.fst = prim.FST;
+			d.fb = ctx.FRAME.Block(); d.fbw = ctx.FRAME.FBW; d.fpsm = ctx.FRAME.PSM; d.mask = ctx.FRAME.FBMSK;
+			d.tbp = ctx.TEX0.TBP0; d.tbw = ctx.TEX0.TBW; d.psm = ctx.TEX0.PSM;
+			d.tw = ctx.TEX0.TW; d.th = ctx.TEX0.TH; d.tcc = ctx.TEX0.TCC; d.tfx = ctx.TEX0.TFX;
+			d.alpha = ctx.ALPHA.U64; d.zmsk = ctx.ZBUF.ZMSK; d.source_rt = source_rt;
+			d.clamp_u = ctx.CLAMP.WMS; d.clamp_v = ctx.CLAMP.WMT;
+			d.scissor_w = ctx.SCISSOR.SCAX1 - ctx.SCISSOR.SCAX0 + 1;
+			d.scissor_h = ctx.SCISSOR.SCAY1 - ctx.SCISSOR.SCAY0 + 1;
+			d.effect_test = ctx.TEST.ZTE && ctx.TEST.ZTST == ZTST_ALWAYS && !ctx.TEST.ATE && !ctx.TEST.DATE &&
+				!scanmask && !ctx.SCISSOR.SCAX0 && !ctx.SCISSOR.SCAY0;
+			if (!count || !index_count)
+				return d;
+			d.min_x = d.min_y = d.min_u = d.min_v = std::numeric_limits<float>::max();
+			d.max_x = d.max_y = d.max_u = d.max_v = -std::numeric_limits<float>::max();
+			d.min_z = 0xFFFFFFFFu;
+			d.unit_color = d.red_clear = true;
+			for (u32 i = 0; i < index_count; ++i)
+			{
+				if (indices[i] >= count)
+					return rs3_vision_draw{};
+				const auto& v = vertices[indices[i]];
+				const float x = ((float)v.XYZ.X - (float)ctx.XYOFFSET.OFX) / 16.f;
+				const float y = ((float)v.XYZ.Y - (float)ctx.XYOFFSET.OFY) / 16.f;
+				const float u = (float)v.U / 16.f, t = (float)v.V / 16.f;
+				d.min_x = std::min(d.min_x, x); d.max_x = std::max(d.max_x, x);
+				d.min_y = std::min(d.min_y, y); d.max_y = std::max(d.max_y, y);
+				d.min_u = std::min(d.min_u, u); d.max_u = std::max(d.max_u, u);
+				d.min_v = std::min(d.min_v, t); d.max_v = std::max(d.max_v, t);
+				d.min_z = std::min(d.min_z, v.XYZ.Z); d.max_z = std::max(d.max_z, v.XYZ.Z);
+				d.unit_color = d.unit_color && v.RGBAQ.R == 128 && v.RGBAQ.G == 128 && v.RGBAQ.B == 128 && v.RGBAQ.A == 128;
+				d.red_clear = d.red_clear && !prim.TME && !prim.ABE && v.RGBAQ.R == 0 &&
+					v.RGBAQ.G == 0 && v.RGBAQ.B == 0 && v.RGBAQ.A == 128;
+			}
+			const bool half_scope = count == 4 &&
+				((std::abs(d.min_x) < 0.1f && std::abs(d.max_x - 320.f) < 0.1f) ||
+				 (std::abs(d.min_x - 320.f) < 0.1f && std::abs(d.max_x - 640.f) < 0.1f));
+			const bool paired_scope = count == 8 && std::abs(d.min_x) < 0.1f && std::abs(d.max_x - 640.f) < 0.1f;
+			d.scope_indices = ctx.ZBUF.PSM == PSMZ16S && (half_scope || paired_scope) && index_count == (count / 4) * 6;
+			if (d.scope_indices)
+			{
+				constexpr u32 fan_indices[] = {0, 1, 2, 0, 2, 3};
+				for (u32 quad = 0; quad < count / 4; ++quad)
+					for (u32 index = 0; index < 6; ++index)
+						d.scope_indices = d.scope_indices && indices[quad * 6 + index] == quad * 4 + fan_indices[index];
+			}
+			d.hud = prim.TME && prim.FST && ctx.TEST.ZTE && ctx.TEST.ZTST == ZTST_GEQUAL &&
+				ctx.ZBUF.ZMSK && d.min_z == d.max_z && d.min_z >=
+				(0xFFFFFFFFu >> (GSLocalMemory::m_psm[ctx.ZBUF.PSM].fmt * 8));
+			return d;
+		}
+
+		bool vision_readback(const GSTextureCache::Target* rt, u32 block, std::vector<u8>* thermal_frame = nullptr)
+		{
+			const GSVector4i rect(0, 0, 640, 448);
+			if (!rt || !rt->m_texture || !g_gs_device || rt->m_texture->GetFormat() != GSTexture::Format::Color ||
+				rt->m_TEX0.TBP0 != block || rt->m_TEX0.TBW != 10 ||
+				rt->m_TEX0.PSM != PSMCT32 || rt->GetUnscaledWidth() < 640 || rt->GetUnscaledHeight() < 448 ||
+				!rt->m_valid_rgb || !rt->m_valid.rintersect(rect).eq(rect) || !rt->m_dirty.empty() ||
+				!std::isfinite(rt->m_scale) || rt->m_scale <= 0.f)
+				return false;
+			if (!s_vision_download)
+				s_vision_download = g_gs_device->CreateDownloadTexture(640, 448, GSTexture::Format::Color);
+			if (!s_vision_download)
+				return false;
+			if (rt->m_scale == 1.f)
+			{
+				s_vision_download->CopyFromTexture(rect, rt->m_texture, rect, 0, true);
+			}
+			else
+			{
+				GSTexture* native = g_gs_device->CreateRenderTarget(640, 448, GSTexture::Format::Color, false);
+				if (!native)
+					return false;
+				const GSVector4 source = GSVector4(rect) * GSVector4(rt->m_scale) / GSVector4(rt->m_texture->GetSize()).xyxy();
+				g_gs_device->StretchRect(rt->m_texture, source, native, GSVector4(rect), ShaderConvert::COPY, Nearest);
+				s_vision_download->CopyFromTexture(rect, native, rect, 0, true);
+				g_gs_device->Recycle(native);
+			}
+			s_vision_download->Flush();
+			if (!s_vision_download->Map(rect))
+				return false;
+			const u8* pixels = s_vision_download->GetMapPointer();
+			const u32 pitch = s_vision_download->GetMapPitch();
+			if (!pixels || pitch < 640 * 4)
+			{
+				s_vision_download->Unmap();
+				return false;
+			}
+			if (thermal_frame)
+				thermal_frame->resize(640 * 448 * 4);
+			for (u32 y = 0; y < 448; ++y)
+			{
+				const u8* src = pixels + (size_t)y * pitch;
+				u8* dst = (thermal_frame ? thermal_frame->data() : s_overlay.data()) + (size_t)y * 640 * 4;
+				for (u32 x = 0; x < 640; ++x, src += 4, dst += 4)
+				{
+					dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = 255;
+				}
+			}
+			s_vision_download->Unmap();
+			if (!thermal_frame)
+			{
+				s_overlay_used = true;
+				s_vision_background_frame = s_frame_counter;
+			}
+			return true;
+		}
+
+		bool rtx_vision_present(rs3_vision_kind kind)
+		{
+			const u32 mode = rtx_vision_request(kind);
+			if (!mode || !s_remix.guest_vision_available())
+				return false;
+			if (kind == rs3_vision_kind::Thermal)
+			{
+				if (!s_remix.guest_thermal_available() || s_guest_thermal_frame.size() != 640 * 448 * 4)
+					return false;
+				// Empty half-rate fields repeat their matching game/RTX frame, never an active OFF frame.
+				if (s_guest_thermal_upload_frame != s_frame_counter)
+				{
+					if (s_remix.set_guest_thermal(s_guest_thermal_frame.data(), 640, 448, 640 * 4) != REMIXAPI_ERROR_CODE_SUCCESS)
+						return false;
+					s_guest_thermal_upload_frame = s_frame_counter;
+				}
+			}
+			return s_remix.set_guest_vision(mode) == REMIXAPI_ERROR_CODE_SUCCESS;
+		}
+
+		void vision_begin_draw(const GSRendererHW& r, const rs3_vision_draw& draw,
+			const GSTextureCache::Target* rt, int width, int height)
+		{
+			s_vision_draw_frame = s_frame_counter;
+			const rs3_vision_kind kind = vision_observe(s_vision_sequence, draw, s_frame_counter);
+			if (kind == rs3_vision_kind::None || s_vision_attempt_frame == s_frame_counter)
+				return;
+			s_vision_attempt_frame = s_frame_counter;
+			const u32 rtx_mode = rtx_vision_request(kind);
+			const bool canvas_ready = overlay_begin_draw(r, width, height);
+			bool original_thermal_ready = false;
+			if (kind == rs3_vision_kind::Thermal)
+			{
+				s_guest_thermal_frame.clear();
+				s_guest_thermal_upload_frame = ~0ull;
+			}
+			if (rtx_mode == 2 && s_remix.guest_thermal_available() && canvas_ready &&
+				s_overlay_w == 640 && s_overlay_h == 448)
+			{
+				original_thermal_ready = vision_readback(rt, s_vision_sequence.main_bp, &s_guest_thermal_frame);
+			}
+			if (canvas_ready && rtx_mode && rtx_vision_present(kind))
+			{
+				s_vision_background_frame = ~0ull;
+				s_rtx_vision_frame = s_frame_counter;
+				s_rtx_vision_kind = kind;
+				static u32 reports = 0;
+				if ((reports++ % 300) == 0)
+					INFO_LOG("Remix: dedicated guest vision {}", rtx_mode == 1 ? "RTX night" : "RTX thermal (native material heat and cooling)");
+				return;
+			}
+			if (s_remix.guest_vision_available())
+				s_remix.set_guest_vision(0);
+			if (original_thermal_ready)
+			{
+				s_overlay = s_guest_thermal_frame;
+				s_overlay_used = true;
+				s_vision_background_frame = s_frame_counter;
+			}
+			else if (canvas_ready && s_overlay_w == 640 && s_overlay_h == 448 &&
+				vision_readback(rt, s_vision_sequence.main_bp))
+			{
+				static u32 reports = 0;
+				if ((reports++ % 300) == 0)
+					INFO_LOG("Remix: guest {} vision fallback {}x{} crop640x448 scale{}; temporary original scene in goggles",
+						kind == rs3_vision_kind::Night ? "night" : "thermal", rt->GetUnscaledWidth(), rt->GetUnscaledHeight(), rt->m_scale);
+			}
+		}
+
+		void vision_end_frame(bool merged_frame_active)
+		{
+			if (s_vision_draw_frame == s_frame_counter)
+			{
+				s_rtx_vision_held_kind = s_rtx_vision_frame == s_frame_counter ? s_rtx_vision_kind : rs3_vision_kind::None;
+				if (s_rtx_vision_held_kind != rs3_vision_kind::Thermal)
+				{
+					s_guest_thermal_frame.clear();
+					s_guest_thermal_upload_frame = ~0ull;
+				}
+			}
+			if (merged_frame_active || !rtx_vision_enabled() || rtx_vision_mode() == 0)
+			{
+				s_rtx_vision_held_kind = rs3_vision_kind::None;
+				s_guest_thermal_frame.clear();
+				s_guest_thermal_upload_frame = ~0ull;
+			}
+			if (!rtx_vision_present(s_rtx_vision_held_kind) && s_remix.guest_vision_available())
+				s_remix.set_guest_vision(0);
+			// Preserve half-rate empty fields, but never carry a goggle snapshot into an active OFF frame.
+			if (s_vision_background_frame != ~0ull && s_vision_background_frame != s_frame_counter &&
+				s_vision_draw_frame == s_frame_counter)
+			{
+				if (s_overlay_frame != s_frame_counter)
+					overlay_reset(s_overlay_w, s_overlay_h);
+				s_vision_background_frame = ~0ull;
+			}
+		}
+
+		bool socom_hud_depth_pass(size_t pixel, float depth, const overlay_raster_options& options)
+		{
+			if (!options.socom_hud)
+				return true;
+			if (pixel >= s_socom_hud_depth.size() || !std::isfinite(depth))
+				return false;
+			const u32 z = static_cast<u32>(std::clamp(static_cast<double>(depth), 0.0, 4294967295.0)) & options.depth_mask;
+			const u32 stored = s_socom_hud_depth[pixel];
+			return options.depth_test == ZTST_ALWAYS ||
+				(options.depth_test == ZTST_GEQUAL && z >= stored) ||
+				(options.depth_test == ZTST_GREATER && z > stored);
+		}
+
+		void socom_hud_write_depth(size_t pixel, float depth, const overlay_raster_options& options)
+		{
+			if (options.socom_hud && options.depth_write)
+				s_socom_hud_depth[pixel] = static_cast<u32>(std::clamp(static_cast<double>(depth), 0.0, 4294967295.0)) & options.depth_mask;
+		}
+
+		void overlay_raster_lines(const u16* indices, u32 index_count,
+			const overlay_raster_options& options)
+		{
+			const u8 white[4] = {255, 255, 255, 255};
+			for (u32 i = 0; i + 1 < index_count; i += 2)
+			{
+				const u32 a = indices[i], b = indices[i + 1];
+				if (a >= s_scratch_vertices.size() || b >= s_scratch_vertices.size())
+					continue;
+				const float x0 = (s_scratch_ndc[a * 2] * 0.5f + 0.5f) * static_cast<float>(s_overlay_w);
+				const float y0 = (0.5f - s_scratch_ndc[a * 2 + 1] * 0.5f) * static_cast<float>(s_overlay_h);
+				const float x1 = (s_scratch_ndc[b * 2] * 0.5f + 0.5f) * static_cast<float>(s_overlay_w);
+				const float y1 = (0.5f - s_scratch_ndc[b * 2 + 1] * 0.5f) * static_cast<float>(s_overlay_h);
+				if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1))
+					continue;
+				const u32 steps = static_cast<u32>(std::ceil(std::max(std::abs(x1 - x0), std::abs(y1 - y0))));
+				for (u32 step = 0; step <= steps; ++step)
+				{
+					const float t = steps ? static_cast<float>(step) / static_cast<float>(steps) : 0.f;
+					const int x = static_cast<int>(std::floor(x0 + (x1 - x0) * t));
+					const int y = static_cast<int>(std::floor(y0 + (y1 - y0) * t));
+					if (x < 0 || y < 0 || x >= static_cast<int>(s_overlay_w) || y >= static_cast<int>(s_overlay_h) ||
+						x < static_cast<int>(options.scissor.SCAX0) || x > static_cast<int>(options.scissor.SCAX1) ||
+						y < static_cast<int>(options.scissor.SCAY0) || y > static_cast<int>(options.scissor.SCAY1))
+						continue;
+					u32 color = 0;
+					for (u32 k = 0; k < 4; ++k)
+					{
+						const float ca = static_cast<float>((s_scratch_vertices[a].color >> (k * 8)) & 255u);
+						const float cb = static_cast<float>((s_scratch_vertices[b].color >> (k * 8)) & 255u);
+						color |= static_cast<u32>(ca + (cb - ca) * t) << (k * 8);
+					}
+					const size_t pixel = static_cast<size_t>(y) * s_overlay_w + x;
+					const float depth = options.socom_hud ?
+						static_cast<float>(s_socom_hud_vertices[a].z) + (static_cast<float>(s_socom_hud_vertices[b].z) - static_cast<float>(s_socom_hud_vertices[a].z)) * t : 0.f;
+					if (!socom_hud_depth_pass(pixel, depth, options))
+						continue;
+					socom_hud_write_depth(pixel, depth, options);
+					u8* destination = s_overlay.data() + pixel * 4;
+					if (overlay_apply_texel(destination, white, color, options))
+					{
+						s_overlay_used = true;
+						++s_overlay_texels;
+					}
+				}
+			}
+			++s_overlay_draws;
+		}
+
+		void overlay_raster(u64 content_hash, const overlay_raster_options& options = {})
 		{
 			const u8* px = nullptr;
 			u32 tw = 0, th = 0;
-			if (!remix_ps2::materials::cpu_pixels(content_hash, px, tw, th))
+			const u8 white[4] = {255, 255, 255, 255};
+			if (options.untextured)
+			{
+				px = white;
+				tw = th = 1;
+			}
+			else if (!remix_ps2::materials::cpu_pixels(content_hash, px, tw, th))
 			{
 				++s_overlay_nopixels;
 				return;
@@ -882,6 +1625,13 @@ namespace RemixSubmit
 				minx = std::max(minx, 0); miny = std::max(miny, 0);
 				maxx = std::min(maxx, (int)s_overlay_w - 1);
 				maxy = std::min(maxy, (int)s_overlay_h - 1);
+				if (options.native_sampler)
+				{
+					minx = std::max(minx, static_cast<int>(options.scissor.SCAX0));
+					maxx = std::min(maxx, static_cast<int>(options.scissor.SCAX1));
+					miny = std::max(miny, static_cast<int>(options.scissor.SCAY0));
+					maxy = std::min(maxy, static_cast<int>(options.scissor.SCAY1));
+				}
 
 				for (int y = miny; y <= maxy; ++y)
 				{
@@ -894,35 +1644,61 @@ namespace RemixSubmit
 						if (w0 < 0.f || w1 < 0.f || w2 < 0.f)
 							continue;
 
-						const float u = (w0 * s_scratch_vertices[i0].texcoord[0]) +
+						const float texture_q = options.perspective_texture ?
+							w0 * s_socom_hud_vertices[i0].q + w1 * s_socom_hud_vertices[i1].q + w2 * s_socom_hud_vertices[i2].q : 1.f;
+						if (!(texture_q > 0.f) || !std::isfinite(texture_q))
+							continue;
+						const float u = ((w0 * s_scratch_vertices[i0].texcoord[0]) +
 										(w1 * s_scratch_vertices[i1].texcoord[0]) +
-										(w2 * s_scratch_vertices[i2].texcoord[0]);
-						const float v = (w0 * s_scratch_vertices[i0].texcoord[1]) +
+										(w2 * s_scratch_vertices[i2].texcoord[0])) / texture_q;
+						const float v = ((w0 * s_scratch_vertices[i0].texcoord[1]) +
 										(w1 * s_scratch_vertices[i1].texcoord[1]) +
-										(w2 * s_scratch_vertices[i2].texcoord[1]);
+										(w2 * s_scratch_vertices[i2].texcoord[1])) / texture_q;
 						if (!std::isfinite(u) || !std::isfinite(v))
 							continue;
 
-						// Wrap, matching the GS default.
-						int su = (int)(u * (float)tw); su %= (int)tw; if (su < 0) su += (int)tw;
-						int sv = (int)(v * (float)th); sv %= (int)th; if (sv < 0) sv += (int)th;
+						int su = 0, sv = 0;
+						if (!options.untextured)
+						{
+							if (options.native_sampler)
+							{
+								su = overlay_sample_coordinate(static_cast<int>(std::floor(u * options.texture_width)),
+									static_cast<int>(options.texture_width), options.clamp.WMS,
+									options.clamp.MINU, options.clamp.MAXU) - options.texture_origin_x;
+								sv = overlay_sample_coordinate(static_cast<int>(std::floor(v * options.texture_height)),
+									static_cast<int>(options.texture_height), options.clamp.WMT,
+									options.clamp.MINV, options.clamp.MAXV) - options.texture_origin_y;
+							}
+							else
+							{
+								su = overlay_sample_coordinate(static_cast<int>(u * tw), tw, 0, 0, 0);
+								sv = overlay_sample_coordinate(static_cast<int>(v * th), th, 0, 0, 0);
+							}
+							if (su < 0 || sv < 0 || su >= static_cast<int>(tw) || sv >= static_cast<int>(th))
+								continue;
+						}
 
 						const u8* texel = px + (((size_t)sv * tw) + su) * 4;
 
-						// Vertex colour modulates, and PS2 alpha already scaled to 0..255.
-						const u32 vc = s_scratch_vertices[i0].color;
-						const u32 va = (vc >> 24) & 0xFF;
-						const u32 a = (texel[3] * va) / 255u;
-						if (a == 0)
+						const size_t pixel = static_cast<size_t>(y) * s_overlay_w + x;
+						const float depth = options.socom_hud ? static_cast<float>(s_socom_hud_vertices[i0].z) +
+							w1 * (static_cast<float>(s_socom_hud_vertices[i1].z) - static_cast<float>(s_socom_hud_vertices[i0].z)) +
+							w2 * (static_cast<float>(s_socom_hud_vertices[i2].z) - static_cast<float>(s_socom_hud_vertices[i0].z)) : 0.f;
+						if (!socom_hud_depth_pass(pixel, depth, options))
 							continue;
-
-						u8* dst = s_overlay.data() + (((size_t)y * s_overlay_w) + x) * 4;
-						for (u32 k = 0; k < 3; ++k)
+						u32 color = s_scratch_vertices[i0].color;
+						if (options.socom_hud)
 						{
-							const u32 src = ((u32)texel[k] * ((vc >> (k * 8)) & 0xFF)) / 255u;
-							dst[k] = (u8)(((src * a) + ((u32)dst[k] * (255u - a))) / 255u);
+							color = 0;
+							for (u32 k = 0; k < 4; ++k)
+								color |= static_cast<u32>(std::clamp(w0 * ((s_scratch_vertices[i0].color >> (k * 8)) & 255u) +
+									w1 * ((s_scratch_vertices[i1].color >> (k * 8)) & 255u) +
+									w2 * ((s_scratch_vertices[i2].color >> (k * 8)) & 255u), 0.f, 255.f)) << (k * 8);
 						}
-						dst[3] = (u8)std::min(255u, (u32)dst[3] + a);
+						socom_hud_write_depth(pixel, depth, options);
+						u8* dst = s_overlay.data() + pixel * 4;
+						if (!overlay_apply_texel(dst, texel, color, options))
+							continue;
 						s_overlay_used = true;
 						++s_overlay_texels;
 					}
@@ -1710,6 +2486,107 @@ namespace RemixSubmit
 			return r2 >= fst_z_min_r2();
 		}
 
+		struct effect_depth_fit
+		{
+			z_fit fit;
+			u64 frame = ~0ull;
+			u64 target = 0;
+			u32 zpsm = ~0u;
+			double anchor_a = 0.0, anchor_b = 0.0;
+			bool ready = false;
+
+			bool matches(u64 draw_frame, u64 draw_target, u32 draw_zpsm) const
+			{
+				return frame == draw_frame && target == draw_target && zpsm == draw_zpsm;
+			}
+
+			bool accepts(u64 draw_frame, u64 draw_target, u32 draw_zpsm, double zn, double q) const
+			{
+				return (fit.n == 0.0 || matches(draw_frame, draw_target, draw_zpsm)) &&
+					(anchor_a == 0.0 || std::abs(q - ((zn * anchor_a) + anchor_b)) <= q * 0.01);
+			}
+
+			void add(const z_fit& draw_fit, u64 draw_frame, u64 draw_target, u32 draw_zpsm)
+			{
+				if (ready)
+					return;
+				double a = 0.0, b = 0.0, r2 = 0.0;
+				if (fit.n == 0.0)
+				{
+					if (draw_fit.n == 0.0)
+						return;
+					frame = draw_frame;
+					target = draw_target;
+					zpsm = draw_zpsm;
+				}
+				if (!matches(draw_frame, draw_target, draw_zpsm))
+					return;
+				fit.merge(draw_fit);
+				const bool qualified = fit.solve(true, a, b, r2) && a > 0.0 && r2 >= fst_z_min_r2();
+				if (anchor_a == 0.0 && qualified)
+				{
+					anchor_a = a;
+					anchor_b = b;
+				}
+				ready = anchor_a > 0.0 && fit.n >= 1024.0 && qualified;
+			}
+
+			bool solution(u64 draw_frame, u64 draw_target, u32 draw_zpsm, double& a, double& b) const
+			{
+				double r2 = 0.0;
+				return ready && matches(draw_frame, draw_target, draw_zpsm) && fit.solve(true, a, b, r2);
+			}
+		};
+
+		struct effect_depth_fits
+		{
+			std::vector<effect_depth_fit> cohorts;
+
+			const effect_depth_fit* find(u64 frame, u64 target, u32 zpsm) const
+			{
+				for (const effect_depth_fit& fit : cohorts)
+					if (fit.matches(frame, target, zpsm))
+						return &fit;
+				return nullptr;
+			}
+
+			bool ready_for(u64 frame, u64 target, u32 zpsm) const
+			{
+				const effect_depth_fit* fit = find(frame, target, zpsm);
+				return fit && fit->ready;
+			}
+
+			bool accepts(u64 frame, u64 target, u32 zpsm, double zn, double q) const
+			{
+				const effect_depth_fit* fit = find(frame, target, zpsm);
+				return !fit || fit->accepts(frame, target, zpsm, zn, q);
+			}
+
+			void add(const z_fit& draw, u64 frame, u64 target, u32 zpsm)
+			{
+				for (effect_depth_fit& fit : cohorts)
+				{
+					if (fit.matches(frame, target, zpsm))
+					{
+						fit.add(draw, frame, target, zpsm);
+						return;
+					}
+				}
+				effect_depth_fit fit;
+				fit.add(draw, frame, target, zpsm);
+				if (fit.fit.n != 0.0)
+					cohorts.push_back(fit);
+			}
+
+			bool solution(u64 frame, u64 target, u32 zpsm, double& a, double& b) const
+			{
+				const effect_depth_fit* fit = find(frame, target, zpsm);
+				return fit && fit->solution(frame, target, zpsm, a, b);
+			}
+		};
+
+		effect_depth_fits s_effect_depth;
+
 		// Explicit absolute overrides. When unset (the default) radius and radiance are derived
 		// from the frame's measured extent instead, which is scale-free -- see place_debug_light.
 		float debug_light_radius_override()
@@ -1981,14 +2858,8 @@ namespace RemixSubmit
 
 		// --- authored level lights ------------------------------------------------------------
 		//
-		// R6 3's levels are Unreal packages: Maps/Alcatraz.rsm (v118, licensee 21) carries 212
-		// light actors -- 211 Light + 1 Sunlight -- with real world Locations, LightBrightness,
-		// LightRadius, LightHue and LightSaturation. Extracted offline (the .rsm lives on the Xbox
-		// release, not in the PS2 install, so runtime parsing is not an option) into
-		//   RemixGames\<SERIAL>\lights_<LEVEL>.txt
-		//
-		// OFF by default. LIGHTMODE stays exactly as it was so the single distant fill remains
-		// available for A/B -- 212 uncalibrated lights will not be right on the first try.
+		// PS2 actor data is exported to RemixGames/<SERIAL>/lights_<LEVEL>.txt. The active map
+		// is read from the guest, so a rig never follows the camera into a different level.
 		int level_lights_mode()
 		{
 			return std::clamp(env_int_live(L"PCSX2_REMIX_LEVELLIGHTS", 0), 0, 1);
@@ -2044,6 +2915,201 @@ namespace RemixSubmit
 		};
 		std::vector<level_light> s_level_lights;
 		bool s_level_lights_built = false;
+		std::string s_level_light_map;
+		u32 s_level_light_level = 0;
+		u64 s_level_light_retry_frame = 0;
+		float s_level_light_cull_range = 0.f;
+		bool s_level_light_creation_retry = false;
+
+		struct r6_light_level
+		{
+			std::string map;
+			u32 address = 0;
+		};
+
+		r6_light_level r6_active_light_level()
+		{
+			if (!eeMem || remix_ps2::paths::game_id() != "SLUS-20883" ||
+				VMManager::GetCurrentCRC() != 0x21CC1EC3)
+				return {};
+
+			constexpr u32 ram_size = 0x02000000;
+			const auto valid = [](u32 address, u32 size) {
+				return address != 0 && (address & 3) == 0 && address <= ram_size - size;
+			};
+			const auto word = [](u32 address) {
+				u32 value;
+				std::memcpy(&value, eeMem->Main + address, sizeof(value));
+				return value;
+			};
+			const u32 engine = word(0x006546C8);
+			if (!valid(engine, 0x468) || word(engine) != 0x0061A220 || word(engine + 0x464) != 0)
+				return {};
+			const u32 level = word(engine + 0x45C);
+			if (!valid(level, 0x2C) || word(level) != 0x00615EE0)
+				return {};
+			const u32 package = word(level + 0x18);
+			if (!valid(package, 0x2C) || word(package) != 0x0060F950)
+				return {};
+			const u32 name_address = word(package + 0x28);
+			if (name_address == 0 || name_address > ram_size - 64)
+				return {};
+
+			// GLevel describes the loaded world; command-line and loading-screen strings can
+			// describe the next one. Only a bounded identifier may select a host filename.
+			const char* name = reinterpret_cast<const char*>(eeMem->Main + name_address);
+			std::string map;
+			for (u32 i = 0; i < 64; ++i)
+			{
+				char c = name[i];
+				if (c == 0)
+					return map.empty() ? r6_light_level{} : r6_light_level{map, level};
+				if (c >= 'a' && c <= 'z')
+					c -= 'a' - 'A';
+				if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+					return {};
+				map.push_back(c);
+			}
+			return {};
+		}
+
+		std::atomic<bool> s_guest_movie_active{false};
+		std::atomic<u64> s_guest_movie_decodes{0};
+		u64 s_guest_movie_reset_decodes = 0;
+		std::unique_ptr<GSDownloadTexture> s_merged_frame_download;
+		u64 s_merged_loading_frame = ~0ull, s_merged_attempt_frame = ~0ull;
+		bool s_merged_frame_owned = false;
+
+		void merged_frame_reset(bool preserve_current_overlay = false)
+		{
+			if (s_merged_frame_owned && (!preserve_current_overlay || s_overlay_frame != s_frame_counter))
+			{
+				overlay_reset(s_overlay_w, s_overlay_h);
+				s_overlay_frame = ~0ull;
+			}
+			s_merged_frame_owned = false;
+			s_merged_frame_download.reset();
+			s_merged_loading_frame = s_merged_attempt_frame = ~0ull;
+		}
+
+		void guest_movie_reset()
+		{
+			s_guest_movie_reset_decodes = s_guest_movie_decodes.load(std::memory_order_relaxed);
+			s_guest_movie_active.store(false, std::memory_order_relaxed);
+		}
+
+		bool rs3_merged_frame_active()
+		{
+			if (ui_mode() == 0 || ui_raster_mode() == 0 || sprite_geometry_mode() != 0 ||
+				remix_ps2::paths::game_id() != "SLUS-20883" || VMManager::GetCurrentCRC() != 0x21CC1EC3)
+				return false;
+			const std::string map = r6_active_light_level().map;
+			const bool movie = s_guest_movie_active.load(std::memory_order_relaxed) &&
+				s_guest_movie_decodes.load(std::memory_order_relaxed) - s_guest_movie_reset_decodes >= 7;
+			return s_merged_loading_frame == s_frame_counter || map == "ENTRY" ||
+				(map.empty() && movie);
+		}
+
+		void merged_frame_present(const void* merged_texture, int crop_left, int crop_top,
+			int crop_right, int crop_bottom, bool active)
+		{
+			if (!active)
+			{
+				merged_frame_reset(true);
+				return;
+			}
+			if (s_merged_attempt_frame == s_frame_counter)
+				return;
+			s_merged_attempt_frame = s_frame_counter;
+			const auto fail = []() {
+				merged_frame_reset(true);
+				s_merged_attempt_frame = s_frame_counter;
+			};
+			GSTexture* const texture = const_cast<GSTexture*>(static_cast<const GSTexture*>(merged_texture));
+			if (!texture || !g_gs_device || texture->GetFormat() != GSTexture::Format::Color ||
+				crop_left < 0 || crop_top < 0 || crop_right <= crop_left || crop_bottom <= crop_top ||
+				crop_right > texture->GetWidth() || crop_bottom > texture->GetHeight())
+			{
+				fail();
+				return;
+			}
+			if (!s_merged_frame_download)
+				s_merged_frame_download = g_gs_device->CreateDownloadTexture(640, 448, GSTexture::Format::Color);
+			GSTexture* const native = s_merged_frame_download ?
+				g_gs_device->CreateRenderTarget(640, 448, GSTexture::Format::Color, false) : nullptr;
+			if (!native)
+			{
+				fail();
+				return;
+			}
+			const GSVector4i rect(0, 0, 640, 448);
+			const GSVector4 source = GSVector4(GSVector4i(crop_left, crop_top, crop_right, crop_bottom)) /
+				GSVector4(texture->GetSize()).xyxy();
+			g_gs_device->StretchRect(texture, source, native, GSVector4(rect), ShaderConvert::COPY, Biln);
+			s_merged_frame_download->CopyFromTexture(rect, native, rect, 0, true);
+			g_gs_device->Recycle(native);
+			s_merged_frame_download->Flush();
+			if (!s_merged_frame_download->Map(rect))
+			{
+				fail();
+				return;
+			}
+			const u8* pixels = s_merged_frame_download->GetMapPointer();
+			const u32 pitch = s_merged_frame_download->GetMapPitch();
+			if (!pixels || pitch < 640u * 4u)
+			{
+				s_merged_frame_download->Unmap();
+				fail();
+				return;
+			}
+			overlay_reset(640, 448);
+			for (u32 y = 0; y < 448; ++y)
+			{
+				const u8* src = pixels + static_cast<size_t>(y) * pitch;
+				u8* dst = s_overlay.data() + static_cast<size_t>(y) * 640 * 4;
+				for (u32 x = 0; x < 640; ++x, src += 4, dst += 4)
+				{
+					dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = 255;
+				}
+			}
+			s_merged_frame_download->Unmap();
+			s_overlay_frame = s_frame_counter;
+			s_overlay_used = s_merged_frame_owned = true;
+			s_vision_background_frame = ~0ull;
+			static u32 reports = 0;
+			if ((reports++ % 300) == 0)
+				INFO_LOG("Remix: guest movie/menu/loading frame640x448 crop({},{})-({},{})",
+					crop_left, crop_top, crop_right, crop_bottom);
+		}
+
+		void destroy_level_lights()
+		{
+			if (s_remix.ok())
+			{
+				for (const level_light& light : s_level_lights)
+					remix_ps2::guarded_destroy_light(s_remix.api().DestroyLight, light.handle);
+			}
+			s_level_lights.clear();
+			s_level_lights_built = false;
+			s_level_light_retry_frame = 0;
+			s_level_light_cull_range = 0.f;
+			s_level_light_creation_retry = false;
+		}
+
+		void refresh_level_light_map()
+		{
+			const r6_light_level level = (level_lights_mode() != 0) ? r6_active_light_level() : r6_light_level{};
+			if (level.map == s_level_light_map && level.address == s_level_light_level)
+			{
+				if (s_level_light_creation_retry && s_frame_counter >= s_level_light_retry_frame)
+					destroy_level_lights();
+				return;
+			}
+			destroy_level_lights();
+			s_level_light_map = level.map;
+			s_level_light_level = level.address;
+			INFO_LOG("Remix: LEVELLIGHTS active map '{}'", level.map.empty() ? "<none>" : level.map);
+		}
 
 		// UE2 hue/saturation -> linear RGB. Saturation is INVERTED in UE2: 255 is white and 0 is
 		// fully saturated, which is the opposite of every other engine and easy to get backwards.
@@ -2069,130 +3135,163 @@ namespace RemixSubmit
 
 		void build_level_lights()
 		{
-			if (s_level_lights_built || level_lights_mode() == 0)
+			if (s_level_lights_built || s_level_light_map.empty() || level_lights_mode() == 0 ||
+				!s_active_camera.valid || s_frame_counter < s_level_light_retry_frame)
 				return;
-
-			// Anchor the rig on the eye, so wait for a camera. Without one there is nothing to
-			// shrink about and every light would land in the wrong place permanently.
-			if (!s_active_camera.valid)
-				return;
-			s_level_lights_built = true;
-
-			const float pscale = level_light_pos_scale();
-			const float ax = s_active_camera.position[0];
-			const float ay = s_active_camera.position[1];
-			const float az = s_active_camera.position[2];
 
 			const std::string dir = remix_ps2::paths::game_dir();
 			if (dir.empty())
-			{
-				INFO_LOG("Remix: LEVELLIGHTS on but no per-game dir -- nothing loaded");
 				return;
-			}
-			const std::string path = Path::Combine(dir, "lights_ALCATRAZ.txt");
+			const std::string path = Path::Combine(dir, "lights_" + s_level_light_map + ".txt");
 			std::FILE* f = FileSystem::OpenCFile(path.c_str(), "r");
 			if (!f)
 			{
-				INFO_LOG("Remix: LEVELLIGHTS on but '{}' not found -- no authored lights loaded", path);
+				if (s_level_light_retry_frame == 0)
+					INFO_LOG("Remix: LEVELLIGHTS '{}' not found -- no authored lights for this map", path);
+				s_level_light_retry_frame = s_frame_counter + 60;
 				return;
 			}
 
-			const remixapi_Interface& api = s_remix.api();
-			const float scale = level_light_scale();
-			u32 made = 0, failed = 0, suns = 0, skipped_dark = 0;
+			float scale = level_light_scale();
+			float pscale = level_light_pos_scale();
+			float emitter_radius = level_light_radius();
+			s_level_light_cull_range = level_light_range();
 			char line[512];
+			// Map overrides are resolved before actors, independent of line order.
 			while (std::fgets(line, sizeof(line), f))
 			{
-				if (line[0] == '#' || line[0] == 0x0A || line[0] == 0x0D)
+				char key[32];
+				float value;
+				if (std::sscanf(line, "%31s %f", key, &value) != 2 || !std::isfinite(value) || value < 0.f)
 					continue;
+				if (std::strcmp(key, "SCALE") == 0)
+					scale = value;
+				else if (std::strcmp(key, "POSSCALE") == 0 && value > 0.f)
+					pscale = value;
+				else if (std::strcmp(key, "RADIUS") == 0)
+					emitter_radius = value;
+				else if (std::strcmp(key, "RANGE") == 0)
+					s_level_light_cull_range = value;
+			}
+			std::rewind(f);
 
-				float x, y, z, dx, dy, dz, bright, radius;
-				u32 hue = 0, sat = 255;
+			const float ax = s_active_camera.position[0];
+			const float ay = s_active_camera.position[1];
+			const float az = s_active_camera.position[2];
+			const remixapi_Interface& api = s_remix.api();
+			u32 made = 0, failed = 0, suns = 0, skipped_dark = 0;
+			while (std::fgets(line, sizeof(line), f))
+			{
+				float x, y, z, dx, dy, dz, bright, radius = 0.f;
+				u32 hue = 0, sat = 255, type = 1, effect = 0, cone = 0;
+				int pitch = 0, yaw = 0, roll = 0;
+				char actor_name[128] = {};
 				remixapi_LightInfo info{};
 				info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-				info.isDynamic = 1; // MUST be set or the runtime sleeps analytical lights
-
+				info.isDynamic = 1;
 				float lpos[3] = {0.f, 0.f, 0.f};
 				float radiance_boost = 1.f;
 				bool distant_light = false;
 				remixapi_LightInfoSphereEXT sphere{};
 				remixapi_LightInfoDistantEXT distant{};
-				float rgb[3] = {1.f, 1.f, 1.f};
+				float rgb[3];
 
-				if (std::sscanf(line, "SUN %f %f %f %f %f %f %f %u %u",
-						&x, &y, &z, &dx, &dy, &dz, &bright, &hue, &sat) == 9)
+				if (std::sscanf(line, " SUN %f %f %f %f %f %f %f %u %u %127s",
+						&x, &y, &z, &dx, &dy, &dz, &bright, &hue, &sat, actor_name) >= 9)
 				{
-					ue2_hue_sat_to_rgb(hue, sat, rgb);
+					const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+					if (!std::isfinite(length) || length <= 0.f)
+						continue;
 					distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
-					distant.direction = {dx, dy, dz};
+					distant.direction = {dx / length, dy / length, dz / length};
 					distant.angularDiameterDegrees = 0.5f;
 					info.pNext = &distant;
-					{
-						u64 lh = fnv_seed;
-						for (const char* c = line; *c && *c != 10 && *c != 13; ++c)
-							lh = fnv_mix(lh, static_cast<u32>(static_cast<unsigned char>(*c)));
-						info.hash = 0x9C5241B210000000ull ^ (lh & 0x00FFFFFFFFFFFFFFull);
-					}
 					distant_light = true;
-					++suns;
 				}
-				else if (std::sscanf(line, "LIGHT %f %f %f %f %f %u %u",
-						&x, &y, &z, &bright, &radius, &hue, &sat) == 7)
+				else
 				{
-					ue2_hue_sat_to_rgb(hue, sat, rgb);
+					const bool ps2_actor = std::sscanf(line,
+						" PS2LIGHT %f %f %f %f %f %u %u %u %u %u %d %d %d %127s",
+						&x, &y, &z, &bright, &radius, &hue, &sat, &type, &effect, &cone,
+						&pitch, &yaw, &roll, actor_name) == 14;
+					if (!ps2_actor && std::sscanf(line, " LIGHT %f %f %f %f %f %u %u %127s",
+							&x, &y, &z, &bright, &radius, &hue, &sat, actor_name) < 7)
+						continue;
+					if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+						!std::isfinite(radius) || radius < 0.f || hue > 255 || sat > 255 ||
+						(ps2_actor && (type > 255 || effect > 255 || cone > 255)))
+						continue;
+					if (type == 0)
+					{
+						++skipped_dark;
+						continue;
+					}
+					if (ps2_actor && (effect == 8 || effect == 12) && cone == 0)
+						continue;
 					sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
 					lpos[0] = ax + (x - ax) * pscale;
 					lpos[1] = ay + (y - ay) * pscale;
 					lpos[2] = az + (z - az) * pscale;
 					sphere.position = {lpos[0], lpos[1], lpos[2]};
 					const float authored_radius = std::max(0.01f, radius * pscale);
-					const float override_radius = level_light_radius();
-					sphere.radius = (override_radius > 0.f) ? override_radius : authored_radius;
-					// Emitted power is radiance x area, so shrinking the emitter without this would dim
-					// the lamp by the square of the change.
+					sphere.radius = (emitter_radius > 0.f) ? emitter_radius : authored_radius;
+					// Keep the rig's existing power calibration when changing physical emitter size.
 					radiance_boost = (authored_radius * authored_radius) / (sphere.radius * sphere.radius);
-					sphere.shaping_hasvalue = 0;
+					if (ps2_actor && (effect == 8 || effect == 12))
+					{
+						constexpr float k = 6.2831853f / 65536.f;
+						const float p = static_cast<float>(pitch & 0xFFFF) * k;
+						const float yaw_radians = static_cast<float>(yaw & 0xFFFF) * k;
+						sphere.shaping_hasvalue = 1;
+						sphere.shaping_value.direction = {std::cos(p) * std::cos(yaw_radians), std::cos(p) * std::sin(yaw_radians), std::sin(p)};
+						// The PS2 cutoff is cos(theta) = 1 - LightCone/256; Remix takes theta in degrees.
+						sphere.shaping_value.coneAngleDegrees = std::acos(1.f - static_cast<float>(cone) / 256.f) * 57.295779513f;
+						sphere.shaping_value.coneSoftness = static_cast<float>(cone) / 256.f;
+						sphere.shaping_value.focusExponent = 0.f;
+					}
 					info.pNext = &sphere;
-					// Identity from the actor's own line in lights_<LEVEL>.txt, not its ordinal. A hash
-					// of "how many lights came before this one" changes for every later lamp the moment
-					// anything is skipped or the file is edited -- which would silently re-bind a
-					// modder's placements in mod.usda to different lamps. The line is stable across
-					// runs and independent of the skip rules and of POSSCALE.
-					{
-						u64 lh = fnv_seed;
-						for (const char* c = line; *c && *c != 10 && *c != 13; ++c)
-							lh = fnv_mix(lh, static_cast<u32>(static_cast<unsigned char>(*c)));
-						info.hash = 0x9C5241B220000000ull ^ (lh & 0x00FFFFFFFFFFFFFFull);
-					}
-					// 37 of this map's 211 Light actors carry brightness 0 -- 29 of them radius 0 too,
-					// meaning the .rsm property walk found neither field. They emit nothing and exist
-					// only as clutter in the debug overlay.
-					if (bright <= 0.f)
-					{
-						++skipped_dark;
-						continue;
-					}
 				}
-				else
+				if (!std::isfinite(bright) || bright <= 0.f)
+				{
+					++skipped_dark;
 					continue;
-
+				}
 				const float r = (bright / 255.f) * scale * radiance_boost;
+				if (!std::isfinite(r) || !std::isfinite(sphere.position.x) ||
+					!std::isfinite(sphere.position.y) || !std::isfinite(sphere.position.z) ||
+					!std::isfinite(sphere.radius) || hue > 255 || sat > 255)
+					continue;
+				ue2_hue_sat_to_rgb(hue, sat, rgb);
 				info.radiance = {rgb[0] * r, rgb[1] * r, rgb[2] * r};
 
+				// Actor names and map identity keep bindings stable when another row is disabled.
+				u64 hash = fnv_seed;
+				for (const char c : s_level_light_map)
+					hash = fnv_mix(hash, static_cast<u32>(static_cast<unsigned char>(c)));
+				hash = fnv_mix(hash, 0);
+				const char* identity = actor_name[0] ? actor_name : line;
+				for (const char* c = identity; *c && *c != 10 && *c != 13; ++c)
+					hash = fnv_mix(hash, static_cast<u32>(static_cast<unsigned char>(*c)));
+				info.hash = 0x9C5241B220000000ull ^ (hash & 0x00FFFFFFFFFFFFFFull);
+
 				remixapi_LightHandle h = nullptr;
-				if (remix_ps2::guarded_create_light(api.CreateLight, &info, &h) ==
-						REMIXAPI_ERROR_CODE_SUCCESS && h)
+				if (remix_ps2::guarded_create_light(api.CreateLight, &info, &h) == REMIXAPI_ERROR_CODE_SUCCESS && h)
 				{
 					s_level_lights.push_back({h, {lpos[0], lpos[1], lpos[2]}, distant_light});
 					++made;
+					if (distant_light)
+						++suns;
 				}
 				else
 					++failed;
 			}
 			std::fclose(f);
-
-			INFO_LOG("Remix: LEVELLIGHTS loaded '{}' -- created {} ({} distant) failed {} skipped-dark {} scale {:.3f} posscale {:.5f} anchor {:.0f} {:.0f} {:.0f}",
-				path, made, suns, failed, skipped_dark, scale, pscale, ax, ay, az);
+			s_level_lights_built = true;
+			s_level_light_creation_retry = failed != 0;
+			if (s_level_light_creation_retry)
+				s_level_light_retry_frame = s_frame_counter + 60;
+			INFO_LOG("Remix: LEVELLIGHTS loaded '{}' -- created {} ({} distant) failed {} skipped-dark {} scale {:.3f} posscale {:.5f} emitter {:.3f} range {:.0f} anchor {:.0f} {:.0f} {:.0f}",
+				path, made, suns, failed, skipped_dark, scale, pscale, emitter_radius, s_level_light_cull_range, ax, ay, az);
 		}
 		// --- EE-resident camera ---------------------------------------------------------------
 		// FOUND 2026-08-27 by diffing three save states (still / turn in place / walk+turn):
@@ -2265,19 +3364,120 @@ namespace RemixSubmit
 		u32 ee_cam_loc_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMLOC", 0x00F0F670)); }
 		u32 ee_cam_rot_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMROT", 0x00F0F680)); }
 
+		struct r6_view_camera
+		{
+			float position[3];
+			s32 rotation[3];
+			float fov_y;
+			float aspect;
+		};
+
+		bool read_r6_view_camera(r6_view_camera& out)
+		{
+			if (!eeMem || remix_ps2::paths::game_id() != "SLUS-20883" ||
+				VMManager::GetCurrentCRC() != 0x21CC1EC3)
+				return false;
+			const r6_light_level level = r6_active_light_level();
+			if (level.map.empty() || level.map == "ENTRY")
+				return false;
+			constexpr u32 ram_size = 0x02000000;
+			const auto valid = [](u32 address, u32 size) {
+				return address != 0 && (address & 3) == 0 && size <= ram_size && address <= ram_size - size;
+			};
+			const auto word = [](u32 address) {
+				u32 value;
+				std::memcpy(&value, eeMem->Main + address, sizeof(value));
+				return value;
+			};
+			const auto class_name_is = [&](u32 object, const char* name) {
+				const u32 cls = word(object + 0x24);
+				if (!valid(cls, 0x2C) || word(cls) != 0x0060F210)
+					return false;
+				const u32 cached_name = word(cls + 0x28);
+				const size_t size = std::strlen(name) + 1;
+				return cached_name != 0 && cached_name <= ram_size - size &&
+					std::memcmp(eeMem->Main + cached_name, name, size) == 0;
+			};
+			const u32 engine = word(0x006546C8);
+			if (!valid(engine, 0x468) || word(engine) != 0x0061A220 ||
+				word(engine + 0x45C) != level.address || word(engine + 0x464) != 0)
+				return false;
+			const u32 client = word(engine + 0x44);
+			if (!valid(client, 0x98) || word(client) != 0x0060EAF0 || !class_name_is(client, "PSX2Client"))
+				return false;
+			const u32 array = word(client + 0x30), count = word(client + 0x34), capacity = word(client + 0x38);
+			if (count == 0 || count > 2 || capacity < count || capacity > 2 || !valid(array, count * 4))
+				return false;
+			const u32 viewport = word(client + 0x90);
+			bool belongs = false;
+			for (u32 i = 0; i < count; ++i)
+				belongs |= word(array + i * 4) == viewport;
+			if (!belongs || !valid(viewport, 0x200) || word(viewport) != 0x0060EBD0 ||
+				!class_name_is(viewport, "PSX2Viewport"))
+				return false;
+			const u32 controller = word(viewport + 0x34);
+			if (!valid(controller, 0x580) || word(controller) != 0x00621610 ||
+				(!class_name_is(controller, "R6PlayerController") && !class_name_is(controller, "R6TrainingController")) ||
+				word(controller + 0x56C) != viewport || word(controller + 0x18) != word(level.address + 0x18))
+				return false;
+			const u32 target = word(controller + 0x578);
+			if (!valid(target, 0x2C) || word(target + 0x18) != word(level.address + 0x18))
+				return false;
+			const u32 width = word(viewport + 0x90), height = word(viewport + 0x94);
+			if (width < 64 || width > 4096 || height < 64 || height > 4096)
+				return false;
+			r6_view_camera value{};
+			std::memcpy(value.position, eeMem->Main + viewport + 0x1C0, sizeof(value.position));
+			std::memcpy(value.rotation, eeMem->Main + viewport + 0x1D0, sizeof(value.rotation));
+			float fov_x;
+			std::memcpy(&fov_x, eeMem->Main + viewport + 0x1DC, sizeof(fov_x));
+			for (float p : value.position)
+				if (!std::isfinite(p) || std::abs(p) > 1e7f)
+					return false;
+			if (!std::isfinite(fov_x) || fov_x <= 1.f || fov_x >= 179.f)
+				return false;
+			value.aspect = static_cast<float>(width) / static_cast<float>(height);
+			constexpr float radians = 0.017453292519943295f;
+			value.fov_y = 2.f * std::atan(std::tan(fov_x * (radians * 0.5f)) / value.aspect) / radians;
+			if (!std::isfinite(value.fov_y) || value.fov_y <= 0.f || value.fov_y >= 179.f ||
+				word(0x006546C8) != engine || word(engine + 0x44) != client ||
+				word(engine + 0x45C) != level.address || word(engine + 0x464) != 0 ||
+				word(client + 0x90) != viewport || word(viewport + 0x34) != controller ||
+				word(controller + 0x56C) != viewport)
+				return false;
+			out = value;
+			return true;
+		}
+
 		// Location + FRotator -> row-vector world->view. Unreal is Z-up, X forward, 65536 == 360 deg.
-		bool read_ee_camera(float (&pos)[3], remix_ps2::mat4& view, float (&angles_deg)[3])
+		bool read_ee_camera(float (&pos)[3], remix_ps2::mat4& view, float (&angles_deg)[3],
+			float* out_fov_y = nullptr, float* out_aspect = nullptr)
 		{
 			if (!eeMem)
 				return false;
-			const u32 loc = ee_cam_loc_addr() & 0x01FFFFFCu;
-			const u32 rot = ee_cam_rot_addr() & 0x01FFFFFCu;
-			if ((loc + 12u) > Ps2MemSize::MainRam || (rot + 12u) > Ps2MemSize::MainRam)
-				return false;
 			float p[3];
 			s32 r[3];
-			std::memcpy(p, eeMem->Main + loc, sizeof(p));
-			std::memcpy(r, eeMem->Main + rot, sizeof(r));
+			if (remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3)
+			{
+				r6_view_camera camera{};
+				if (!read_r6_view_camera(camera))
+					return false;
+				std::memcpy(p, camera.position, sizeof(p));
+				std::memcpy(r, camera.rotation, sizeof(r));
+				if (out_fov_y)
+					*out_fov_y = camera.fov_y;
+				if (out_aspect)
+					*out_aspect = camera.aspect;
+			}
+			else
+			{
+				const u32 loc = ee_cam_loc_addr() & 0x01FFFFFCu;
+				const u32 rot = ee_cam_rot_addr() & 0x01FFFFFCu;
+				if ((loc + 12u) > Ps2MemSize::MainRam || (rot + 12u) > Ps2MemSize::MainRam)
+					return false;
+				std::memcpy(p, eeMem->Main + loc, sizeof(p));
+				std::memcpy(r, eeMem->Main + rot, sizeof(r));
+			}
 			for (float v : p)
 			{
 				if (!std::isfinite(v) || std::abs(v) > 1e7f)
@@ -2290,9 +3490,25 @@ namespace RemixSubmit
 			angles_deg[0] = static_cast<float>(r[0]) * (360.f / 65536.f);
 			angles_deg[1] = static_cast<float>(r[1]) * (360.f / 65536.f);
 			angles_deg[2] = static_cast<float>(r[2]) * (360.f / 65536.f);
-			const float cp = std::cos(pitch), sp = std::sin(pitch);
-			const float cy = std::cos(yaw),   sy = std::sin(yaw);
-			const float cr = std::cos(roll),  sr = std::sin(roll);
+			float cp = std::cos(pitch), sp = std::sin(pitch);
+			float cy = std::cos(yaw),   sy = std::sin(yaw);
+			float cr = std::cos(roll),  sr = std::sin(roll);
+			if (remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3)
+			{
+				// The native view constructor indexes the sine table after negating each angle.
+				const auto native_pair = [&](s32 angle, float& cosine, float& sine) {
+					const u32 negative = 0u - static_cast<u32>(angle);
+					const u32 sine_index = (negative >> 2) & 0x3FFFu;
+					const u32 cosine_index = ((negative + 0x4000u) >> 2) & 0x3FFFu;
+					std::memcpy(&sine, eeMem->Main + 0x0068A8F0u + sine_index * 4, sizeof(sine));
+					std::memcpy(&cosine, eeMem->Main + 0x0068A8F0u + cosine_index * 4, sizeof(cosine));
+					sine = -sine;
+					const float length2 = sine * sine + cosine * cosine;
+					return std::isfinite(length2) && std::abs(length2 - 1.f) < 1e-4f;
+				};
+				if (!native_pair(r[0], cp, sp) || !native_pair(r[1], cy, sy) || !native_pair(r[2], cr, sr))
+					return false;
+			}
 			const float fwd[3]   = { cp * cy, cp * sy, sp };
 			const float right[3] = { (sr * sp * cy) - (cr * sy), (sr * sp * sy) + (cr * cy), -sr * cp };
 			const float up[3]    = { -((cr * sp * cy) + (sr * sy)), (cy * sr) - (cr * sp * sy), cr * cp };
@@ -2320,13 +3536,14 @@ namespace RemixSubmit
 		{
 			float pos[3], ang[3];
 			remix_ps2::mat4 view{};
-			if (!read_ee_camera(pos, view, ang))
+			float fov_y = ee_cam_fov(), aspect = ee_cam_aspect();
+			if (!read_ee_camera(pos, view, ang, &fov_y, &aspect))
 				return false;
 
 			const float near_plane = 1.f;
 			const float far_plane = 100000.f;
 			remix_ps2::mat4 proj =
-				remix_ps2::make_perspective(ee_cam_fov(), ee_cam_aspect(), near_plane, far_plane);
+				remix_ps2::make_perspective(fov_y, aspect, near_plane, far_plane);
 
 			// Scale the depth->w column. Anything non-unity here means the guest's projection
 			// disagreed with the synthetic one about how far a unit of view depth is.
@@ -2998,6 +4215,96 @@ namespace RemixSubmit
 			}
 		}
 
+		u64 hash_floats(const float* values, u32 count);
+		bool s_socom_clear_valid = false;
+		bool s_socom_clear_applied = false;
+		remixapi_Float4D s_socom_clear_color{};
+		remix_ps2::socom::MissionSnapshot s_socom_mission{};
+		remix_ps2::socom::LightingRig s_socom_native_rig{};
+		remix_ps2::socom::LightingRig s_socom_vu_rig{};
+		u64 s_socom_vu_last_frame = 0;
+		u64 s_socom_vu_last_kick = 0;
+		remixapi_LightHandle s_socom_lights[4]{};
+		u64 s_socom_light_key = 0;
+
+		const remix_ps2::socom::LightingRig& socom_light_rig()
+		{
+			const auto serial = remix_ps2::paths::game_id();
+			if ((serial == "SCUS-97134" || serial == "SCUS-97474" || serial == "SCUS-97545") &&
+				(s_socom_native_rig.valid || s_socom_native_rig.menu))
+				return s_socom_native_rig;
+			return s_socom_vu_rig;
+		}
+
+		bool socom_background_active()
+		{
+			return remix_ps2::paths::game_id() == "SCUS-97545" && s_socom_mission.valid &&
+				s_socom_mission.world_identity == 0x7BB684F4 &&
+				std::strcmp(s_socom_mission.mission_name, "run\\steppes\\sp433.zdb") == 0;
+		}
+
+		bool socom_lights_active()
+		{
+			return remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()) &&
+				light_mode() == 1 && !no_debug_scene() &&
+				(s_socom_mission.valid || (s_active_camera.socom_raster && socom_light_rig().valid));
+		}
+
+		void destroy_socom_lights()
+		{
+			for (auto& handle : s_socom_lights)
+			{
+				if (handle)
+					remix_ps2::guarded_destroy_light(s_remix.api().DestroyLight, handle);
+				handle = nullptr;
+			}
+			s_socom_light_key = 0;
+		}
+
+		void refresh_socom_lights()
+		{
+			if (!socom_lights_active())
+			{
+				destroy_socom_lights();
+				return;
+			}
+			const auto& rig = socom_light_rig();
+			const u32 identity = s_socom_mission.valid ? s_socom_mission.world_identity : rig.world_identity;
+			const wchar_t* ambient_keys[] = {L"PCSX2_REMIX_SOCOMAMBIENTR", L"PCSX2_REMIX_SOCOMAMBIENTG", L"PCSX2_REMIX_SOCOMAMBIENTB"};
+			float radiance[3];
+			for (u32 i = 0; i < 3; ++i)
+			{
+				const float authored = env_float_signed(ambient_keys[i], rig.valid ? rig.ambient[i] : 0.f);
+				radiance[i] = std::max(0.f, authored + ambient_radiance());
+			}
+			const u64 wanted = fnv_mix(hash_floats(radiance, 3), identity);
+			if (wanted == s_socom_light_key)
+				return;
+			const bool enabled = radiance[0] > 0.f || radiance[1] > 0.f || radiance[2] > 0.f;
+			destroy_socom_lights();
+			if (enabled)
+			{
+				remixapi_LightInfo info{};
+				info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+				info.hash = fnv_mix(0x534F434F4D4C0003ull, identity);
+				info.isDynamic = 1;
+				info.radiance = {radiance[0], radiance[1], radiance[2]};
+				remixapi_LightInfoDomeEXT dome{};
+				dome.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DOME_EXT;
+				dome.transform = s_identity_transform;
+				info.pNext = &dome;
+				const u32 status = remix_ps2::guarded_create_light(s_remix.api().CreateLight, &info, &s_socom_lights[3]);
+				if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_socom_lights[3])
+				{
+					ERROR_LOG("Remix: SOCOM ambient light creation failed ({})", remix_ps2::error_name(status));
+					return;
+				}
+			}
+			s_socom_light_key = wanted;
+			INFO_LOG("Remix: SOCOM mission lighting: {} ({}) -- ambient only; distant lights disabled",
+				s_socom_mission.valid ? s_socom_mission.world_name : rig.world_name, static_cast<u32>(rig.evidence));
+		}
+
 		// Everything that decides what the two fill lights ARE. Anything in here changing means the
 		// lights have to be destroyed and rebuilt, because the Remix API has no "modify a light":
 		// remixapi_LightInfo is consumed by CreateLight and the handle is immutable thereafter.
@@ -3043,7 +4350,7 @@ namespace RemixSubmit
 			// the caller, so that turning LIGHTMODE to 0 (or 2) while the game runs actually
 			// destroys the fill instead of leaving it burning -- which is what it did before, and
 			// is exactly how a bisect arm that "ran with the key light off" ran at full strength.
-			if (no_debug_scene() || light_mode() != 1)
+			if (no_debug_scene() || light_mode() != 1 || remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()))
 				return want;
 
 			want.winterblade = socom_winterblade_lighting();
@@ -3374,6 +4681,8 @@ namespace RemixSubmit
 		void setup_camera_checked(const remixapi_CameraInfo* info, const char* what, bool& logged)
 		{
 			const u32 code = remix_ps2::guarded_setup_camera(s_remix.api().SetupCamera, info);
+			RemixCameraTrace::RecordAPI(s_frame_counter, info->type, code, info->pNext != nullptr,
+				&info->view[0][0], &info->projection[0][0]);
 			if (code == REMIXAPI_ERROR_CODE_SUCCESS)
 				return;
 
@@ -3530,8 +4839,7 @@ namespace RemixSubmit
 		// give it, a few units in front of the player rather than at infinity.
 		bool sky_camera_enabled()
 		{
-			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_SKYCAM", 1) != 0;
-			return value;
+			return env_int_live(L"PCSX2_REMIX_SKYCAM", 1) != 0;
 		}
 
 		// Distance from the eye at which a sky draw is planted, in world units. 0 disables the push
@@ -3660,6 +4968,8 @@ namespace RemixSubmit
 			// The extent the previous frame actually submitted, in whichever space is in use.
 			// Both tiers get the same treatment: view-space positions are in guest eye-depth
 			// units, which are just as far from "near 0.1" as world-space ones are.
+			RemixCameraTrace::RecordCamera(RemixCameraTrace::SubmittedCamera, s_frame_counter, cam.matrix_hash,
+				cam.valid, s_hold_pending, cam.position, &cam.view.m[0][0], &cam.projection.m[0][0]);
 			const float scene_radius = s_last_bounds.radius();
 
 			if (!cam.valid)
@@ -6729,6 +8039,39 @@ namespace RemixSubmit
 				}
 			}
 
+			// The retail SOCOM raster has explicit native axes and screen scales. Generic
+			// factorization can mirror those axes while preserving the screen image, which
+			// rotates recovered world geometry beneath fixed lights. (AI-assisted.)
+			bool native_socom = false;
+			if (remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()))
+			{
+				for (u32 c = 0; c < frame.count; ++c)
+				{
+					const auto& candidate = frame.items[c];
+					if (candidate.source != 4 || candidate.mem_offset != 64 ||
+						!(candidate.flags & RemixVU1Capture::candidate_flag_feeds_div))
+						continue;
+					remix_ps2::mat4 raster;
+					std::memcpy(&raster, candidate.m, sizeof(raster));
+					remix_ps2::socom_camera::Camera native;
+					if (!remix_ps2::socom_camera::BuildRaster(raster,
+						{vp.ofx, vp.ofy, static_cast<u32>(vp.width), static_cast<u32>(vp.height)}, native))
+						continue;
+					best_split.view = native.view;
+					best_split.projection = native.projection;
+					best_normalized = native.normalized;
+					best_hash = hash_floats(candidate.m, 16);
+					best_offset = candidate.mem_offset;
+					best_source = 4;
+					best_score = 1000.f;
+					best_name = "native-raster";
+					best_transposed = false;
+					best_camtest_key = 0;
+					native_socom = true;
+					break;
+				}
+			}
+
 			// PCSX2_REMIX_CAMTESTALL = 2. Deliberately OUTSIDE the loop above, and after it: these
 			// are not candidates, they are the VU1 neighbourhood the slicer never reads. Nothing
 			// below this point can see them -- best_rank, best_split and s_camtest_elected_key are
@@ -6780,7 +8123,7 @@ namespace RemixSubmit
 			// Which sign is correct cannot be decided from one frame -- that is precisely what the
 			// WORLDFIX audit measures across frames. So this offers both directions and neither is
 			// the default.
-			if (const int worldfix = worldfix_mode(); worldfix >= 2)
+			if (const int worldfix = worldfix_mode(); worldfix >= 2 && !native_socom)
 			{
 				const bool want_positive = (worldfix == 2);
 
@@ -6862,6 +8205,7 @@ namespace RemixSubmit
 			camera.matrix_hash = best_hash;
 			camera.score = best_score;
 			camera.valid = true;
+			camera.socom_raster = native_socom;
 
 			// --- refutation against the geometry, not against ground truth --------------------
 			//
@@ -7584,6 +8928,42 @@ namespace RemixSubmit
 		// nullptr means the pipeline refused this matrix (a verdict that is cached too -- without
 		// that, the ~830 draws carrying a refused hash would each re-run the whole hypothesis
 		// search and turn a fallback into a frame-time cliff).
+		const remix_ps2::clip_solver* socom_draw_solver(u64 ring_hash, const float (&ring_m)[16],
+			float ofx, float ofy, int width, int height)
+		{
+			if (!s_active_camera.socom_raster || !ring_hash || width <= 0 || height <= 0)
+				return nullptr;
+			const float viewport[] = {ofx, ofy, static_cast<float>(width), static_cast<float>(height)};
+			const u64 key = fnv_mix(ring_hash, hash_floats(viewport, 4));
+			static u64 cached_key = 0;
+			static bool cached_valid = false;
+			static remix_ps2::socom_camera::Camera native{};
+			if (cached_key != key)
+			{
+				remix_ps2::mat4 raster;
+				std::memcpy(&raster, ring_m, sizeof(raster));
+				cached_valid = remix_ps2::socom_camera::BuildRaster(raster,
+					{ofx, ofy, static_cast<u32>(width), static_cast<u32>(height)}, native);
+				cached_key = key;
+			}
+			if (!cached_valid)
+				return nullptr;
+			// Publish this kick's full camera for the presentation target. Batch/held scene
+			// snapshots now carry the same camera that recovered their world. (AI-assisted.)
+			if (s_last_viewport.valid && width == s_last_viewport.width && height == s_last_viewport.height &&
+				ofx == s_last_viewport.ofx && ofy == s_last_viewport.ofy)
+			{
+				s_active_camera.view = native.view;
+				s_active_camera.projection = remix_ps2::rebuild_projection_z(native.projection,
+					s_active_camera.near_plane, s_active_camera.far_plane);
+				s_active_camera.solver = native.solver;
+				std::copy_n(native.position, 3, s_active_camera.position);
+				s_active_camera.matrix_hash = ring_hash;
+				s_camera_last_accept_frame = s_frame_counter;
+			}
+			return &native.solver;
+		}
+
 		const remix_ps2::clip_solver* cached_per_draw_solver(u64 ring_hash, const float (&ring_m)[16])
 		{
 			per_draw_camera_entry* victim = &s_per_draw_cameras[0];
@@ -8538,6 +9918,105 @@ namespace RemixSubmit
 			return (limit == 0) || (draw_ordinal < limit);
 		}
 
+		struct native_sky_state
+		{
+			u64 draw_frame = ~0ull;
+			u64 check_frame = ~0ull;
+			u32 phase = 0;
+			u32 framebuffer = 0;
+			bool enabled = false;
+			std::vector<u8> pixels;
+		};
+		native_sky_state s_native_sky;
+
+		void native_sky_reset()
+		{
+			s_native_sky = {};
+			if (s_remix.guest_sky_available())
+				s_remix.set_guest_sky(nullptr, 0, 0, 0);
+		}
+
+		bool native_sky_enabled()
+		{
+			if (s_native_sky.check_frame != s_frame_counter)
+			{
+				s_native_sky.check_frame = s_frame_counter;
+				s_native_sky.enabled = s_remix.guest_sky_available() &&
+					remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3 &&
+					r6_active_light_level().map == "OIL_REFINERY_A";
+			}
+			return s_native_sky.enabled;
+		}
+
+		bool native_sky_begin_draw(const GSRendererHW& r, bool is_triangle, const GSTextureCache::Source* source,
+			const GSTextureCache::Target* target)
+		{
+			if (!native_sky_enabled())
+				return false;
+			if (s_native_sky.draw_frame != s_frame_counter)
+			{
+				s_native_sky.draw_frame = s_frame_counter;
+				s_native_sky.phase = 0;
+				s_native_sky.pixels.clear();
+			}
+			if (s_native_sky.phase >= 4)
+				return false;
+			const bool sky_state = source && !source->m_target && !source->m_from_target &&
+				r.PRIM->TME && !r.PRIM->FST && r.PRIM->FGE && is_triangle &&
+				r.m_context->FRAME.FBW == 10 && r.m_context->FRAME.PSM == PSMCT32 &&
+				r.m_draw_env->FOGCOL.FCR == 78 && r.m_draw_env->FOGCOL.FCG == 57 && r.m_draw_env->FOGCOL.FCB == 22;
+			const u64 hash = sky_state ? remix_ps2::materials::hash_only(source) : 0;
+			const u32 layer = hash == 0xD49FD3F067CB3B79ull ? 1u :
+				(hash == 0x995F820AC9992796ull ? 2u : (hash == 0x58E62991927A5AE1ull ? 3u : 0u));
+			if (layer && (layer == s_native_sky.phase || layer == s_native_sky.phase + 1))
+			{
+				if (s_native_sky.phase == 0)
+					s_native_sky.framebuffer = r.m_context->FRAME.Block();
+				if (s_native_sky.framebuffer == r.m_context->FRAME.Block())
+				{
+					s_native_sky.phase = layer;
+					return true;
+				}
+			}
+			if (s_native_sky.phase != 0)
+			{
+				// This tee runs before the first world draw; the target still contains only native sky.
+				const bool complete = s_native_sky.phase == 3;
+				s_native_sky.phase = 4;
+				if (!complete || !vision_readback(target, s_native_sky.framebuffer, &s_native_sky.pixels))
+				{
+					s_native_sky.pixels.clear();
+					static u32 failures = 0;
+					if ((failures++ % 300) == 0)
+						WARNING_LOG("Remix: native Oil sky capture unavailable; no stale frame reused");
+				}
+				else
+				{
+					static u32 captures = 0;
+					if (captures++ < 4)
+						INFO_LOG("Remix: native Oil sky captured 640x448 after all three layers, frame {}", s_frame_counter);
+				}
+			}
+			return false;
+		}
+
+		void native_sky_present(bool merged_frame_active, bool hold_camera)
+		{
+			if (!native_sky_enabled() || merged_frame_active || s_native_sky.pixels.size() != 640 * 448 * 4 ||
+				s_native_sky.draw_frame == ~0ull || s_frame_counter > s_native_sky.draw_frame + 1 ||
+				(s_native_sky.draw_frame != s_frame_counter && !hold_camera))
+			{
+				s_native_sky.pixels.clear();
+				if (s_remix.guest_sky_available())
+					s_remix.set_guest_sky(nullptr, 0, 0, 0);
+				return;
+			}
+			// Permit one empty half-rate field with the held world; longer gaps invalidate the sky.
+			const u32 status = s_remix.set_guest_sky(s_native_sky.pixels.data(), 640, 448, 640 * 4);
+			if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+				s_native_sky.pixels.clear();
+		}
+
 		// --- sky by texture hash, resolved BEFORE the solver is chosen -----------------------
 		//
 		// A rtx.skyBoxTextures tag already reaches the instance: build_draw_state ORs
@@ -8612,17 +10091,32 @@ namespace RemixSubmit
 				cache_generation = tag_generation;
 			}
 
-			if (const auto found = cache.find(static_cast<const void*>(source)); found != cache.end())
-				return found->second;
+			const bool native_sky = remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()) ||
+				(remix_ps2::paths::game_id() == "SLUS-20883" &&
+				 VMManager::GetCurrentCRC() == 0x21CC1EC3);
+			// Native texture objects can change or be reused within one GS frame.
+			if (!native_sky)
+			{
+				if (const auto found = cache.find(static_cast<const void*>(source)); found != cache.end())
+					return found->second;
+			}
 
 			// 0 for a render-target source by design, and categories_for(0) is 0 -- so an
 			// RT-sourced draw can never be tagged this way, which is correct: a render target has
 			// no stable content identity for a tag to key on.
 			const u64 content_hash = remix_ps2::materials::hash_only(source);
-			const bool sky = (remix_ps2::materials::categories_for(content_hash) &
+			bool sky = (remix_ps2::materials::categories_for(content_hash) &
 								 static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY)) != 0;
 
-			cache.emplace(static_cast<const void*>(source), sky);
+			if (!sky && native_sky)
+			{
+				const u64 bitmap_hash = remix_ps2::materials::hash_only(source, false);
+				sky = (remix_ps2::materials::categories_for(bitmap_hash) &
+					static_cast<u32>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY)) != 0;
+			}
+
+			if (!native_sky)
+				cache.emplace(static_cast<const void*>(source), sky);
 			return sky;
 		}
 
@@ -9417,7 +10911,7 @@ namespace RemixSubmit
 		//
 		// Absolute, NOT relative to the largest target seen: see the gate itself for why the
 		// relative version culled the whole world.
-		// Drop the depth-detached silhouette pass. Measured on R6 3 (logsemix_draws.txt, 708
+		// Drop the depth-detached silhouette pass. Measured on R6 3 (logs/remix_draws.txt, 708
 		// draws): every real surface and every real character uses ZTST=2 (GEQUAL) with depth
 		// writes on. Exactly 9 draws use ZTST=1 (ALWAYS) with ZMSK=1 (no depth write) -- 1.3% of
 		// the draws carrying 24% of the vertices, all one ~3730-vertex character mesh at the same
@@ -9755,7 +11249,7 @@ namespace RemixSubmit
 			blend.pNext = nullptr;
 			blend.alphaTestEnabled = regs.ate ? 1 : 0;
 			blend.alphaTestReferenceValue = static_cast<u8>(regs.aref);
-			blend.alphaTestCompareOp = to_d3d_compare(regs.atst);
+			blend.alphaTestCompareOp = regs.ate ? to_d3d_compare(regs.atst) : 7u; // disabled GS alpha test is ALWAYS in Remix
 			blend.alphaBlendEnabled = regs.abe ? 1 : 0;
 			to_d3d_blend(regs.alpha, blend.srcColorBlendFactor, blend.dstColorBlendFactor);
 			blend.colorBlendOp = 0; // VK_BLEND_OP_ADD (D3DBLENDOP_ADD is 1; the runtime casts to VkBlendOp)
@@ -9855,8 +11349,139 @@ namespace RemixSubmit
 		// Vertices go in exactly as they were built -- world or view space, whichever the frame is
 		// submitting in -- so the batch instance carries the identity transform and there is no
 		// registration to get wrong. Batching and stable identity are alternatives, not partners.
+		// Diagnostic correspondence only: never reuses geometry or changes visibility.
+		struct temporal_draw_probe
+		{
+			struct sample
+			{
+				u32 occurrences = 1;
+				std::vector<remixapi_HardcodedVertex> vertices;
+				std::vector<u32> indices;
+			};
+			struct result
+			{
+				bool report = false;
+				u64 ordinal = 0, gap = 0, draws = 0, matched = 0, added = 0, removed = 0;
+				u64 ambiguous = 0, overflow = 0, exact = 0, within2 = 0, within8 = 0;
+				u64 handles = 0, shared_handles = 0;
+				double max_delta = 0;
+				std::array<u64, 6> passes{};
+			};
+			std::unordered_map<u64, sample> current, previous;
+			std::unordered_set<u64> meshes, previous_meshes;
+			u64 previous_frame = 0, ordinal = 0, draws = 0, overflow = 0, stored_vertices = 0;
+			std::array<u64, 6> passes{};
+			static u32 bits(float value) { u32 out; std::memcpy(&out, &value, sizeof(out)); return out; }
+			static bool same_layout(const sample& a, const sample& b)
+			{
+				if (a.vertices.size() != b.vertices.size() || a.indices != b.indices) return false;
+				for (size_t i = 0; i < a.vertices.size(); ++i)
+				{
+					if (a.vertices[i].color != b.vertices[i].color ||
+						std::memcmp(a.vertices[i].texcoord, b.vertices[i].texcoord, sizeof(a.vertices[i].texcoord))) return false;
+				}
+				return true;
+			}
+			void observe(u64 material, u64 state, u32 pass, bool world,
+				const std::vector<remixapi_HardcodedVertex>& vertices, const std::vector<u32>& indices)
+			{
+				if (!world || ordinal >= 1200 || vertices.empty() || indices.empty()) return;
+				++draws; ++passes[std::min<u32>(pass, 5)];
+				if (current.size() >= 4096 || stored_vertices + vertices.size() > 262144) { ++overflow; return; }
+				u64 key = fnv_mix(fnv_mix(fnv_mix(fnv_seed, material), state), pass);
+				key = fnv_mix(fnv_mix(key, vertices.size()), indices.size());
+				for (const auto& v : vertices)
+				{
+					key = fnv_mix(fnv_mix(fnv_mix(key, v.color), bits(v.texcoord[0])), bits(v.texcoord[1]));
+					for (const float value : v.position) if (!std::isfinite(value)) { ++overflow; return; }
+				}
+				for (const u32 index : indices) { if (index >= vertices.size()) { ++overflow; return; } key = fnv_mix(key, index); }
+				auto [it, inserted] = current.try_emplace(key);
+				if (!inserted) { ++it->second.occurrences; return; }
+				it->second.vertices = vertices; it->second.indices = indices; stored_vertices += vertices.size();
+			}
+			void mesh(u64 handle) { if (ordinal < 1200 && draws != 0) meshes.insert(handle); }
+			result finish(u64 frame)
+			{
+				result out;
+				if (draws == 0) { current.clear(); meshes.clear(); passes = {}; stored_vertices = overflow = 0; return out; }
+				out.ordinal = ++ordinal; out.report = ordinal <= 8 || (ordinal % 60) == 0;
+				out.draws = draws; out.passes = passes; out.overflow = overflow;
+				out.gap = previous.empty() ? 0 : frame - previous_frame;
+				const bool adjacent = !previous.empty() && frame > previous_frame && out.gap <= 2;
+				for (const auto& [key, entry] : current)
+				{
+					if (entry.occurrences != 1) { out.ambiguous += entry.occurrences; continue; }
+					const auto old = previous.find(key);
+					if (!adjacent || old == previous.end() || old->second.occurrences != 1 || !same_layout(entry, old->second)) { ++out.added; continue; }
+					++out.matched; double maximum = 0;
+					bool exact = true;
+					for (size_t i = 0; i < entry.vertices.size(); ++i)
+					{
+						double distance2 = 0;
+						for (u32 j = 0; j < 3; ++j) { const double d = static_cast<double>(entry.vertices[i].position[j]) - old->second.vertices[i].position[j]; distance2 += d * d; }
+						maximum = std::max(maximum, std::sqrt(distance2));
+						exact = exact && std::memcmp(&entry.vertices[i], &old->second.vertices[i], sizeof(entry.vertices[i])) == 0;
+					}
+					out.max_delta = std::max(out.max_delta, maximum);
+					out.exact += exact; out.within2 += maximum <= 2; out.within8 += maximum <= 8;
+				}
+				if (adjacent) for (const auto& [key, entry] : previous)
+				{
+					if (entry.occurrences == 1 && !current.count(key)) ++out.removed;
+				}
+				out.handles = meshes.size();
+				if (adjacent) for (const u64 handle : meshes) out.shared_handles += previous_meshes.count(handle);
+				previous = std::move(current); previous_meshes = std::move(meshes); previous_frame = frame;
+				current.clear(); meshes.clear(); draws = overflow = stored_vertices = 0; passes = {};
+				return out;
+			}
+		};
+		temporal_draw_probe s_temporal_probe;
+		void temporal_probe_finish(u64 frame)
+		{
+			const auto p = s_temporal_probe.finish(frame);
+			if (!p.report) return;
+			INFO_LOG("Remix: TEMPORAL frame {} sample {} gap {} | prepared {} paired {} new {} gone {} ambiguous {} overflow {} | exact-payload {} pos<=2 {} pos<=8 {} max-delta {:.3f} | accepted batch-handles {} shared {} | pass opaque {} alpha {} cutout {} near {} sky {} view {}",
+				frame, p.ordinal, p.gap, p.draws, p.matched, p.added, p.removed, p.ambiguous, p.overflow,
+				p.exact, p.within2, p.within8, p.max_delta, p.handles, p.shared_handles,
+				p.passes[0], p.passes[1], p.passes[2], p.passes[3], p.passes[4], p.passes[5]);
+		}
+
+
+		// Isolate an opaque world material without changing the order of batch surfaces.
+		// The effective ONE/ZERO alias ignores source alpha; unit_alpha remains a
+		// separate proof for the existing additive overlay and lightmap folds.
+		bool batch_material_partition(u32 pass, const draw_state& ds,
+			const remix_ps2::materials::binding& material, bool depth_read, bool depth_write, bool samples_target)
+		{
+			const bool candidate = remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3 &&
+				alpha_state_mode() == 2 && batch_reuse_mode() == 0 && pass == 0 &&
+				depth_read && depth_write && !samples_target && material.material && material.content_hash != 0 &&
+				!ds.is_sky && !ds.is_cutout && ds.categories == 0 && ds.blend.alphaTestEnabled == 0 &&
+				ds.blend.alphaTestCompareOp == 7u && ds.blend.alphaBlendEnabled != 0 &&
+				ds.blend.srcColorBlendFactor == 1u && ds.blend.dstColorBlendFactor == 0u && ds.blend.colorBlendOp == 0u &&
+				ds.blend.srcAlphaBlendFactor == 1u && ds.blend.dstAlphaBlendFactor == 0u && ds.blend.alphaBlendOp == 0u &&
+				ds.blend.writeMask == 0xFu && ds.blend.isTextureFactorBlend == 0;
+			if (!candidate || !s_active_camera.valid || s_scratch_indices.empty()) return false;
+			// Unused slots are zeroed; they cannot establish distance from the eye.
+			// Keep any referenced near geometry on its existing shared-mesh path.
+			for (const u32 index : s_scratch_indices)
+			{
+				if (index >= s_scratch_vertices.size()) return false;
+				double distance2 = 0;
+				for (u32 j = 0; j < 3; ++j)
+				{
+					const double delta = static_cast<double>(s_scratch_vertices[index].position[j]) - s_active_camera.position[j];
+					distance2 += delta * delta;
+				}
+				if (!std::isfinite(distance2) || distance2 < 250.0 * 250.0) return false;
+			}
+			return true;
+		}
+
 		void batch_append(u64 group_key, const draw_state& ds, const remix_ps2::materials::binding& material,
-			u64 draw_hash)
+			u64 draw_hash, bool partition_material = false)
 		{
 			size_t group_index;
 
@@ -9898,12 +11523,14 @@ namespace RemixSubmit
 				batch_surface& fresh = group.surfaces[surface_index];
 				fresh.material_hash = material.content_hash;
 				fresh.material = material.material;
+				fresh.partition_material = partition_material;
 				fresh.vertices.clear();
 				fresh.indices.clear();
 				group.surface_of_material.emplace(material.content_hash, surface_index);
 			}
 
 			batch_surface& surface = group.surfaces[surface_index];
+			surface.partition_material = surface.partition_material && partition_material && surface.material == material.material;
 			const u32 base = static_cast<u32>(surface.vertices.size());
 
 			surface.vertices.insert(surface.vertices.end(), s_scratch_vertices.begin(), s_scratch_vertices.end());
@@ -10231,10 +11858,90 @@ namespace RemixSubmit
 		// A window with no groups is where hold-previous-window lives: that is the empty window the
 		// step-4B measurement found, and it is the last point before Present at which anything can
 		// still be put on the screen.
+		// The fingerprint only indexes candidates; every API payload byte must also match.
+		bool batch_payload(const batch_group& group, std::vector<u8>& payload,
+			size_t surface_begin = 0, size_t surface_end = std::numeric_limits<size_t>::max())
+		{
+			payload.clear();
+			surface_end = std::min(surface_end, group.surfaces_used);
+			if (surface_begin > surface_end) return false;
+			const auto append = [&payload](const void* value, size_t bytes)
+			{
+				if (bytes > s_batch_payload_budget - payload.size()) return false;
+				const auto* data = static_cast<const u8*>(value);
+				if (payload.capacity() < payload.size() + bytes) payload.reserve(payload.size() + bytes);
+				payload.insert(payload.end(), data, data + bytes);
+				return true;
+			};
+			const auto field = [&append](const auto& value) { return append(&value, sizeof(value)); };
+			const bool world = s_active_camera.valid;
+			const bool blend = alpha_state_mode() == 2;
+			if (!field(world) || !field(group.categories) || !field(blend)) return false;
+			if (blend)
+			{
+				if (!field(group.blend.alphaTestEnabled)) return false;
+				if (!field(group.blend.alphaTestReferenceValue)) return false;
+				if (!field(group.blend.alphaTestCompareOp)) return false;
+				if (!field(group.blend.alphaBlendEnabled)) return false;
+				if (!field(group.blend.srcColorBlendFactor)) return false;
+				if (!field(group.blend.dstColorBlendFactor)) return false;
+				if (!field(group.blend.colorBlendOp)) return false;
+				if (!field(group.blend.textureColorArg1Source)) return false;
+				if (!field(group.blend.textureColorArg2Source)) return false;
+				if (!field(group.blend.textureColorOperation)) return false;
+				if (!field(group.blend.textureAlphaArg1Source)) return false;
+				if (!field(group.blend.textureAlphaArg2Source)) return false;
+				if (!field(group.blend.textureAlphaOperation)) return false;
+				if (!field(group.blend.tFactor)) return false;
+				if (!field(group.blend.isTextureFactorBlend)) return false;
+				if (!field(group.blend.srcAlphaBlendFactor)) return false;
+				if (!field(group.blend.dstAlphaBlendFactor)) return false;
+				if (!field(group.blend.alphaBlendOp)) return false;
+				if (!field(group.blend.writeMask)) return false;
+				if (!field(group.blend.isVertexColorBakedLighting)) return false;
+			}
+			u64 surfaces = 0;
+			for (size_t i = surface_begin; i < surface_end; ++i)
+				if (!group.surfaces[i].vertices.empty() && !group.surfaces[i].indices.empty()) ++surfaces;
+			if (!field(surfaces)) return false;
+			for (size_t i = surface_begin; i < surface_end; ++i)
+			{
+				const batch_surface& surface = group.surfaces[i];
+				if (surface.vertices.empty() || surface.indices.empty()) continue;
+				const u64 vertices = surface.vertices.size(), indices = surface.indices.size();
+				if (!field(surface.material_hash) || !field(surface.material) || !field(vertices) || !field(indices) ||
+					!append(surface.vertices.data(), surface.vertices.size() * sizeof(remixapi_HardcodedVertex)) ||
+					!append(surface.indices.data(), surface.indices.size() * sizeof(u32))) return false;
+			}
+			return true;
+		}
+
+		u64 batch_payload_hash(const std::vector<u8>& payload)
+		{
+			u64 hash = fnv_seed;
+			for (const u8 value : payload) { hash ^= value; hash *= fnv_prime; }
+			return hash;
+		}
+
+		u64 batch_unused_hash(u64 hash)
+		{
+			for (;;)
+			{
+				if (hash == 0) hash = 1;
+				const bool flat = std::any_of(s_batch_meshes.begin(), s_batch_meshes.end(),
+					[hash](const batch_mesh& mesh) { return mesh.mesh_hash == hash; });
+				const bool cached = std::any_of(s_batch_mesh_cache.begin(), s_batch_mesh_cache.end(),
+					[hash](const auto& mesh) { return mesh.second.mesh_hash == hash; });
+				if (!flat && !cached) return hash;
+				hash = fnv_mix(hash, 1);
+			}
+		}
+
 		void batch_flush()
 		{
 			if (s_batch_groups_used == 0)
 			{
+				temporal_probe_finish(s_frame_counter);
 				s_batch_group_of_key.clear();
 				hold_previous_window();
 				return;
@@ -10258,16 +11965,25 @@ namespace RemixSubmit
 			// the next window if that window turns out to be empty.
 			s_held_camera = s_active_camera;
 
-			for (size_t g = 0; g < s_batch_groups_used; ++g)
+			for (size_t g = 0, next_surface = 0; g < s_batch_groups_used;)
 			{
+				const size_t group_index = g;
 				batch_group& group = s_batch_groups[g];
+				const size_t surface_begin = next_surface;
+				size_t surface_end = std::min(surface_begin + 1, group.surfaces_used);
+				// An eligible material owns one mesh. Contiguous remaining surfaces retain
+				// their original shared mesh and surface order, including every alpha pass.
+				if (surface_begin < group.surfaces_used && !group.surfaces[surface_begin].partition_material)
+					while (surface_end < group.surfaces_used && !group.surfaces[surface_end].partition_material) ++surface_end;
+				next_surface = surface_end;
+				if (next_surface == group.surfaces_used) { ++g; next_surface = 0; }
 
 				s_batch_surface_scratch.clear();
 				u64 hash = fnv_seed;
 				hash = fnv_mix(hash, s_frame_counter);
-				hash = fnv_mix(hash, g);
+				hash = fnv_mix(hash, group_index);
 
-				for (size_t i = 0; i < group.surfaces_used; ++i)
+				for (size_t i = surface_begin; i < surface_end; ++i)
 				{
 					batch_surface& surface = group.surfaces[i];
 
@@ -10293,29 +12009,26 @@ namespace RemixSubmit
 				remixapi_MeshInfo mesh_info{};
 				mesh_info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
 				mesh_info.pNext = nullptr;
-				// Unique per frame per group: the geometry is camera-derived and genuinely new
-				// every frame, so reusing a hash would ask the runtime to treat different
-				// geometry as the same object.
-				// Content key when reusing, so identical geometry keeps its handle. The old key
-				// (frame counter + group index) is retained for the non-reuse path.
-				const u64 mesh_key = (batch_reuse_mode() != 0) ? group.content : hash;
-				mesh_info.hash = (mesh_key == 0) ? 1 : mesh_key;
+				mesh_info.hash = batch_unused_hash(hash);
 				mesh_info.surfaces_values = s_batch_surface_scratch.data();
 				mesh_info.surfaces_count = s_batch_surface_scratch.size();
 
 				remixapi_MeshHandle handle = nullptr;
-
-				// Same geometry, same handle. Refreshing created_frame keeps a visible group alive;
-				// the reap below retires whatever stops being drawn.
-				const bool reuse = batch_reuse_mode() != 0;
-				if (reuse)
+				const bool reuse = batch_reuse_mode() != 0 ||
+					(remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3);
+				const bool have_payload = reuse && batch_payload(group, s_batch_payload_scratch, surface_begin, surface_end);
+				const u64 payload_hash = have_payload ? batch_payload_hash(s_batch_payload_scratch) : 0;
+				if (have_payload)
 				{
-					const auto cached = s_batch_mesh_cache.find(mesh_info.hash);
-					if (cached != s_batch_mesh_cache.end() && cached->second.handle)
+					const auto range = s_batch_mesh_cache.equal_range(payload_hash);
+					for (auto cached = range.first; cached != range.second; ++cached)
 					{
+						if (!cached->second.handle || cached->second.payload != s_batch_payload_scratch) continue;
 						cached->second.created_frame = s_frame_counter;
 						handle = cached->second.handle;
+						mesh_info.hash = cached->second.mesh_hash;
 						++s_batch_reused;
+						break;
 					}
 				}
 
@@ -10327,17 +12040,21 @@ namespace RemixSubmit
 					if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
 					{
 						ERROR_LOG("Remix: batch CreateMesh failed for group {} ({} surfaces): {}",
-							g, s_batch_surface_scratch.size(), remix_ps2::error_name(status));
+							group_index, s_batch_surface_scratch.size(), remix_ps2::error_name(status));
 						continue;
 					}
 
 					++s_stats.meshes_created;
 					++s_stats.meshes_created_frame;
 					++s_stats.batch_meshes_created;
-					if (reuse)
-						s_batch_mesh_cache[mesh_info.hash] = batch_mesh{handle, s_frame_counter};
+					if (have_payload && s_batch_payload_scratch.size() <= s_batch_payload_budget - s_batch_payload_bytes)
+					{
+						s_batch_mesh_cache.emplace(payload_hash,
+							batch_mesh{handle, s_frame_counter, mesh_info.hash, s_batch_payload_scratch});
+						s_batch_payload_bytes += s_batch_payload_scratch.size();
+					}
 					else
-						s_batch_meshes.push_back(batch_mesh{handle, s_frame_counter});
+						s_batch_meshes.push_back(batch_mesh{handle, s_frame_counter, mesh_info.hash, {}});
 				}
 
 				remixapi_InstanceInfo instance{};
@@ -10357,6 +12074,7 @@ namespace RemixSubmit
 				// value because instance.pNext must point at storage that outlives this call.
 				if (draw_status == REMIXAPI_ERROR_CODE_SUCCESS)
 				{
+					s_temporal_probe.mesh(mesh_info.hash);
 					held_instance held{};
 					held.handle = handle;
 					held.blend = group.blend;
@@ -10368,6 +12086,7 @@ namespace RemixSubmit
 				}
 			}
 
+			temporal_probe_finish(s_frame_counter);
 			s_stats.batch_surfaces_peak = std::max(s_stats.batch_surfaces_peak, surfaces_this_frame);
 			s_stats.batch_vertices_peak = std::max(s_stats.batch_vertices_peak, vertices_this_frame);
 
@@ -10379,6 +12098,7 @@ namespace RemixSubmit
 		// on a save-state load, where the whole scene is replaced in one step.
 		void batch_discard()
 		{
+			s_temporal_probe = {};
 			if (s_remix.ok())
 			{
 				const remixapi_Interface& api = s_remix.api();
@@ -10403,6 +12123,8 @@ namespace RemixSubmit
 
 			s_batch_meshes.clear();
 			s_batch_mesh_cache.clear();
+			s_batch_payload_bytes = 0;
+			s_batch_payload_scratch.clear();
 			s_batch_group_of_key.clear();
 			s_batch_groups_used = 0;
 
@@ -10467,6 +12189,7 @@ namespace RemixSubmit
 					++s_stats.meshes_destroyed;
 					++s_stats.meshes_destroyed_frame;
 				}
+				s_batch_payload_bytes -= it->second.payload.size();
 				it = s_batch_mesh_cache.erase(it);
 			}
 		}
@@ -10654,13 +12377,15 @@ namespace RemixSubmit
 			const int hold_mode_now = hold_empty_mode();
 			INFO_LOG("Remix: overlay {}x{} | screen-ui seen {} nomat {} nondc {} | "
 					 "raster draws {} nopixels {} texels {} fullscreen {} | presents {} | "
-					 "DrawScreenOverlay {} | uiraster {} uimode {} | sprite3d {} draws {}",
+					 "DrawScreenOverlay {} | uiraster {} uimode {} | "
+					 "sprite3d {} draws {} | sprite skip: untex {} nomat {} blit {}",
 				s_overlay_w, s_overlay_h,
 				s_screen_ui_seen, s_screen_ui_nomat, s_screen_ui_nondc,
 				s_overlay_draws, s_overlay_nopixels, s_overlay_texels, s_overlay_fullscreen,
 				s_overlay_presents,
 				(s_remix.api().DrawScreenOverlay != nullptr) ? "available" : "NULL IN INTERFACE",
-				ui_raster_mode(), ui_mode(), sprite_geometry_mode(), s_sprite_geometry_draws);
+				ui_raster_mode(), ui_mode(), sprite_geometry_mode(), s_sprite_geometry_draws,
+				s_sprite_skip_untex, s_sprite_skip_nomat, s_sprite_skip_blit);
 
 			INFO_LOG("Remix: hold-empty {} | empty windows {} held {} cam-held {} skipped-present {} "
 					 "instances {} | "
@@ -10707,9 +12432,30 @@ namespace RemixSubmit
 		return value;
 	}
 
+	void OnSocomLighting(const remix_ps2::socom::LightingRig& rig)
+	{
+		s_socom_native_rig = rig;
+	}
+
+	void OnSocomMission(const remix_ps2::socom::MissionSnapshot& mission)
+	{
+		if (!mission.valid || !s_socom_mission.valid || mission.world_identity != s_socom_mission.world_identity ||
+			std::strcmp(mission.mission_name, s_socom_mission.mission_name) != 0)
+			s_socom_clear_valid = false;
+		s_socom_mission = mission;
+		if (remix_ps2::materials::set_socom_mission(mission.valid ? mission.world_name : "",
+			mission.valid ? mission.world_identity : 0, mission.valid ? mission.mission_name : "") && s_remix.ok())
+		{
+			remix_ps2::materials::refresh_game_config(s_remix);
+			remix_ps2::materials::refresh_categories();
+		}
+	}
+
 	void SetRendererIsRemix(bool enabled)
 	{
 		s_renderer_is_remix = enabled;
+		if (!enabled)
+			rtx_vision_reset();
 		g_armed = enabled || (SpikeMode() > 0);
 
 		// Arm the VU1 matrix scan with the renderer, not with the spike: the spike has no
@@ -11111,7 +12857,238 @@ namespace RemixSubmit
 		}
 	} // namespace
 
-	void OnDrawPrims(const GSRendererHW& r, int rt_unscaled_width, int rt_unscaled_height, const void* tex_source)
+	enum class rs3_screen_kind
+	{
+		None,
+		LoadingSprite,
+		ScopeMask,
+		ScopeRim,
+		AccuracyLine,
+	};
+
+	bool rs3_screen_indices_valid(rs3_screen_kind kind, u32 vertex_count,
+		const u16* indices, u32 index_count)
+	{
+		if (!indices || index_count < 2 ||
+			(kind == rs3_screen_kind::LoadingSprite && (vertex_count != 2 || index_count != 2)) ||
+			(kind == rs3_screen_kind::AccuracyLine && (index_count & 1u)))
+			return false;
+		for (u32 i = 0; i < index_count; ++i)
+			if (indices[i] >= vertex_count)
+				return false;
+		if (kind == rs3_screen_kind::ScopeMask || kind == rs3_screen_kind::ScopeRim)
+		{
+			if ((vertex_count != 4 && vertex_count != 8) || index_count != (vertex_count / 4) * 6)
+				return false;
+			// Identical fan packets share one GS draw; retain each quad's assembled triangles.
+			constexpr u32 quad_indices[] = {0, 1, 2, 0, 2, 3};
+			for (u32 quad = 0; quad < vertex_count / 4; ++quad)
+				for (u32 index = 0; index < 6; ++index)
+					if (indices[quad * 6 + index] != quad * 4 + quad_indices[index])
+						return false;
+		}
+		return true;
+	}
+
+	rs3_screen_kind classify_rs3_screen_primitive(const GIFRegPRIM& prim,
+		const GSDrawingContext& context, const GSVertex* vertices, u32 vertex_count,
+		int target_width, int target_height)
+	{
+		if (!prim.FST || !prim.ABE || !vertices || vertex_count < 2 ||
+			target_width <= 0 || target_height <= 0 ||
+			context.FRAME.FBMSK != 0 || context.FRAME.FBW * 64u < 320u ||
+			context.SCISSOR.SCAY1 < context.SCISSOR.SCAY0 ||
+			context.SCISSOR.SCAY1 - context.SCISSOR.SCAY0 + 1u < 200u)
+			return rs3_screen_kind::None;
+
+		const u32 z = vertices[0].XYZ.Z;
+		for (u32 i = 1; i < vertex_count; ++i)
+			if (vertices[i].XYZ.Z != z)
+				return rs3_screen_kind::None;
+		const u32 maximum = 0xFFFFFFFFu >> (GSLocalMemory::m_psm[context.ZBUF.PSM].fmt * 8);
+
+		if (prim.PRIM == GS_LINELIST && !prim.TME && context.TEST.ZTE &&
+			context.TEST.ZTST == ZTST_GEQUAL && z >= maximum)
+			return rs3_screen_kind::AccuracyLine;
+
+		if (prim.PRIM == GS_SPRITE && vertex_count == 2 && !context.TEST.ZTE && context.ZBUF.ZMSK &&
+			context.ZBUF.PSM == PSMZ24 && z == 0xFFFFu &&
+			(!prim.TME || (context.TEX0.TFX == TFX_MODULATE && !context.TEX0.TCC)))
+			return rs3_screen_kind::LoadingSprite;
+
+		if (prim.PRIM != GS_TRIANGLEFAN || !prim.TME || (vertex_count != 4 && vertex_count != 8) ||
+			!context.TEST.ZTE || context.TEST.ZTST != ZTST_ALWAYS ||
+			context.ZBUF.ZMSK || z < maximum || !context.TEX0.TCC ||
+			context.TEX0.TFX != TFX_MODULATE ||
+			context.TEX0.TW != 8 || context.TEX0.TH != 7 ||
+			(context.TEX0.PSM != PSMT8 && context.TEX0.PSM != PSMT4))
+			return rs3_screen_kind::None;
+
+		if (context.ALPHA.A == 1 && context.ALPHA.B == 2 &&
+			context.ALPHA.C == 0 && context.ALPHA.D == 2)
+			return rs3_screen_kind::ScopeMask;
+		if (context.ALPHA.A == 0 && context.ALPHA.B == 2 &&
+			context.ALPHA.C == 2 && context.ALPHA.D == 1 && context.ALPHA.FIX == 128)
+			return rs3_screen_kind::ScopeRim;
+		return rs3_screen_kind::None;
+	}
+
+
+	bool rs3_loading_present_packet(const GIFRegPRIM& prim, const GSDrawingContext& context,
+		const GSVertex* vertices, u32 vertex_count, const u16* indices, u32 index_count, u32 scan_mask)
+	{
+		// The loading compositor's unblended 32-bit source copy into the 16-bit display buffer.
+		// This is a frame witness only; its full-screen texture never enters the CPU UI raster.
+		if (prim.PRIM != GS_SPRITE || !prim.FST || !prim.TME || prim.ABE ||
+			!vertices || vertex_count != 2 || !indices || index_count != 2 ||
+			indices[0] != 0 || indices[1] != 1 || scan_mask != 0 ||
+			context.FRAME.FBP != 0 || context.FRAME.FBW != 10 || context.FRAME.PSM != PSMCT16S ||
+			context.FRAME.FBMSK != 0 || context.FBA.FBA || context.TEST.ATE || context.TEST.DATE ||
+			context.TEST.ZTE || context.TEST.ZTST != ZTST_ALWAYS ||
+			context.ZBUF.PSM != PSMZ24 || context.ZBUF.ZBP != 0 || !context.ZBUF.ZMSK ||
+			context.TEX0.TBP0 != 0x08C0 || context.TEX0.TBW != 10 || context.TEX0.PSM != PSMCT32 ||
+			context.TEX0.TW != 10 || context.TEX0.TH != 9 || context.TEX0.TCC || context.TEX0.TFX != TFX_DECAL ||
+			context.SCISSOR.SCAX0 != 0 || context.SCISSOR.SCAX1 != 639 ||
+			context.SCISSOR.SCAY0 != 0 || context.SCISSOR.SCAY1 != 447)
+			return false;
+		for (u32 vertex = 0; vertex < 2; ++vertex)
+		{
+			const GSVertex& v = vertices[vertex];
+			if (v.XYZ.Z != 0xFFFFu || v.RGBAQ.R != 128 || v.RGBAQ.G != 128 ||
+				v.RGBAQ.B != 128 || v.RGBAQ.A != 128 ||
+				static_cast<u32>(v.XYZ.X) != context.XYOFFSET.OFX + vertex * 640u * 16u ||
+				static_cast<u32>(v.XYZ.Y) != context.XYOFFSET.OFY + vertex * 448u * 16u ||
+				v.U != 8u + vertex * 640u * 16u || v.V != 8u + vertex * 448u * 16u)
+				return false;
+		}
+		return true;
+	}
+
+	bool socom_hud_boundary(const GIFRegPRIM& prim, const GSDrawingContext& context,
+		const GSVertex* vertices, u32 count, const u16* indices, u32 index_count, int width, int height)
+	{
+		if (!vertices || count != 2 || !indices || index_count != 2 || indices[0] != 0 || indices[1] != 1 ||
+			prim.PRIM != GS_SPRITE || prim.TME || prim.FST || width <= 0 || height <= 0 ||
+			context.TEST.U64 != 0x32001 || context.ZBUF.ZMSK || context.ZBUF.PSM != PSMZ16S ||
+			context.FRAME.PSM != PSMCT32 || context.FRAME.FBMSK || context.FRAME.FBW * 64u < static_cast<u32>(width) ||
+			context.SCISSOR.SCAX0 || context.SCISSOR.SCAY0 ||
+			context.SCISSOR.SCAX1 + 1 != width || context.SCISSOR.SCAY1 + 1 != height)
+			return false;
+		for (u32 i = 0; i < 2; ++i)
+			if (vertices[i].XYZ.Z != 0 || vertices[i].XYZ.X != context.XYOFFSET.OFX + i * width * 16u ||
+				vertices[i].XYZ.Y != context.XYOFFSET.OFY + i * height * 16u)
+				return false;
+		return true;
+	}
+
+	bool socom_near_flat_q(const GSVertex* vertices, u32 count, const u16* indices, u32 index_count)
+	{
+		if (!vertices || !count || !indices || !index_count)
+			return false;
+		u32 minimum = std::numeric_limits<u32>::max(), maximum = 0;
+		for (u32 i = 0; i < index_count; ++i)
+		{
+			if (indices[i] >= count)
+				return false;
+			const float q = vertices[indices[i]].RGBAQ.Q;
+			if (!std::isfinite(q) || q <= 0.f)
+				return false;
+			u32 bits;
+			std::memcpy(&bits, &q, sizeof(bits));
+			minimum = std::min(minimum, bits);
+			maximum = std::max(maximum, bits);
+		}
+		return maximum - minimum <= 2u;
+	}
+
+	bool socom_color_clear(const GIFRegPRIM& prim, const GSDrawingContext& context,
+		const GSVertex* vertices, u32 count, const u16* indices, u32 index_count, int width, int height)
+	{
+		if (!vertices || count != 2 || !indices || index_count != 2 || indices[0] != 0 || indices[1] != 1 ||
+			prim.PRIM != GS_SPRITE || prim.TME || prim.FST || prim.ABE || width <= 0 || height <= 0 ||
+			context.TEST.U64 != 0x30000 || context.ZBUF.ZMSK || context.ZBUF.PSM != PSMZ16S ||
+			context.FRAME.PSM != PSMCT32 || context.FRAME.FBMSK || context.FRAME.FBW * 64u < static_cast<u32>(width) ||
+			context.SCISSOR.SCAX0 || context.SCISSOR.SCAY0 ||
+			context.SCISSOR.SCAX1 + 1 != width || context.SCISSOR.SCAY1 + 1 != height)
+			return false;
+		for (u32 i = 0; i < 2; ++i)
+			if (vertices[i].XYZ.Z != 0 || vertices[i].XYZ.X != context.XYOFFSET.OFX + i * width * 16u ||
+				vertices[i].XYZ.Y != context.XYOFFSET.OFY + i * height * 16u || vertices[i].RGBAQ.A != 128 ||
+				vertices[i].RGBAQ.R != vertices[0].RGBAQ.R || vertices[i].RGBAQ.G != vertices[0].RGBAQ.G ||
+				vertices[i].RGBAQ.B != vertices[0].RGBAQ.B)
+				return false;
+		return true;
+	}
+
+	float socom_clear_channel(u8 value)
+	{
+		const float srgb = static_cast<float>(value) / 255.f;
+		return srgb <= 0.04045f ? srgb / 12.92f : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+	}
+
+	void OnDrawLoadingFrame(const GSRendererHW& r, const void* raw_vertices, u32 vertex_count,
+		const void* raw_indices, u32 index_count)
+	{
+		// Native color clears can be consumed by TryTargetClear before DrawPrims.
+		if (armed() && socom_background_active())
+		{
+			int width, height;
+			if (overlay_display_extent(r, width, height) && s_frame_viewport.valid &&
+				s_frame_viewport.target_frame == s_frame_counter &&
+				s_frame_viewport.width >= width && s_frame_viewport.height >= height &&
+				static_cast<u32>(s_frame_viewport.target) == static_cast<u32>(r.m_context->FRAME.U64) &&
+				s_frame_viewport.zbp == r.m_context->ZBUF.ZBP && socom_color_clear(*r.PRIM, *r.m_context,
+					static_cast<const GSVertex*>(raw_vertices), vertex_count, static_cast<const u16*>(raw_indices), index_count, width, height))
+			{
+				const auto& color = static_cast<const GSVertex*>(raw_vertices)[0].RGBAQ;
+				s_socom_clear_color = {socom_clear_channel(color.R), socom_clear_channel(color.G), socom_clear_channel(color.B), 1.f};
+				s_socom_clear_valid = true;
+			}
+		}
+		// The measured CA menu clears its 32-bit canvas before any menu geometry.
+		// Its 16-bit presentation copy uses another buffer, so keep this witness
+		// tied to the native menu layout instead of the display-copy FBP.
+		if (armed() && ui_mode() != 0 && ui_raster_mode() != 0 && sprite_geometry_mode() == 0 &&
+			remix_ps2::paths::game_id() == "SCUS-97545" && VMManager::GetCurrentCRC() == 0xD7CFDCCF &&
+			socom_light_rig().menu && r.m_context->FRAME.U64 == 0xA0046 && r.m_context->ZBUF.ZBP == 210)
+		{
+			int width, height;
+			if (overlay_display_extent(r, width, height) && width == 640 && height == 448 &&
+				socom_color_clear(*r.PRIM, *r.m_context, static_cast<const GSVertex*>(raw_vertices), vertex_count,
+					static_cast<const u16*>(raw_indices), index_count, width, height))
+			{
+				s_socom_hud_frame = s_frame_counter;
+				s_socom_hud_target = r.m_context->FRAME.U64;
+				s_socom_hud_depth.assign(static_cast<size_t>(width) * height, 0u);
+			}
+		}
+		// SOCOM clears only depth before rendering its own HUD camera and weapon icon.
+		// Observe this before GSRendererHW optimizes the clear or the guest primitive data.
+		if (armed() && ui_mode() != 0 && ui_raster_mode() != 0 && sprite_geometry_mode() == 0 &&
+			remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()))
+		{
+			int width, height;
+			if (overlay_display_extent(r, width, height) && s_frame_viewport.valid &&
+				s_frame_viewport.target_frame == s_frame_counter &&
+				s_frame_viewport.width >= width && s_frame_viewport.height >= height &&
+				static_cast<u32>(s_frame_viewport.target) == static_cast<u32>(r.m_context->FRAME.U64) &&
+				s_frame_viewport.zbp == r.m_context->ZBUF.ZBP && socom_hud_boundary(*r.PRIM, *r.m_context,
+				static_cast<const GSVertex*>(raw_vertices), vertex_count, static_cast<const u16*>(raw_indices), index_count, width, height))
+			{
+				s_socom_hud_frame = s_frame_counter;
+				s_socom_hud_target = r.m_context->FRAME.U64;
+				s_socom_hud_depth.assign(static_cast<size_t>(width) * height, 0u);
+			}
+		}
+		if (!armed() || ui_mode() == 0 || ui_raster_mode() == 0 || sprite_geometry_mode() != 0 ||
+			remix_ps2::paths::game_id() != "SLUS-20883" || VMManager::GetCurrentCRC() != 0x21CC1EC3)
+			return;
+		if (rs3_loading_present_packet(*r.PRIM, *r.m_context, static_cast<const GSVertex*>(raw_vertices), vertex_count,
+			static_cast<const u16*>(raw_indices), index_count, r.m_draw_env->SCANMSK.MSK))
+			s_merged_loading_frame = s_frame_counter;
+	}
+
+	void OnDrawPrims(const GSRendererHW& r, int rt_unscaled_width, int rt_unscaled_height, const void* tex_source, const void* rt_target)
 	{
 		if (!armed())
 			return;
@@ -11121,11 +13098,241 @@ namespace RemixSubmit
 		if (!s_live)
 			return;
 
+		if (remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()))
+		{
+			const u64 kick = RemixVU1Capture::GSKickSeq();
+			if (kick != s_socom_vu_last_kick)
+			{
+				s_socom_vu_last_kick = kick;
+				remix_ps2::socom::LightingRig rig;
+				s_socom_vu_rig = RemixVU1Capture::LookupKickLighting(kick, rig) ? rig : remix_ps2::socom::LightingRig{};
+				s_socom_vu_last_frame = s_frame_counter;
+			}
+		}
+		RemixCameraTrace::RecordCamera(RemixCameraTrace::RecoveryCamera, s_frame_counter, s_active_camera.matrix_hash,
+			s_active_camera.valid, false, s_active_camera.position, &s_active_camera.view.m[0][0], &s_active_camera.projection.m[0][0]);
+		rs3_native_viewport(r, r.m_context->FRAME.FBW, rt_unscaled_width, rt_unscaled_height);
+
+		// A refused/intervening draw invalidates the predecessor too.
+		const bool previous_overlay_base = s_overlay_base_valid && s_overlay_base_frame == s_frame_counter;
+		s_overlay_base_valid = false;
+
 		++s_stats.draws_seen;
 
 		if (s_frame_counter < submit_delay_frames())
 		{
 			++s_stats.skip_submit_delay;
+			return;
+		}
+
+		if (native_sky_begin_draw(r, r.m_vt.m_primclass == GS_TRIANGLE_CLASS, static_cast<const GSTextureCache::Source*>(tex_source),
+			static_cast<const GSTextureCache::Target*>(rt_target)))
+			return;
+
+		const bool vision_enabled = ui_mode() != 0 && ui_raster_mode() != 0 && sprite_geometry_mode() == 0 &&
+			remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3;
+		if (vision_enabled)
+		{
+			const auto* source = static_cast<const GSTextureCache::Source*>(tex_source);
+			const rs3_vision_draw draw = vision_draw_info(*r.PRIM, *r.m_context, r.m_vertex->buff, r.m_vertex->next,
+				r.m_index->buff, r.m_index->tail, source && (source->m_target || source->m_from_target),
+				r.m_draw_env->SCANMSK.MSK);
+			vision_begin_draw(r, draw, static_cast<const GSTextureCache::Target*>(rt_target), rt_unscaled_width, rt_unscaled_height);
+		}
+		else if (s_vision_background_frame != ~0ull || s_rtx_vision_held_kind != rs3_vision_kind::None)
+		{
+			vision_reset();
+		}
+
+		if (s_socom_hud_frame == s_frame_counter && s_socom_hud_target == r.m_context->FRAME.U64 &&
+			remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()) && ui_mode() != 0 && ui_raster_mode() != 0 && sprite_geometry_mode() == 0)
+		{
+			// The depth clear is a phase witness, never color in the overlay.
+			if (r.m_context->TEST.ATE && r.m_context->TEST.ATST == ATST_NEVER && r.m_context->TEST.AFAIL == AFAIL_ZB_ONLY)
+				return;
+			const u32 count = r.m_vertex->next, indices = r.m_index->tail;
+			if (!count || count > s_max_vertices_per_mesh || indices > s_max_indices_per_mesh || !indices ||
+				(r.m_vt.m_primclass != GS_TRIANGLE_CLASS && r.m_vt.m_primclass != GS_SPRITE_CLASS && r.m_vt.m_primclass != GS_LINE_CLASS))
+				return;
+			for (u32 i = 0; i < indices; ++i)
+				if (r.m_index->buff[i] >= count)
+					return;
+			int width, height;
+			if (!overlay_display_extent(r, width, height) || rt_unscaled_width < width || rt_unscaled_height < height ||
+				r.m_context->SCISSOR.SCAX0 > r.m_context->SCISSOR.SCAX1 ||
+				r.m_context->SCISSOR.SCAY0 > r.m_context->SCISSOR.SCAY1 ||
+				r.m_context->SCISSOR.SCAX0 >= width || r.m_context->SCISSOR.SCAY0 >= height ||
+				!overlay_begin_draw(r, width, height))
+				return;
+			if (s_socom_hud_depth.size() != static_cast<size_t>(s_overlay_w) * s_overlay_h)
+				return;
+			const auto* source = static_cast<const GSTextureCache::Source*>(tex_source);
+			overlay_raster_options options = overlay_native_options(*r.m_context, source);
+			options.socom_hud = true;
+			options.untextured = !r.PRIM->TME;
+			options.perspective_texture = r.PRIM->TME && !r.PRIM->FST;
+			options.gs_modulation = r.PRIM->TME && r.m_context->TEX0.TFX == TFX_MODULATE;
+			options.depth_test = r.m_context->TEST.ZTE ? r.m_context->TEST.ZTST : ZTST_ALWAYS;
+			options.depth_write = r.m_context->TEST.ZTE && !r.m_context->ZBUF.ZMSK;
+			options.depth_mask = 0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_context->ZBUF.PSM].fmt * 8);
+			if (r.PRIM->ABE && r.m_context->ALPHA.U64 == 0x48)
+				options.blend = overlay_blend_mode::Additive;
+			u64 hash = 0;
+			if (!options.untextured)
+			{
+				hash = remix_ps2::materials::bind(s_remix, source, s_frame_counter, true).content_hash;
+				if (!hash) { ++s_screen_ui_nomat; return; }
+			}
+			s_scratch_vertices.clear(); s_scratch_indices.clear(); s_scratch_ndc.clear(); s_socom_hud_vertices.clear();
+			auto add_vertex = [&](const GSVertex& v)
+			{
+				remixapi_HardcodedVertex out{};
+				out.color = (std::min(255u, static_cast<u32>(v.RGBAQ.A) * 255u / 128u) << 24) |
+					(static_cast<u32>(v.RGBAQ.R) << 16) | (static_cast<u32>(v.RGBAQ.G) << 8) | v.RGBAQ.B;
+				out.texcoord[0] = options.untextured ? 0.f : r.PRIM->FST ? static_cast<float>(v.U) / (16.f * options.texture_width) : v.ST.S;
+				out.texcoord[1] = options.untextured ? 0.f : r.PRIM->FST ? static_cast<float>(v.V) / (16.f * options.texture_height) : v.ST.T;
+				s_scratch_vertices.push_back(out);
+				s_socom_hud_vertices.push_back({v.RGBAQ.Q, v.XYZ.Z});
+				float x, y;
+				overlay_ndc_from_gs(v.XYZ.X, v.XYZ.Y, r.m_context->XYOFFSET.OFX, r.m_context->XYOFFSET.OFY, x, y);
+				s_scratch_ndc.push_back(x); s_scratch_ndc.push_back(y);
+			};
+			if (r.m_vt.m_primclass == GS_SPRITE_CLASS)
+			{
+				for (u32 i = 0; i + 1 < indices; i += 2)
+				{
+					const GSVertex& first = r.m_vertex->buff[r.m_index->buff[i]];
+					const GSVertex& second = r.m_vertex->buff[r.m_index->buff[i + 1]];
+					const u32 base = static_cast<u32>(s_scratch_vertices.size());
+					for (u32 corner = 0; corner < 4; ++corner)
+					{
+						GSVertex v = second;
+						const bool right = corner == 1 || corner == 2, bottom = corner >= 2;
+						v.XYZ.X = right ? second.XYZ.X : first.XYZ.X; v.XYZ.Y = bottom ? second.XYZ.Y : first.XYZ.Y;
+						v.U = right ? second.U : first.U; v.V = bottom ? second.V : first.V;
+						v.ST.S = right ? second.ST.S : first.ST.S; v.ST.T = bottom ? second.ST.T : first.ST.T;
+						add_vertex(v);
+					}
+					s_scratch_indices.insert(s_scratch_indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+				}
+			}
+			else
+			{
+				for (u32 i = 0; i < count; ++i) add_vertex(r.m_vertex->buff[i]);
+				if (r.m_vt.m_primclass == GS_LINE_CLASS)
+				{
+					if (options.untextured) overlay_raster_lines(r.m_index->buff, indices, options);
+					return;
+				}
+				s_scratch_indices.assign(r.m_index->buff, r.m_index->buff + indices);
+			}
+			overlay_raster(hash, options);
+			++s_screen_ui_seen;
+			return;
+		}
+
+		// Explicit screen primitives never enter camera reconstruction or world geometry.
+		const bool rs3_screen_enabled = ui_mode() != 0 && ui_raster_mode() != 0 &&
+			sprite_geometry_mode() == 0 && remix_ps2::paths::game_id() == "SLUS-20883" &&
+			VMManager::GetCurrentCRC() == 0x21CC1EC3;
+		const rs3_screen_kind screen_kind = rs3_screen_enabled ?
+			classify_rs3_screen_primitive(*r.PRIM, *r.m_context, r.m_vertex->buff,
+				r.m_vertex->next, rt_unscaled_width, rt_unscaled_height) : rs3_screen_kind::None;
+		if (screen_kind != rs3_screen_kind::None)
+		{
+			const int minimum_area = offscreen_rt_min_area();
+			if (minimum_area > 0 && rt_unscaled_width * rt_unscaled_height < minimum_area)
+			{
+				++s_stats.skip_offscreen_rt;
+				return;
+			}
+			const u32 count = r.m_vertex->next;
+			const u32 indices = r.m_index->tail;
+			if (count > s_max_vertices_per_mesh || indices > s_max_indices_per_mesh || indices < 2)
+			{
+				++s_stats.skip_too_large;
+				return;
+			}
+			if (!rs3_screen_indices_valid(screen_kind, count, r.m_index->buff, indices))
+			{
+				++s_stats.skip_empty;
+				return;
+			}
+			if (screen_kind == rs3_screen_kind::LoadingSprite)
+				s_merged_loading_frame = s_frame_counter;
+			const auto* const ui_source = static_cast<const GSTextureCache::Source*>(tex_source);
+			overlay_raster_options options = overlay_native_options(*r.m_context, ui_source);
+			options.untextured = r.PRIM->TME == 0;
+			options.gs_modulation = !options.untextured;
+			options.blend = screen_kind == rs3_screen_kind::ScopeMask ? overlay_blend_mode::DestinationMultiply :
+				(screen_kind == rs3_screen_kind::ScopeRim ? overlay_blend_mode::Additive : overlay_blend_mode::SourceOver);
+			u64 hash = 0;
+			if (!options.untextured)
+			{
+				const bool loading_background = screen_kind == rs3_screen_kind::LoadingSprite;
+				const remix_ps2::materials::binding binding = remix_ps2::materials::bind(
+					s_remix, ui_source, s_frame_counter, loading_background);
+				hash = binding.content_hash;
+				if (hash == 0)
+				{
+					++s_screen_ui_nomat;
+					return;
+				}
+			}
+			if (!overlay_begin_draw(r, rt_unscaled_width, rt_unscaled_height))
+				return;
+			s_scratch_vertices.clear();
+			s_scratch_ndc.clear();
+			s_scratch_indices.clear();
+			auto add_ui_vertex = [&](const GSVertex& vertex)
+			{
+				remixapi_HardcodedVertex out{};
+				out.color = (std::min(255u, static_cast<u32>(vertex.RGBAQ.A) * 255u / 128u) << 24) |
+					(static_cast<u32>(vertex.RGBAQ.R) << 16) |
+					(static_cast<u32>(vertex.RGBAQ.G) << 8) | static_cast<u32>(vertex.RGBAQ.B);
+				out.texcoord[0] = static_cast<float>(vertex.U) / (16.f * static_cast<float>(options.texture_width));
+				out.texcoord[1] = static_cast<float>(vertex.V) / (16.f * static_cast<float>(options.texture_height));
+				s_scratch_vertices.push_back(out);
+				float x, y;
+				overlay_ndc_from_gs(vertex.XYZ.X, vertex.XYZ.Y,
+					r.m_context->XYOFFSET.OFX, r.m_context->XYOFFSET.OFY, x, y);
+				s_scratch_ndc.push_back(x);
+				s_scratch_ndc.push_back(y);
+			};
+			if (screen_kind == rs3_screen_kind::LoadingSprite)
+			{
+				if (r.m_index->buff[0] >= count || r.m_index->buff[1] >= count)
+				{
+					++s_stats.skip_empty;
+					return;
+				}
+				const GSVertex& first = r.m_vertex->buff[r.m_index->buff[0]];
+				const GSVertex& second = r.m_vertex->buff[r.m_index->buff[1]];
+				for (int corner = 0; corner < 4; ++corner)
+				{
+					const bool right = corner == 1 || corner == 2;
+					const bool bottom = corner == 2 || corner == 3;
+					GSVertex vertex = second;
+					vertex.XYZ.X = right ? second.XYZ.X : first.XYZ.X;
+					vertex.XYZ.Y = bottom ? second.XYZ.Y : first.XYZ.Y;
+					vertex.U = right ? second.U : first.U;
+					vertex.V = bottom ? second.V : first.V;
+					add_ui_vertex(vertex);
+				}
+				s_scratch_indices = {0, 1, 2, 0, 2, 3};
+			}
+			else
+			{
+				for (u32 i = 0; i < count; ++i)
+					add_ui_vertex(r.m_vertex->buff[i]);
+				if (screen_kind == rs3_screen_kind::AccuracyLine)
+				{
+					overlay_raster_lines(r.m_index->buff, indices, options);
+					return;
+				}
+				s_scratch_indices.assign(r.m_index->buff, r.m_index->buff + indices);
+			}
+			overlay_raster(hash, options);
 			return;
 		}
 
@@ -11142,9 +13349,13 @@ namespace RemixSubmit
 		const bool sprite_ui_probe = sprite_class && r.m_process_texture &&
 			ui_mode() != 0 && ui_raster_mode() != 0;
 		// SPRITE3D admits the same draws for the opposite reason: not to composite them over the
-		// image but to submit them as geometry the path tracer can light.
-		const bool sprite_geometry = sprite_class && r.m_process_texture &&
-			sprite_geometry_mode() != 0;
+		// image but to submit them as geometry the path tracer can light. From mode 2 an
+		// untextured sprite is admitted too -- a flat panel or gradient carried in vertex colour.
+		const bool sprite_geometry = sprite_class && sprite_geometry_mode() != 0 &&
+			(r.m_process_texture || sprite_geometry_mode() >= 2);
+
+		if (sprite_class && !sprite_geometry && !r.m_process_texture && sprite_geometry_mode() != 0)
+			++s_sprite_skip_untex;
 		// Either way the draw needs the two-vertices-per-primitive treatment below.
 		const bool sprite_quad = sprite_ui_probe || sprite_geometry;
 
@@ -11164,7 +13375,20 @@ namespace RemixSubmit
 		double fst_z_b = 0.0;
 		const bool untex_draw = !r.m_process_texture;
 		const bool fst_draw = !untex_draw && (r.PRIM->FST != 0);
-		const bool z_depth = untex_draw || fst_draw;
+		const u32 effect_max_z = 0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_context->ZBUF.PSM].fmt * 8);
+		const bool world_depth_draw = s_active_camera.valid && r.m_context->TEST.ZTE != 0 &&
+			r.m_context->TEST.ZTST >= ZTST_GEQUAL && [&]() {
+				if (sprite_class)
+					return r.m_vertex->next > 1u && r.m_vertex->buff[1].XYZ.Z < effect_max_z;
+				return std::any_of(r.m_index->buff, r.m_index->buff + r.m_index->tail, [&](u16 index) {
+					return index < r.m_vertex->next && r.m_vertex->buff[index].XYZ.Z < effect_max_z;
+				});
+			}();
+		// Affine ST effects carry Q=1 for UVs; their tested Z still locates them in the world.
+		const bool affine_world_draw = world_depth_draw && r.m_vt.m_primclass == GS_TRIANGLE_CLASS &&
+			!untex_draw && r.PRIM->FST == 0 && r.m_vt.m_eq.q &&
+			r.m_vertex->next != 0 && r.m_vertex->buff[0].RGBAQ.Q == 1.f;
+		const bool z_depth = untex_draw || fst_draw || affine_world_draw;
 		// TWO DIFFERENT QUESTIONS, and widening one of them broke the other.
 		//
 		// fallback_screen_ui answers "there is no camera, so treat this flat draw as a screen
@@ -11176,15 +13400,41 @@ namespace RemixSubmit
 		// ui_candidate answers only "is this draw eligible for the 2D overlay rasteriser". It may
 		// be wide, because the raster path uses NDC and UVs and never touches w, and a draw it
 		// consumes returns before geometry submission anyway.
-		const bool flat_2d = (z_depth ? (r.m_vt.m_eq.z && (!fst_draw || !remix_ps2::nocam_enabled()))
+		const bool native_ca_menu = remix_ps2::paths::game_id() == "SCUS-97545" && socom_light_rig().menu;
+		// Menu transforms can leave flat screen quads one or two Q ULPs apart.
+		const bool menu_flat_q = native_ca_menu && !s_active_camera.valid && !z_depth &&
+			r.m_vt.m_primclass == GS_TRIANGLE_CLASS && r.m_vt.m_eq.z &&
+			socom_near_flat_q(r.m_vertex->buff, r.m_vertex->next, r.m_index->buff, r.m_index->tail);
+		const bool flat_2d = menu_flat_q || (z_depth ? (r.m_vt.m_eq.z && (!fst_draw || !remix_ps2::nocam_enabled()))
 									  : r.m_vt.m_eq.q);
-		const bool fallback_screen_ui = !untex_draw && !s_active_camera.valid && flat_2d;
-		const bool ui_candidate = !untex_draw && ui_mode() != 0 && flat_2d;
+		// The `!untex_draw` half is about Q: an untextured draw never wrote one, so it normally
+		// has to go the Z-recovery route. A sprite on a 2D screen has no depth to recover and
+		// belongs in the view-space tier at w = 1 whether or not it carries a texture, so
+		// SPRITE3D's untextured sprites join it.
+		const bool fallback_screen_ui = (!untex_draw || sprite_geometry) &&
+			!s_active_camera.valid && flat_2d;
+		const bool ui_candidate = !untex_draw && ui_mode() != 0 && flat_2d && !world_depth_draw;
+		// Font sprites use flat UVs at the maximum guest depth with a GEQUAL test.
+		// They have no perspective Q; use unit depth for their screen raster path.
+		// Other flat draws retain their depth and the UIWMAX distance guard.
+		const u32 ui_depth_index = sprite_class ? 1u : 0u;
+		const bool fst_screen_ui = ui_candidate && fst_draw && ui_raster_mode() != 0 &&
+			!sprite_geometry && !r.m_cached_ctx.DepthRead() &&
+			r.m_context->TEST.ZTE != 0 && r.m_context->TEST.ZTST == ZTST_GEQUAL &&
+			r.m_vertex->next > ui_depth_index && r.m_vertex->buff[ui_depth_index].XYZ.Z >=
+				(0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_context->ZBUF.PSM].fmt * 8));
 
 		// Counted at the point of CLASSIFICATION, so "the HUD is not being recognised as 2D" and
 		// "it is recognised but the rasteriser rejects it" stop looking identical in the log.
 		if (fallback_screen_ui)
 			++s_screen_ui_seen;
+
+		if (affine_world_draw && !s_effect_depth.solution(s_frame_counter, r.m_context->FRAME.U64,
+			r.m_context->ZBUF.PSM, fst_z_a, fst_z_b))
+		{
+			++s_stats.skip_fst;
+			return;
+		}
 
 		// Untextured: no texture means no Q was ever written, and also no material -- these come
 		// back from materials::bind() with the null binding and shade like Rainbow Six 3's white
@@ -11213,7 +13463,7 @@ namespace RemixSubmit
 		// viewed exactly head-on is lost -- applied to the only varying quantity FST draws have.
 		// Applies to every Z-depth draw, textured or not: for an untextured draw Q is not merely
 		// the wrong divisor, it was never written, so testing it would pass everything through.
-		if (!fallback_screen_ui && !ui_candidate && (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q))
+		if (!fallback_screen_ui && !ui_candidate && !world_depth_draw && (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q))
 		{
 			// Counted separately: "how many FST draws have no depth variation at all" is the
 			// number that decides whether depth-from-Z can recover geometry for this title or
@@ -11560,8 +13810,10 @@ namespace RemixSubmit
 			}
 		}
 
-		if (shadow_pass_mode() != 0 && r.m_cached_ctx.TEST.ZTE != 0 &&
-			r.m_cached_ctx.TEST.ZTST == 1 && r.m_cached_ctx.ZBUF.ZMSK != 0)
+		// Use the guest's queued context: the hardware renderer changes a passing
+		// GEQUAL test to ALWAYS, which otherwise misidentifies font sprites as shadows.
+		if (shadow_pass_mode() != 0 && r.m_context->TEST.ZTE != 0 &&
+			r.m_context->TEST.ZTST == ZTST_ALWAYS && r.m_context->ZBUF.ZMSK != 0)
 		{
 			++s_stats.skip_shadow_pass;
 			return;
@@ -11625,6 +13877,9 @@ namespace RemixSubmit
 			s_frame_viewport.width = rt_unscaled_width;
 			s_frame_viewport.height = rt_unscaled_height;
 			s_frame_viewport.weight = vertex_count;
+			s_frame_viewport.target = r.m_context->FRAME.U64;
+			s_frame_viewport.target_frame = s_frame_counter;
+			s_frame_viewport.zbp = r.m_context->ZBUF.ZBP;
 		}
 
 		// The synthetic projection the recovered geometry is expressed against. Only its two
@@ -11666,8 +13921,9 @@ namespace RemixSubmit
 		// nullptr = "this draw's camera is the frame camera, or the ring/pipeline could not give a
 		// trustworthy one, or placement is off" -- all of which mean: un-project with the frame
 		// solver, unchanged.
-		const remix_ps2::clip_solver* const draw_camera =
-			world_mode ? per_draw_solver(draw_kick_hash, draw_kick_m) : nullptr;
+		const remix_ps2::clip_solver* const draw_camera = world_mode ?
+			(s_active_camera.socom_raster ? socom_draw_solver(draw_kick_hash, draw_kick_m,
+				ox, oy, rt_unscaled_width, rt_unscaled_height) : per_draw_solver(draw_kick_hash, draw_kick_m)) : nullptr;
 		const remix_ps2::clip_solver& base_solver = draw_camera ? *draw_camera : s_active_camera.solver;
 
 		// Sky geometry has to be solved in a space with no eye in it.
@@ -11739,10 +13995,12 @@ namespace RemixSubmit
 				const GSVertex& va = guest_verts[ia];
 				const GSVertex& vb = guest_verts[ib];
 
-				if (std::abs(static_cast<int>(va.XYZ.X) - static_cast<int>(vb.XYZ.X)) >= blit_x &&
+				if (sprite_blit_mode() == 0 &&
+					std::abs(static_cast<int>(va.XYZ.X) - static_cast<int>(vb.XYZ.X)) >= blit_x &&
 					std::abs(static_cast<int>(va.XYZ.Y) - static_cast<int>(vb.XYZ.Y)) >= blit_y)
 				{
 					++s_overlay_fullscreen;
+					++s_sprite_skip_blit;
 					continue;
 				}
 
@@ -11786,6 +14044,19 @@ namespace RemixSubmit
 
 		const GSVertex* const verts = sprite_quad ? s_sprite_vertices.data() : r.m_vertex->buff;
 
+		s_scratch_referenced.assign(vertex_count, 0);
+		const u32 referenced_index_count = index_count - (index_count % 3);
+		for (u32 i = 0; i < referenced_index_count; ++i)
+		{
+			const u32 index = sprite_quad ? s_sprite_indices[i] : r.m_index->buff[i];
+			if (index >= vertex_count)
+			{
+				++s_stats.skip_empty;
+				return;
+			}
+			s_scratch_referenced[index] = 1;
+		}
+
 		// The baked lightmap for this surface, sampled from the masked channel passes that
 		// re-drew these same vertices. Complete only once all three channels have been seen.
 		const lm_verts* lm_fold = nullptr;
@@ -11815,7 +14086,7 @@ namespace RemixSubmit
 		// far-distance scan below needs it too, and computing it twice would be two expressions
 		// that have to be kept in step by hand. Its other reader is draw_zfit further down.
 		const double zfit_scale = 1.0 / static_cast<double>(
-			0xFFFFFFFFu >> (GSLocalMemory::m_psm[r.m_cached_ctx.ZBUF.PSM].fmt * 8));
+			0xFFFFFFFFu >> (GSLocalMemory::m_psm[affine_world_draw ? r.m_context->ZBUF.PSM : r.m_cached_ctx.ZBUF.PSM].fmt * 8));
 
 		// The draw's nearest vertex in eye depth, for the far-distance requirement on sky
 		// classification (PCSX2_REMIX_SKYMINW). It has to be known HERE, before the vertex loop,
@@ -11850,8 +14121,10 @@ namespace RemixSubmit
 				1.0f / static_cast<float>(1u << r.m_cached_ctx.TEX0.TW) / 16.0f;
 			for (u32 i = 0; i < vertex_count; ++i)
 			{
+				if (s_scratch_referenced[i] == 0)
+					continue;
 				const GSVertex& v = verts[i];
-				const float q = fallback_screen_ui ? 1.f : (z_depth ?
+				const float q = (fallback_screen_ui || fst_screen_ui) ? 1.f : (z_depth ?
 					static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
 					v.RGBAQ.Q);
 				const float w = 1.0f / q;
@@ -11920,6 +14193,15 @@ namespace RemixSubmit
 		// which is what a skybox is -- rather than 5 feet in front of the player.
 		const bool sky_push = (sky_distance() > 0.f) && (cloud_sky_draw || hash_sky_draw);
 
+		// Oil Refinery's black 8x8 sky layer is colored by GS fog, not by its texture.
+		// Its captured FOGCOL is brown and its vertex F varies across the sky. The bridge
+		// otherwise loses that color because Remix has no GS fog coordinate.
+		const bool rs3_black_fog_sky = remix_ps2::paths::game_id() == "SLUS-20883" &&
+			VMManager::GetCurrentCRC() == 0x21CC1EC3 && hash_sky_draw && source && r.PRIM->FGE &&
+			r.m_draw_env->FOGCOL.FCR == 78 && r.m_draw_env->FOGCOL.FCG == 57 &&
+			r.m_draw_env->FOGCOL.FCB == 22 &&
+			remix_ps2::materials::hash_only(source) == 0xD49FD3F067CB3B79ull;
+
 		const remix_ps2::clip_solver& solver = sky_draw ? sky_solver : base_solver;
 
 		s_scratch_vertices.clear();
@@ -11963,6 +14245,16 @@ namespace RemixSubmit
 		// FST=0 draws contribute: they are the ones carrying both Z and a trustworthy w, and
 		// feeding recovered values back into the fit would make it self-confirming.
 		z_fit draw_zfit{};
+		z_fit draw_effect_zfit{};
+		bool draw_effect_matches = true;
+		const bool effect_fit_candidate = world_mode && !sky_draw && !z_depth && !r.m_vt.m_eq.q &&
+			!r.m_vt.m_eq.z && !s_effect_depth.ready_for(s_frame_counter, r.m_context->FRAME.U64,
+				r.m_context->ZBUF.PSM) && r.m_context->FRAME.PSM == PSMCT32 &&
+			r.m_context->FRAME.FBMSK == 0 && r.m_context->TEST.ZTE != 0 &&
+			r.m_context->TEST.ZTST == ZTST_GEQUAL && r.m_context->TEST.ATE == 0 &&
+			r.m_context->TEST.DATE == 0 && r.m_context->ZBUF.ZMSK == 0 &&
+			r.m_context->ALPHA.A == r.m_context->ALPHA.B && r.m_context->ALPHA.D == 0 &&
+			r.m_draw_env->SCANMSK.MSK == 0;
 
 		vcolor_stats draw_vcolor{};
 		u32 first_vcolor = 0;
@@ -11996,6 +14288,16 @@ namespace RemixSubmit
 
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
+			if (s_scratch_referenced[i] == 0)
+			{
+				s_scratch_vertices[i] = {};
+				if (!s_scratch_ndc.empty())
+				{
+					s_scratch_ndc[(size_t)i * 2] = 0.f;
+					s_scratch_ndc[((size_t)i * 2) + 1] = 0.f;
+				}
+				continue;
+			}
 			const GSVertex& v = verts[i];
 
 			const float ndc_x = ((static_cast<float>(v.XYZ.X) - 0.05f) * sx) - offset_x;
@@ -12009,7 +14311,7 @@ namespace RemixSubmit
 			// Q = a*zn + b fitted on this title's FST=0 draws. Non-positive or non-finite
 			// results fall out at the same finite check -- Z below the far plane inverts to a
 			// negative w, and rejecting it is correct.
-			const float q = fallback_screen_ui ? 1.f : (z_depth ?
+			const float q = (fallback_screen_ui || fst_screen_ui) ? 1.f : (z_depth ?
 				static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
 				v.RGBAQ.Q);
 			const float w = 1.0f / q;
@@ -12080,8 +14382,17 @@ namespace RemixSubmit
 			out.normal[2] = -1.f;
 			// An untextured draw has no texture to coordinate against, and TEX0.TW/TH are stale,
 			// so fst_inv_w/h would be meaningless here. Zero, and let the null material shade it.
-			out.texcoord[0] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.U) * fst_inv_w) : (v.ST.S * w));
-			out.texcoord[1] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.V) * fst_inv_h) : (v.ST.T * w));
+			float texture_w = affine_world_draw ? 1.f : w;
+			// The tee sees raw ST/Q before SetupIA; screen position w=1 must not change UVs.
+			if (native_ca_menu && fallback_screen_ui && !z_depth && std::isfinite(v.RGBAQ.Q) && v.RGBAQ.Q > 0.f)
+			{
+				const float inverse_q = 1.f / v.RGBAQ.Q;
+				if (std::isfinite(inverse_q) && std::isfinite(v.ST.S * inverse_q) &&
+					std::isfinite(v.ST.T * inverse_q))
+					texture_w = inverse_q;
+			}
+			out.texcoord[0] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.U) * fst_inv_w) : (v.ST.S * texture_w));
+			out.texcoord[1] = untex_draw ? 0.f : (fst_draw ? (static_cast<float>(v.V) * fst_inv_h) : (v.ST.T * texture_w));
 			// PS2 alpha is 0..128 (0x80 == 1.0); scale into 0..255 for a D3DCOLOR-style ARGB.
 			// Alpha is kept either way -- it is real transparency, not baked lighting.
 			const u32 alpha = std::min<u32>(255u, static_cast<u32>(v.RGBAQ.A) * 2u);
@@ -12097,10 +14408,21 @@ namespace RemixSubmit
 				out.color = (alpha << 24) | (mr << 16) | (mg << 8) | mb;
 			}
 			else
-			out.color = (vcolor_mode() != 0) ?
+			out.color = (vcolor_mode() != 0 || (native_ca_menu && fallback_screen_ui)) ?
 				((alpha << 24) | (static_cast<u32>(v.RGBAQ.R) << 16) |
 					(static_cast<u32>(v.RGBAQ.G) << 8) | static_cast<u32>(v.RGBAQ.B)) :
 				((alpha << 24) | 0x00FFFFFFu);
+
+			if (rs3_black_fog_sky)
+			{
+				// Raster mixes post-texture black with FOGCOL at F/256. Moving this
+				// affine color to the vertices preserves the captured sky gradient.
+				const u32 inverse_fog = 256u - static_cast<u32>(v.FOG);
+				const u32 red = (78u * inverse_fog) >> 8;
+				const u32 green = (57u * inverse_fog) >> 8;
+				const u32 blue = (22u * inverse_fog) >> 8;
+				out.color = (alpha << 24) | (red << 16) | (green << 8) | blue;
+			}
 
 			draw_vcolor.add(v.RGBAQ.R, v.RGBAQ.G, v.RGBAQ.B);
 			if (i == 0)
@@ -12131,6 +14453,8 @@ namespace RemixSubmit
 						u32 good = 0;
 						for (u32 j = 0; j < vertex_count; ++j)
 						{
+							if (s_scratch_referenced[j] == 0)
+								continue;
 							const float qj = fallback_screen_ui ? 1.f : (z_depth ?
 								static_cast<float>((static_cast<double>(verts[j].XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
 								verts[j].RGBAQ.Q);
@@ -12188,11 +14512,15 @@ namespace RemixSubmit
 			min_z = std::min(min_z, static_cast<u32>(v.XYZ.Z));
 			max_z = std::max(max_z, static_cast<u32>(v.XYZ.Z));
 
-			// Only draws whose w came from Q may feed the Q-from-Z fit. Feeding a Z-derived w back
-			// in would be circular -- the fit would be regressing its own output and would report a
-			// perfect R^2 no matter how wrong it was. z_depth, not !fst_draw, for that reason.
-			if (!z_depth)
-				draw_zfit.add(static_cast<double>(v.XYZ.Z) * zfit_scale, static_cast<double>(w));
+			if (effect_fit_candidate)
+			{
+				const double zn = static_cast<double>(v.XYZ.Z) / static_cast<double>(effect_max_z);
+				const double raw_q = static_cast<double>(v.RGBAQ.Q);
+				draw_effect_matches = draw_effect_matches && v.XYZ.Z > 0 &&
+					std::isfinite(raw_q) && raw_q > 0.0 &&
+					s_effect_depth.accepts(s_frame_counter, r.m_context->FRAME.U64, r.m_context->ZBUF.PSM, zn, raw_q);
+				draw_effect_zfit.add(zn, 1.0 / raw_q);
+			}
 		}
 
 		// The eye-plane gate. w = 1/Q is the depth the guest divided by; the per-vertex check
@@ -12208,7 +14536,7 @@ namespace RemixSubmit
 			// 2D that the exact const-Q test missed. Placed here because min_w/max_w only exist
 			// once the vertex loop has run; see w_flat_limit() for the menu measurement behind it.
 			const float flat_limit = w_flat_limit();
-			if (!fallback_screen_ui && !ui_candidate && flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
+			if (!fallback_screen_ui && !ui_candidate && !world_depth_draw && flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
 			{
 				++s_stats.skip_w_flat;
 				return;
@@ -12293,7 +14621,33 @@ namespace RemixSubmit
 				}
 			}
 
+			// Only perspective triangles whose w came from Q may calibrate Z recovery. A hardware
+			// draw can batch flat HUD primitives with world geometry, so draw-level equality flags
+			// are not sufficient to keep their unrelated Z/Q pairs out of the fit.
+			if (!z_depth && world_depth_draw && !sprite_quad)
+			{
+				const u32 triangle_indices = index_count - (index_count % 3);
+				for (u32 i = 0; i < triangle_indices; i += 3)
+				{
+					const GSVertex* triangle[3] = {
+						&verts[r.m_index->buff[i]],
+						&verts[r.m_index->buff[i + 1]],
+						&verts[r.m_index->buff[i + 2]],
+					};
+					const u32 z0 = triangle[0]->XYZ.Z;
+					const float q0 = triangle[0]->RGBAQ.Q;
+					if ((z0 == triangle[1]->XYZ.Z && z0 == triangle[2]->XYZ.Z) ||
+						(q0 == triangle[1]->RGBAQ.Q && q0 == triangle[2]->RGBAQ.Q))
+						continue;
+
+					for (const GSVertex* sample : triangle)
+						draw_zfit.add(static_cast<double>(sample->XYZ.Z) * zfit_scale,
+							1.0 / static_cast<double>(sample->RGBAQ.Q));
+				}
+			}
 			s_zfit.merge(draw_zfit);
+			if (effect_fit_candidate && draw_effect_matches)
+				s_effect_depth.add(draw_effect_zfit, s_frame_counter, r.m_context->FRAME.U64, r.m_context->ZBUF.PSM);
 
 			if (vcolor_varies)
 				++draw_vcolor.draws_varying;
@@ -12391,6 +14745,23 @@ namespace RemixSubmit
 		const float degenerate_edge = degenerate_area_epsilon() * degenerate_scale;
 		const float degenerate_cross = degenerate_edge * degenerate_edge;
 
+		// RS3 shares vertices between faces. A thin face can reverse its eye-facing normal
+		// and overwrite a stable neighbor's normal. Give each face its own corners so this
+		// pass actually preserves flat shading. Lightmap folding requires raw vertex indices.
+		const bool rs3_flat_normals = remix_ps2::paths::game_id() == "SLUS-20883" &&
+			VMManager::GetCurrentCRC() == 0x21CC1EC3 && world_mode && !ui_candidate &&
+			!sprite_geometry && !sky_draw && !sky_push && !hash_sky_draw && !cloud_sky_draw &&
+			!classify_sky(r.m_cached_ctx.DepthRead(), r.m_cached_ctx.DepthWrite(),
+				s_submitted_this_frame, draw_samples_render_target(tex_source), min_w) &&
+			lightmap_fold_mode() == 0;
+		u64 flat_normal_topology = fnv_seed;
+		if (rs3_flat_normals)
+		{
+			flat_normal_topology = fnv_mix(flat_normal_topology, vertex_count);
+			s_flat_normal_vertices.clear();
+			s_flat_normal_vertices.reserve(std::min<size_t>(s_scratch_indices.size(), s_max_vertices_per_mesh));
+		}
+
 		size_t write = 0;
 
 		for (size_t i = 0; (i + 2) < s_scratch_indices.size(); i += 3)
@@ -12442,15 +14813,27 @@ namespace RemixSubmit
 				}
 			}
 
+			if (rs3_flat_normals && (s_flat_normal_vertices.size() + 3) > s_max_vertices_per_mesh)
+			{
+				++s_stats.skip_too_large;
+				return;
+			}
+
 			// The whole triangle shares it: doubleSided = 1 makes the winding irrelevant.
 			for (u32 k = 0; k < 3; ++k)
 			{
 				const u32 index = s_scratch_indices[i + k];
-				remixapi_HardcodedVertex& target = s_scratch_vertices[index];
+				if (rs3_flat_normals)
+				{
+					flat_normal_topology = fnv_mix(flat_normal_topology, index);
+					s_flat_normal_vertices.push_back(s_scratch_vertices[index]);
+				}
+				remixapi_HardcodedVertex& target = rs3_flat_normals ?
+					s_flat_normal_vertices.back() : s_scratch_vertices[index];
 				target.normal[0] = n[0];
 				target.normal[1] = n[1];
 				target.normal[2] = n[2];
-				s_scratch_indices[write + k] = index;
+				s_scratch_indices[write + k] = rs3_flat_normals ? static_cast<u32>(write + k) : index;
 			}
 
 			write += 3;
@@ -12465,6 +14848,9 @@ namespace RemixSubmit
 			return;
 		}
 
+		if (rs3_flat_normals)
+			s_scratch_vertices.swap(s_flat_normal_vertices);
+
 		smooth_scratch_normals(degenerate_scale);
 
 		// Normals are final here, and every vertex still carries its baked colour, which is the
@@ -12476,13 +14862,21 @@ namespace RemixSubmit
 		// Recomputed here rather than read off the Source: only HashCacheEntry* is stored
 		// there (GSTextureCache.h:306) and it is null on most draws and always null for a
 		// render-target source, so the key has to be rebuilt from TEX0/TEXA/CLUT/region.
-		const bool allow_render_target_snapshot = sky_draw;
+		// Sky was the only caller that needed this, because SOCOM's sky IS a render target. A 2D
+		// screen is the second: the PS2 composites menu art through render targets, so on the BIOS
+		// menu the icons and the backdrop arrive as sprites whose source is a target and bind()
+		// refused them -- measured as `sprite skip: nomat`, the bulk of every refused sprite once
+		// the untextured and blit counts came back at 0 and 1,632 frozen. Snapshotting still costs
+		// a GPU->CPU download and is itself gated by PCSX2_REMIX_RTTEX (0 = off), so this only
+		// opens the door; it does not take anything on its own.
+		const bool allow_render_target_snapshot = sky_draw || sprite_geometry;
 		// An untextured draw has no source to key a material on, so bind() would hand back null and
 		// the surface would shade colourless -- and since UNTEXZ these are the majority of a SOCOM
 		// frame. Give them the shared white material instead, so their per-vertex colour lands.
 		const remix_ps2::materials::binding material = untex_draw ?
 			remix_ps2::materials::bind_untextured(s_remix) :
-			remix_ps2::materials::bind(s_remix, source, s_frame_counter, allow_render_target_snapshot);
+			(rs3_black_fog_sky ? remix_ps2::materials::bind_fog_sky(s_remix) :
+			remix_ps2::materials::bind(s_remix, source, s_frame_counter, allow_render_target_snapshot));
 
 		// Fully transparent in the guest: it drew nothing, so neither should we.
 		if (drop_clear_mode() != 0 && max_vertex_alpha == 0 && vcolor_mode() != 0)
@@ -12516,23 +14910,15 @@ namespace RemixSubmit
 		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok &&
 			!sprite_geometry && material.content_hash != 0 && !s_scratch_ndc.empty())
 		{
-			// Size the buffer to the guest's own target the first time a UI draw appears, so the
-			// overlay is authored at native resolution and Remix scales it once, at the end.
-			if (s_overlay_w != (u32)rt_unscaled_width || s_overlay_h != (u32)rt_unscaled_height)
+			if (overlay_begin_draw(r, rt_unscaled_width, rt_unscaled_height))
 			{
-				overlay_reset((u32)rt_unscaled_width, (u32)rt_unscaled_height);
-				s_overlay_frame = ~0ull;
+				overlay_rebase_ndc(rt_unscaled_width, rt_unscaled_height);
+				overlay_raster_options options = overlay_native_options(*r.m_context, source);
+				// Ordinary UI retains raw GS RGB: 128 is neutral for MODULATE.
+				options.gs_modulation = r.PRIM->TME && r.m_context->TEX0.TFX == TFX_MODULATE &&
+					(vcolor_mode() != 0 || (native_ca_menu && fallback_screen_ui));
+				overlay_raster(material.content_hash, options);
 			}
-
-			// First UI draw of this frame: wipe last frame's HUD and rebuild.
-			if (s_overlay_frame != s_frame_counter)
-			{
-				s_overlay_frame = s_frame_counter;
-				std::fill(s_overlay.begin(), s_overlay.end(), (u8)0);
-				s_overlay_used = false;
-			}
-
-			overlay_raster(material.content_hash);
 			return;
 		}
 
@@ -12550,8 +14936,9 @@ namespace RemixSubmit
 		// the guest sampling its own render target, not menu art. Submitting it as geometry adds
 		// a full-screen untextured quad in front of the eye at best, and it is the draw the
 		// runtime died on at worst (see the divide-by-zero note below), so refuse it here.
-		if (sprite_geometry && material.material == nullptr)
+		if (sprite_geometry && material.material == nullptr && sprite_geometry_mode() < 3)
 		{
+			++s_sprite_skip_nomat;
 			++s_stats.skip_not_triangle;
 			return;
 		}
@@ -12640,6 +15027,10 @@ namespace RemixSubmit
 
 			for (const u32 index : s_scratch_indices)
 				hash = fnv_mix(hash, index);
+
+			// Expanded sequential indices no longer encode the guest mesh topology.
+			if (rs3_flat_normals)
+				hash = fnv_mix(hash, flat_normal_topology);
 
 			if (identity_use_color())
 			{
@@ -12805,12 +15196,23 @@ namespace RemixSubmit
 			return;
 		}
 
-		// Same geometry, different material: a multitexture pass, not a duplicate. Keyed on the
-		// dedupe key with the material contribution removed, so it is exactly "this draw's
-		// triangles in this place, whatever is bound to them". Diagnostic only -- the draw is
-		// submitted either way. See multipass_overlay for what this is for.
+		// Hash geometry directly: XOR cannot remove a material folded through FNV.
 		{
-			const u64 geometry_key = fnv_mix(dedupe_key ^ material.content_hash, 0x9E3779B97F4A7C15ull);
+			u64 geometry_key = fnv_mix(fnv_seed, 0x47454F4D45545259ull);
+			geometry_key = fnv_mix(geometry_key, s_scratch_vertices.size());
+			geometry_key = fnv_mix(geometry_key, s_scratch_indices.size());
+			geometry_key = fnv_mix(geometry_key, r.m_context->FRAME.U64);
+			for (const remixapi_HardcodedVertex& v : s_scratch_vertices)
+			{
+				for (u32 k = 0; k < 3; ++k)
+				{
+					u32 bits;
+					std::memcpy(&bits, &v.position[k], sizeof(bits));
+					geometry_key = fnv_mix(geometry_key, bits);
+				}
+			}
+			for (const u32 index : s_scratch_indices)
+				geometry_key = fnv_mix(geometry_key, index);
 			if (!s_frame_geometry_hashes.insert(geometry_key).second)
 				++s_stats.multipass_overlay;
 		}
@@ -12838,6 +15240,72 @@ namespace RemixSubmit
 		draw_state ds = build_draw_state(regs, material.content_hash, s_submitted_this_frame,
 			untex_draw, cloud_sky_draw || hash_sky_draw, sprite_quad);
 
+		// Frostbite deliberately draws this remote mesh with a zero fog factor, replacing every
+		// pixel with the level's background colour. Remix has no GS fog coordinate, so submitting
+		// the textured mesh exposes two dark columns that the guest made invisible. Suppress only
+		// this exact fully-fogged mission-local material and state.
+		const bool frostbite_fog_hidden_common = socom_background_active() && world_mode &&
+			r.PRIM->TME && r.PRIM->FGE && regs.depth_read && regs.depth_write && regs.abe &&
+			r.m_cached_ctx.TEX0.PSM == PSMT8 && r.m_cached_ctx.TEX0.TCC != 0 &&
+			regs.tfx == TFX_MODULATE &&
+			r.m_draw_env->FOGCOL.FCR == 90 && r.m_draw_env->FOGCOL.FCG == 90 &&
+			r.m_draw_env->FOGCOL.FCB == 92;
+		const bool frostbite_fog_hidden_body = frostbite_fog_hidden_common &&
+			material.content_hash == 0x9F68B2731C3702E0ull && r.m_cached_ctx.TEX0.TBP0 == 0x3886 &&
+			regs.ate == 0 && regs.alpha.A == 0 && regs.alpha.B == 1 &&
+			regs.alpha.C == 0 && regs.alpha.D == 1;
+		const bool frostbite_fog_hidden_trim = frostbite_fog_hidden_common &&
+			material.content_hash == 0x60B56A6511E52B60ull && r.m_cached_ctx.TEX0.TBP0 == 0x3846 &&
+			regs.ate != 0 && regs.atst == ATST_GEQUAL && regs.aref == 64 &&
+			r.m_cached_ctx.TEST.AFAIL == AFAIL_KEEP && regs.alpha.A == 0 && regs.alpha.B == 0 &&
+			regs.alpha.C == 0 && regs.alpha.D == 0 && regs.alpha.FIX == 64;
+		const bool frostbite_fog_hidden_state = frostbite_fog_hidden_body || frostbite_fog_hidden_trim;
+		if (frostbite_fog_hidden_state)
+		{
+			bool all_referenced_vertices_fully_fogged = true;
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				if (s_scratch_referenced[i] && verts[i].FOG != 0)
+				{
+					all_referenced_vertices_fully_fogged = false;
+					break;
+				}
+			}
+			if (all_referenced_vertices_fully_fogged)
+				return;
+		}
+
+		// Frostbite builds its snow from two ordinary alpha-blended textures followed by four
+		// framebuffer channel passes on the same terrain geometry. A missing target binding becomes
+		// Remix's default material, so these six coincident surfaces do not reproduce the guest's
+		// composition. Collapse that exact mission-local sequence to its authored snow base as one
+		// opaque depth-writing surface.
+		const bool frostbite_terrain_state = socom_background_active() && world_mode &&
+			regs.depth_read && regs.depth_write && regs.abe && regs.ate == 0 &&
+			regs.alpha.A == 0 && regs.alpha.B == 1 && regs.alpha.C == 0 && regs.alpha.D == 1 &&
+			r.m_cached_ctx.TEX0.PSM == PSMT8 && r.m_cached_ctx.TEX0.TCC != 0 &&
+			regs.tfx == TFX_MODULATE;
+		const bool frostbite_terrain_base = frostbite_terrain_state &&
+			material.content_hash == 0x69136C9F60EB5514ull && r.m_cached_ctx.TEX0.TBP0 == 0x3748;
+		const bool frostbite_terrain_detail = frostbite_terrain_state &&
+			material.content_hash == 0x0D87B867FFE1A549ull && r.m_cached_ctx.TEX0.TBP0 == 0x3848;
+		const u32 frostbite_channel_tbp = r.m_cached_ctx.TEX0.TBP0;
+		const bool frostbite_terrain_channel = socom_background_active() && world_mode && r.PRIM->TME &&
+			regs.depth_read && !regs.depth_write && regs.abe && regs.ate == 0 &&
+			regs.alpha.A == 0 && regs.alpha.B == 1 && regs.alpha.C == 0 && regs.alpha.D == 1 &&
+			r.m_cached_ctx.TEX0.PSM == PSMCT32 && r.m_cached_ctx.TEX0.TCC != 0 &&
+			regs.tfx == TFX_MODULATE &&
+			(frostbite_channel_tbp == 0x2300 || frostbite_channel_tbp == 0x2400 ||
+				frostbite_channel_tbp == 0x2500 || frostbite_channel_tbp == 0x2600);
+		if (frostbite_terrain_detail || frostbite_terrain_channel)
+			return;
+		if (frostbite_terrain_base)
+		{
+			ds.blend.alphaBlendEnabled = 0;
+			ds.blend.srcColorBlendFactor = ds.blend.srcAlphaBlendFactor = 1u;
+			ds.blend.dstColorBlendFactor = ds.blend.dstAlphaBlendFactor = 0u;
+		}
+
 		// A lightmap pass sits exactly on the surface it modulates, so it has to be a decal or it
 		// z-fights -- that is what made the FBMSK gate necessary in the first place. Static, because
 		// baked lighting does not move. IGNORE_BAKED_LIGHTING keeps the runtime from also treating
@@ -12847,6 +15315,68 @@ namespace RemixSubmit
 			ds.categories |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
 			ds.categories |= REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING;
 		}
+
+		// R6's unmasked detail pass uses (Cd - 0)*Ad + Cs. The runtime cannot
+		// translate DST_ALPHA, but an immediately preceding unity-alpha base makes
+		// this exactly Cs + Cd. Compare actual positions/indices, never material hashes.
+		// Needs proper testing in live gameplay and during map changes.
+		const bool additive_overlay = alpha_state_mode() == 2 && batch_mode() != 0 && batch_reuse_mode() == 0 && world_mode && !ds.is_sky &&
+			regs.abe && regs.alpha.A == 1 && regs.alpha.B == 2 && regs.alpha.C == 1 && regs.alpha.D == 0 &&
+			material.material && material.unit_alpha &&
+			r.m_context->TEST.ZTE != 0 && r.m_context->TEST.ZTST == ZTST_GEQUAL &&
+			r.m_draw_env->SCANMSK.MSK == 0 &&
+			previous_overlay_base && s_overlay_base_target == r.m_context->FRAME.U64 &&
+			s_overlay_base_test == r.m_context->TEST.U64 &&
+			s_overlay_base_zbuf == r.m_context->ZBUF.U64 &&
+			s_overlay_base_scissor == r.m_context->SCISSOR.U64 &&
+			std::all_of(verts, verts + vertex_count, [](const GSVertex& v) { return v.RGBAQ.A == 0x80; }) &&
+			s_overlay_base_indices == s_scratch_indices &&
+			s_overlay_base_vertices.size() == s_scratch_vertices.size() &&
+			std::equal(s_scratch_vertices.begin(), s_scratch_vertices.end(), s_overlay_base_vertices.begin(),
+				[](const remixapi_HardcodedVertex& a, const remixapi_HardcodedVertex& b) {
+					return std::memcmp(a.position, b.position, sizeof(a.position)) == 0;
+				});
+		if (additive_overlay)
+		{
+			ds.blend.srcColorBlendFactor = ds.blend.dstColorBlendFactor = 1u; // ONE + ONE
+			ds.blend.srcAlphaBlendFactor = ds.blend.dstAlphaBlendFactor = 1u;
+			ds.categories |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
+			ds.categories |= REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING;
+		}
+
+		// (A - B) is zero, so D == Cs replaces RGB independently of source alpha.
+		// Keep it in the runtime's opaque traversal instead of the unordered alpha path.
+		const bool opaque_replacement = alpha_state_mode() == 2 && world_mode && !ds.is_sky &&
+			material.material && regs.abe &&
+			regs.alpha.A == regs.alpha.B && regs.alpha.D == 0 &&
+			r.m_context->FRAME.PSM == PSMCT32 && r.m_context->FRAME.FBMSK == 0 &&
+			r.m_cached_ctx.FRAME.FBMSK == 0 && regs.ate == 0 && r.m_context->TEST.ATE == 0 && r.m_cached_ctx.TEST.DATE == 0 && r.m_context->TEST.DATE == 0 &&
+			r.m_context->FBA.FBA == 0 && r.m_draw_env->SCANMSK.MSK == 0 &&
+			r.m_cached_ctx.TEX0.TCC != 0 && regs.tfx == TFX_MODULATE;
+		if (opaque_replacement)
+		{
+			ds.blend.srcColorBlendFactor = ds.blend.srcAlphaBlendFactor = 1u;
+			ds.blend.dstColorBlendFactor = ds.blend.dstAlphaBlendFactor = 0u;
+		}
+
+		const auto remember_overlay_base = [&]() {
+			if (batch_reuse_mode() != 0 || !world_mode || ds.is_sky || !material.material || !material.unit_alpha ||
+				r.m_context->FRAME.PSM != PSMCT32 || r.m_context->FRAME.FBMSK != 0 ||
+				r.m_cached_ctx.FRAME.FBMSK != 0 || r.m_cached_ctx.TEST.ATE != 0 || r.m_cached_ctx.TEST.DATE != 0 ||
+				r.m_draw_env->SCANMSK.MSK != 0 ||
+				r.m_context->FBA.FBA != 0 || regs.alpha.A != regs.alpha.B || regs.alpha.D != 0 ||
+				r.m_cached_ctx.TEX0.TCC == 0 || regs.tfx != TFX_MODULATE ||
+				!std::all_of(verts, verts + vertex_count, [](const GSVertex& v) { return v.RGBAQ.A == 0x80; }))
+				return;
+			s_overlay_base_frame = s_frame_counter;
+			s_overlay_base_target = r.m_context->FRAME.U64;
+			s_overlay_base_test = r.m_context->TEST.U64;
+			s_overlay_base_zbuf = r.m_context->ZBUF.U64;
+			s_overlay_base_scissor = r.m_context->SCISSOR.U64;
+			s_overlay_base_vertices = s_scratch_vertices;
+			s_overlay_base_indices = s_scratch_indices;
+			s_overlay_base_valid = true;
+		};
 
 		// The batch key: everything that lives on the instance. Two draws may share a mesh only
 		// if they agree on all of it. Materials are per surface and deliberately absent.
@@ -13114,6 +15644,12 @@ namespace RemixSubmit
 			}
 		}
 
+		// Loading sprites and retained camera state must not start a diagnostic capture.
+		// This draw has survived geometry validation and the screen-overlay gates.
+		if (world_mode && world_depth_draw && !sprite_quad && !ds.is_sky &&
+			draw_bounds.valid && s_scratch_indices.size() >= 3)
+			s_camera_trace_world_seen = true;
+
 		if (batch_mode() != 0)
 		{
 			// A GEOMETRY key, not an identity key. `hash` under STABLEID deliberately excludes
@@ -13154,7 +15690,24 @@ namespace RemixSubmit
 				geom_hash = fnv_mix(geom_hash, static_cast<u64>(static_cast<s64>(std::llround(ccy / cq))));
 				geom_hash = fnv_mix(geom_hash, static_cast<u64>(static_cast<s64>(std::llround(ccz / cq))));
 			}
-			batch_append(group_key, ds, material, geom_hash);
+			u32 trace_pass = ds.is_sky ? 4u : !world_mode ? 5u : ds.is_cutout ? 2u :
+				(ds.blend.srcColorBlendFactor == 1u && ds.blend.dstColorBlendFactor == 0u &&
+				 ds.blend.alphaTestCompareOp == 7u) ? 0u : 1u;
+			if (world_mode && !ds.is_sky && !s_scratch_vertices.empty())
+			{
+				double distance2 = 0;
+				for (u32 j = 0; j < 3; ++j)
+				{
+					double mean = 0;
+					for (const auto& v : s_scratch_vertices) mean += v.position[j];
+					const double d = mean / s_scratch_vertices.size() - s_active_camera.position[j]; distance2 += d * d;
+				}
+				if (distance2 < 250.0 * 250.0) trace_pass = 3;
+			}
+			s_temporal_probe.observe(material.content_hash, group_key, trace_pass, world_mode, s_scratch_vertices, s_scratch_indices);
+			batch_append(group_key, ds, material, geom_hash,
+				batch_material_partition(trace_pass, ds, material, regs.depth_read, regs.depth_write, regs.samples_target));
+			remember_overlay_base();
 
 			if (!ds.is_sky && draw_bounds.valid)
 			{
@@ -13438,15 +15991,77 @@ namespace RemixSubmit
 		++s_submitted_this_frame;
 	}
 
-	void OnVSync()
+	void OnGuestMovieDecode()
 	{
+		s_guest_movie_decodes.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void OnGuestMovieState(bool active)
+	{
+		s_guest_movie_active.store(active, std::memory_order_relaxed);
+	}
+
+	void OnGSReset()
+	{
+		native_sky_reset();
+		s_camera_trace_world_seen = false;
+		if (remix_ps2::paths::game_id() == "SCUS-97545")
+			s_frame_viewport.valid = false;
+		socom_hud_reset();
+		batch_discard();
+		if (remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()))
+			RemixVU1Capture::DropPublished();
+		s_socom_vu_last_kick = s_socom_vu_last_frame = 0;
+		OnSocomMission({});
+		s_socom_native_rig = {};
+		s_socom_vu_rig = {};
+		guest_movie_reset();
+		merged_frame_reset();
+		vision_reset();
+	}
+
+	void OnVSync(const void* merged_texture, int crop_left, int crop_top, int crop_right, int crop_bottom)
+	{
+		const bool trace_world_seen = s_camera_trace_world_seen;
+		s_camera_trace_world_seen = false;
+		socom_hud_reset();
+		const auto socom_serial = remix_ps2::paths::game_id();
+		RemixVU1Capture::SetSocomTitle(remix_ps2::socom::IsTitle(socom_serial),
+			socom_serial == "SCUS-97134" || socom_serial == "SCUS-97275");
+		if (s_frame_counter > s_socom_vu_last_frame + 4)
+			s_socom_vu_rig = {};
 		if (!armed())
+		{
+			RemixCameraTrace::SetRequested(false);
+			native_sky_reset();
+			rtx_vision_reset();
+			merged_frame_reset();
 			return;
+		}
 
 		ensure_initialized();
 
 		if (!s_live)
+		{
+			RemixCameraTrace::SetRequested(false);
+			native_sky_reset();
+			rtx_vision_reset();
+			merged_frame_reset();
 			return;
+		}
+
+		static live_int trace_request(L"PCSX2_REMIX_CAMTRACE", 0, 0, 1);
+		const bool trace_title = trace_request.get() != 0 &&
+			remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3;
+		const auto trace_level = trace_title ? r6_active_light_level() : r6_light_level{};
+		const bool trace_requested = trace_title && !trace_level.map.empty() && trace_level.map != "ENTRY" &&
+			s_merged_loading_frame != s_frame_counter;
+		r6_view_camera trace_camera{};
+		const bool trace_ready = trace_requested && trace_world_seen && read_r6_view_camera(trace_camera);
+		RemixCameraTrace::SetRequested(trace_requested, trace_ready);
+		const bool merged_frame_active = rs3_merged_frame_active();
+		if (!merged_frame_active)
+			merged_frame_reset(true);
 
 		// FIRST, before anything in this window has referenced a light handle. Rebuilds the fill
 		// lights if a knob behind them has moved since the ones that exist were built -- which is
@@ -13454,7 +16069,9 @@ namespace RemixSubmit
 		// after create_debug_scene() built the originals. Costs one struct compare per window when
 		// nothing changed. See refresh_fill_lights() for why this point in the frame is the safe
 		// one to free a handle at.
+		refresh_socom_lights();
 		refresh_fill_lights();
+		refresh_level_light_map();
 
 		// The guest's OWN rig, on the same contract and at the same safe point: nothing in this
 		// window has referenced a light handle yet, and the previous window's use of every handle
@@ -13473,7 +16090,7 @@ namespace RemixSubmit
 		// camera, geometry, beacon, lights, Present -- so nothing is left accumulated in the runtime
 		// awaiting a Present that never comes. Everything AFTER Present still runs, because none of
 		// it is present-driven; see hold_empty_mode() for the full audit.
-		const bool skip_present = hold_now && (hold_mode == 3);
+		const bool skip_present = hold_now && (hold_mode == 3) && !merged_frame_active;
 
 		if (skip_present)
 		{
@@ -13723,29 +16340,6 @@ namespace RemixSubmit
 				++s_stats.hold_cameras;
 		}
 
-		// Now install the staged EE camera: it governs the draws of the NEXT window, and is
-		// submitted at the NEXT VSync -- one matrix for geometry and camera, as designed.
-		if (s_ee_pending_valid)
-		{
-			s_active_camera = s_ee_pending_camera;
-			s_camera_last_accept_frame = s_frame_counter;
-			s_ee_pending_valid = false;
-			++s_ee_installed;
-		}
-
-		// ...and the staged Zen camera, on the same contract and for the same reason. After
-		// EECAM's install rather than before it so that a title with both knobs set behaves
-		// predictably (the later write wins) instead of depending on statement order nobody read.
-		// In practice they are mutually exclusive: EECAM is set only by SLUS-20883.conf and ZENCAM
-		// only by SLUS-20932.conf.
-		if (s_zen_pending_valid)
-		{
-			s_active_camera = s_zen_pending_camera;
-			s_camera_last_accept_frame = s_frame_counter;
-			s_zen_pending_valid = false;
-			++s_stats.zen_installed;
-		}
-
 		// Before Present, and before the beacon's empty-frame test, because a batched frame's
 		// geometry has not been instanced until this runs.
 		//
@@ -13819,10 +16413,12 @@ namespace RemixSubmit
 				draw_light((light_mode() == 2) ? s_debug_light : nullptr, "camera-attached sphere");
 				draw_light(s_sun_light, "key/distant");
 				draw_light(s_dome_light, "dome");
+				for (auto handle : s_socom_lights)
+					draw_light(handle, "SOCOM mission");
 
 				// Authored level lights, if loaded. Drawn every presented frame like the others.
 				build_level_lights();
-				const float light_range = level_light_range();
+				const float light_range = s_level_light_cull_range;
 				u32 culled = 0;
 				for (const level_light& ll : s_level_lights)
 				{
@@ -13877,15 +16473,40 @@ namespace RemixSubmit
 				}
 			}
 
+			native_sky_present(merged_frame_active, hold_camera);
+			vision_end_frame(merged_frame_active);
+			merged_frame_present(merged_texture, crop_left, crop_top, crop_right, crop_bottom, merged_frame_active);
+
 			// The HUD, composited over the traced image. Submitted before Present so the runtime
 			// has it for this frame; the buffer is cleared at the top of the next one.
 			if (s_overlay_used && s_remix.api().DrawScreenOverlay != nullptr)
 			{
-				s_remix.api().DrawScreenOverlay(s_overlay.data(), s_overlay_w, s_overlay_h,
-					REMIXAPI_FORMAT_B8G8R8A8_UNORM, 1.0f);
+				const bool premultiplied = remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()) &&
+					s_remix.premultiplied_overlay_available();
+				const u8* pixels = premultiplied ? s_overlay.data() : overlay_straight_pixels();
+				if (premultiplied)
+					s_remix.draw_premultiplied_overlay(pixels, s_overlay_w, s_overlay_h,
+						REMIXAPI_FORMAT_B8G8R8A8_UNORM, 1.0f);
+				else
+					s_remix.api().DrawScreenOverlay(pixels, s_overlay_w, s_overlay_h,
+						REMIXAPI_FORMAT_B8G8R8A8_UNORM, 1.0f);
 				++s_overlay_presents;
 			}
 
+			if ((remix_ps2::paths::game_id() == "SCUS-97545" || s_socom_clear_applied) && s_remix.api().dxvk_SetDefaultOutput)
+			{
+				const bool native_background = socom_background_active() && s_socom_clear_valid;
+				const remixapi_Float4D color = native_background ? s_socom_clear_color : remixapi_Float4D{};
+				// A guarded fault can occur after the runtime queues the color.
+				if (native_background)
+					s_socom_clear_applied = true;
+				const u32 status = remix_ps2::guarded_set_default_output(s_remix.api().dxvk_SetDefaultOutput,
+					REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR, &color);
+				if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+					ERROR_LOG("Remix: native background color failed ({})", remix_ps2::error_name(status));
+				else
+					s_socom_clear_applied = native_background;
+			}
 			remixapi_PresentInfo present_info{};
 			present_info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
 			present_info.pNext = nullptr;
@@ -14036,6 +16657,29 @@ namespace RemixSubmit
 									   : 0;
 
 		resolve_world_camera();
+
+		// Current-window geometry, held-frame capture and probes have consumed their camera.
+		// Install the staged EE camera for the next window's draws and camera submission.
+		if (s_ee_pending_valid)
+		{
+			s_active_camera = s_ee_pending_camera;
+			s_camera_last_accept_frame = s_frame_counter;
+			s_ee_pending_valid = false;
+			++s_ee_installed;
+		}
+
+		// ...and the staged Zen camera, on the same contract and for the same reason. After
+		// EECAM's install rather than before it so that a title with both knobs set behaves
+		// predictably (the later write wins) instead of depending on statement order nobody read.
+		// In practice they are mutually exclusive: EECAM is set only by SLUS-20883.conf and ZENCAM
+		// only by SLUS-20932.conf.
+		if (s_zen_pending_valid)
+		{
+			s_active_camera = s_zen_pending_camera;
+			s_camera_last_accept_frame = s_frame_counter;
+			s_zen_pending_valid = false;
+			++s_stats.zen_installed;
+		}
 
 		if (s_frametrace_cam_hash != s_active_camera.matrix_hash)
 		{
@@ -14201,10 +16845,16 @@ namespace RemixSubmit
 			++s_stats.distinct_instanced_frames;
 		}
 
+		RemixCameraTrace::RecordCamera(RemixCameraTrace::EndFrame, s_frame_counter, s_active_camera.matrix_hash,
+			s_active_camera.valid, hold_now, s_active_camera.position, &s_active_camera.view.m[0][0], &s_active_camera.projection.m[0][0]);
+		RemixCameraTrace::EndVSync();
 		++s_frame_counter;
+		s_merged_loading_frame = ~0ull;
 		s_submitted_this_frame = 0;
 		s_frame_submitted_hashes.clear();
 		s_frame_geometry_hashes.clear();
+		s_overlay_base_valid = false;
+		s_effect_depth = effect_depth_fits{};
 		s_frame_instanced_keys.clear();
 		// Counted whether or not batching is enabled: this is the number that decides whether
 		// batching can reach the operating point the dose-response calls safe, and it has to be
@@ -14309,6 +16959,11 @@ namespace RemixSubmit
 
 	void OnGSStateLoaded()
 	{
+		native_sky_reset();
+		socom_hud_reset();
+		guest_movie_reset();
+		merged_frame_reset();
+		vision_reset();
 		if (!armed())
 			return;
 
@@ -14373,6 +17028,10 @@ namespace RemixSubmit
 		// The beacon must not fire just because the first frames after a load submit nothing.
 		s_empty_frame_streak = 0;
 
+		destroy_level_lights();
+		s_level_light_map.clear();
+		s_level_light_level = 0;
+
 		if (!s_live || !s_remix.ok())
 			return;
 
@@ -14410,6 +17069,11 @@ namespace RemixSubmit
 		// The guest's own rig describes a world that no longer exists, and its handles would
 		// otherwise outlive it. The snapshot goes with them, so nothing rebuilds from stale VU1
 		// state before the VU side has published against the new scene.
+		destroy_socom_lights();
+		OnSocomMission({});
+		s_socom_native_rig = {};
+		s_socom_vu_rig = {};
+		s_socom_vu_last_kick = s_socom_vu_last_frame = 0;
 		destroy_zen_lights();
 		s_zen_snapshot = RemixVU1Capture::ZenSnapshot{};
 		s_zen_omni_count = 0;
@@ -14430,6 +17094,8 @@ namespace RemixSubmit
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
 		s_frame_geometry_hashes.clear();
+		s_overlay_base_valid = false;
+		s_effect_depth = effect_depth_fits{};
 		s_frame_instanced_keys.clear();
 		s_frame_group_keys.clear();
 		batch_discard();
@@ -14450,6 +17116,11 @@ namespace RemixSubmit
 
 	void OnGSClose()
 	{
+		native_sky_reset();
+		socom_hud_reset();
+		guest_movie_reset();
+		merged_frame_reset();
+		vision_reset();
 		// Unconditional, and before the runtime check: the scan must stop costing the VU
 		// thread work even when the runtime never came up.
 		RemixVU1Capture::SetArmed(false);
@@ -14493,6 +17164,10 @@ namespace RemixSubmit
 		s_stable_frames = 0;
 		s_last_startup_rect = RECT{};
 
+		destroy_level_lights();
+		s_level_light_map.clear();
+		s_level_light_level = 0;
+
 		if (!s_remix.ok())
 			return;
 
@@ -14508,6 +17183,8 @@ namespace RemixSubmit
 		s_poisoned.clear();
 		s_frame_submitted_hashes.clear();
 		s_frame_geometry_hashes.clear();
+		s_overlay_base_valid = false;
+		s_effect_depth = effect_depth_fits{};
 		s_frame_instanced_keys.clear();
 		s_frame_group_keys.clear();
 		batch_discard();
@@ -14544,6 +17221,11 @@ namespace RemixSubmit
 		s_fill_params = fill_light_params{};
 		s_fill_params_resolved = false;
 
+		destroy_socom_lights();
+		OnSocomMission({});
+		s_socom_native_rig = {};
+		s_socom_vu_rig = {};
+		s_socom_vu_last_kick = s_socom_vu_last_frame = 0;
 		destroy_zen_lights();
 		s_zen_snapshot = RemixVU1Capture::ZenSnapshot{};
 		s_zen_omni_count = 0;
@@ -14564,6 +17246,7 @@ namespace RemixSubmit
 		s_init_attempted = false;
 		s_frame_counter = 0;
 		s_submitted_this_frame = 0;
+		s_camera_trace_world_seen = false;
 		s_stats = {};
 	}
 } // namespace RemixSubmit

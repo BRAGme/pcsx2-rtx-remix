@@ -38,6 +38,7 @@ namespace MTGS
 		// built it. Queued immediately before the packet command; the ring is strictly FIFO, so
 		// it is popped immediately before it too. Only emitted while Remix is armed.
 		RemixKickSeq,
+		RemixCameraTrace, // Diagnostic inline pose observation; never selects a render camera.
 	};
 
 	struct FreezeData

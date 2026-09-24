@@ -6,6 +6,7 @@
 #include "ImGui/FullscreenUI.h"
 #include "ImGui/ImGuiManager.h"
 #include "GS/GS.h"
+#include "GS/Remix/RemixCameraTrace.h"
 #include "GS/GSCapture.h"
 #include "GS/GSExtra.h"
 #include "GS/GSGL.h"
@@ -388,6 +389,7 @@ bool GSopen(const Pcsx2Config::GSOptions& config, GSRendererType renderer, u8* b
 
 void GSclose()
 {
+	RemixCameraTrace::Stop(5);
 	if (GSCapture::IsCapturing())
 		GSCapture::EndCapture();
 
@@ -404,7 +406,15 @@ void GSclose()
 
 void GSreset(bool hardware_reset)
 {
+	const u32 trace_reset = static_cast<u32>(hardware_reset);
+	RemixCameraTrace::Record(RemixCameraTrace::Boundary, &trace_reset, sizeof(trace_reset));
 	g_gs_renderer->Reset(hardware_reset);
+	RemixCameraTrace::Stop(6);
+#if defined(_WIN32) && defined(_M_X64)
+	// Reset flushes pending GS draws; discard their Remix state only after that flush.
+	if (hardware_reset)
+		RemixSubmit::OnGSReset();
+#endif
 
 	// Restart video capture if it's been started.
 	// Otherwise we get a buildup of audio frames from the CPU thread.
@@ -420,6 +430,7 @@ void GSreset(bool hardware_reset)
 
 void GSgifSoftReset(u32 mask)
 {
+	RemixCameraTrace::Record(RemixCameraTrace::Boundary, &mask, sizeof(mask));
 	g_gs_renderer->SoftReset(mask);
 }
 
@@ -442,26 +453,32 @@ void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 T
 
 void GSgifTransfer(const u8* mem, u32 size)
 {
+	RemixCameraTrace::RecordTransfer(3, mem, size);
 	g_gs_renderer->Transfer<3>(mem, size);
 }
 
 void GSgifTransfer1(u8* mem, u32 addr)
 {
+	RemixCameraTrace::RecordTransfer(0, mem + addr, (0x4000 - addr) / 16);
 	g_gs_renderer->Transfer<0>(const_cast<u8*>(mem) + addr, (0x4000 - addr) / 16);
 }
 
 void GSgifTransfer2(u8* mem, u32 size)
 {
+	RemixCameraTrace::RecordTransfer(1, mem, size);
 	g_gs_renderer->Transfer<1>(const_cast<u8*>(mem), size);
 }
 
 void GSgifTransfer3(u8* mem, u32 size)
 {
+	RemixCameraTrace::RecordTransfer(2, mem, size);
 	g_gs_renderer->Transfer<2>(const_cast<u8*>(mem), size);
 }
 
 void GSvsync(u32 field, bool registers_written)
 {
+	const u32 trace_field[2] = {field, static_cast<u32>(registers_written)};
+	RemixCameraTrace::Record(RemixCameraTrace::ConsumerVSync, trace_field, sizeof(trace_field));
 	// Update this here because we need to check if the pending draw affects the current frame, so our regs need to be updated.
 	g_gs_renderer->PCRTCDisplays.SetVideoMode(g_gs_renderer->GetVideoMode());
 	g_gs_renderer->PCRTCDisplays.EnableDisplays(g_gs_renderer->m_regs->PMODE, g_gs_renderer->m_regs->SMODE2, g_gs_renderer->isReallyInterlaced());
@@ -499,6 +516,7 @@ int GSfreeze(FreezeAction mode, freezeData* data)
 		if (GSCapture::IsCapturing())
 			GSCapture::Flush();
 
+		RemixCameraTrace::Stop(7);
 		const int result = g_gs_renderer->Defrost(data);
 
 #if defined(_WIN32) && defined(_M_X64)
@@ -559,6 +577,7 @@ void GSThrottlePresentation()
 
 void GSGameChanged()
 {
+	RemixCameraTrace::Stop(8);
 	if (GSIsHardwareRenderer())
 		GSTextureReplacements::GameChanged();
 

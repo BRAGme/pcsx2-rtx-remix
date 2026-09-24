@@ -21,6 +21,13 @@
 #include "VMManager.h"
 #include "VUmicro.h"
 
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixSubmit.h"
+#include "GS/Remix/RemixSocomLighting.h"
+#include "GS/Remix/RemixVU1Capture.h"
+#include "MemoryTypes.h"
+#endif
+
 static const uint EECNT_FUTURE_TARGET = 0x10000000;
 
 uint g_FrameCount = 0;
@@ -451,6 +458,10 @@ static __fi void DoFMVSwitch()
 		}
 	}
 
+#if defined(_WIN32) && defined(_M_X64)
+	RemixSubmit::OnGuestMovieState(FMVstarted);
+#endif
+
 	if (new_fmv_state == s_last_fmv_state)
 		return;
 
@@ -494,6 +505,25 @@ static __fi void VSyncStart(u64 sCycle)
 	if (!VMManager::Internal::IsExecutionInterrupted())
 		VMManager::Internal::Throttle();
 
+#if defined(_WIN32) && defined(_M_X64)
+	if (RemixVU1Capture::Armed())
+	{
+		const std::string serial = VMManager::GetDiscSerial();
+		if (remix_ps2::socom::IsTitle(serial) && eeMem)
+		{
+			// Read native mission state on its CPU owner and queue its value before this
+			// frame's VSync. The GS thread never dereferences live EE lights. (AI-assisted.)
+			const auto rig = remix_ps2::socom::ReadLighting(
+				std::span<const u8>(eeMem->Main, Ps2MemSize::MainRam), serial, VMManager::GetCurrentCRC());
+			const auto mission = remix_ps2::socom::ReadMission(
+				std::span<const u8>(eeMem->Main, Ps2MemSize::MainRam), serial, VMManager::GetCurrentCRC());
+			MTGS::RunOnGSThread([rig, mission]() {
+				RemixSubmit::OnSocomLighting(rig);
+				RemixSubmit::OnSocomMission(mission);
+			});
+		}
+	}
+#endif
 	gsPostVsyncStart(); // MUST be after framelimit; doing so before causes funk with frame times!
 
 	// Poll input after MTGS frame push, just in case it has to stall to catch up.

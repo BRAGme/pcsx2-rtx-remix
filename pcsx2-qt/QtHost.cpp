@@ -616,6 +616,11 @@ void Host::CheckForSettingsChanges(const Pcsx2Config& old_config)
 
 bool EmuThread::shouldRenderToMain() const
 {
+#if defined(_WIN32) && defined(_M_X64)
+	// Remix cannot rebind its presenter to a replacement HWND.
+	if (EmuConfig.GS.Renderer == GSRendererType::Remix)
+		return false;
+#endif
 	return !Host::GetBoolSettingValue("UI", "RenderToSeparateWindow", false) && !Host::InNoGUIMode();
 }
 
@@ -898,7 +903,11 @@ std::optional<WindowInfo> EmuThread::acquireRenderWindow(bool recreate_window)
 	// Check if we're wanting to get exclusive fullscreen. This should be safe to read, since we're going to be calling from the GS thread.
 	m_is_exclusive_fullscreen = m_is_fullscreen && GSWantsExclusiveFullscreen();
 	const bool window_fullscreen = m_is_fullscreen && !m_is_exclusive_fullscreen;
-	const bool render_to_main = !m_is_exclusive_fullscreen && !window_fullscreen && m_is_rendering_to_main;
+	bool render_to_main = !m_is_exclusive_fullscreen && !window_fullscreen && m_is_rendering_to_main;
+#if defined(_WIN32) && defined(_M_X64)
+	if (GSConfig.Renderer == GSRendererType::Remix)
+		render_to_main = false;
+#endif
 
 	return emit onAcquireRenderWindowRequested(recreate_window, window_fullscreen, render_to_main, m_is_surfaceless);
 }

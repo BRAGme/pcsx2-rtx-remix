@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/GSState.h"
+#include "GS/Remix/RemixCameraTrace.h"
 #include "GS/GSDump.h"
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
@@ -2523,6 +2524,14 @@ void GSState::FlushPrim()
 		const u32 head = vtx_buff.head;
 		const u32 tail = vtx_buff.tail;
 		const u32 next = vtx_buff.next;
+		if (RemixCameraTrace::Capturing())
+		{
+			const u64 regs[10] = {PRIM->U64, m_context->TEST.U64, m_context->ZBUF.U64,
+				m_context->FRAME.U64, m_context->SCISSOR.U64, m_context->XYOFFSET.U64,
+				m_context->TEX0.U64, m_context->ALPHA.U64, m_context->CLAMP.U64, m_draw_env->SCANMSK.U64};
+			RemixCameraTrace::RecordDraw(s_n, m_current_buffer_idx, head, tail, next, regs,
+				vtx_buff.buff, tail * sizeof(GSVertex), idx_buff.buff, idx_buff.tail * sizeof(u16));
+		}
 		u32 unused = 0;
 
 		if (tail > head)

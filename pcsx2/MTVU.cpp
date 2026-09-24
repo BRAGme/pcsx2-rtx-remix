@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "GS/Remix/RemixCameraTrace.h"
 #include "Gif_Unit.h"
 #include "MTVU.h"
 #include "VMManager.h"
@@ -147,11 +148,18 @@ void VU_Thread::ExecuteRingBuffer()
 					vifRegs.top = Read();
 					vifRegs.itop = Read();
 					vuFBRST = Read();
+					RemixCameraTrace::WorkerObservation trace_packet{};
+					trace_packet.job.generation = Read();
+					trace_packet.job.job_id = Read();
+					trace_packet.job.commit_epoch = Read();
+					trace_packet.job.commit_epoch |= static_cast<u64>(Read()) << 32;
 					if (addr != -1)
 						VU1.VI[REG_TPC].UL = addr & 0x7FF;
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
+					trace_packet.first_kick = RemixVU1Capture::KickSeq() + 1;
 					CpuVU1->Execute(vu1RunCycles);
-					gifUnit.gifPath[GIF_PATH_1].FinishGSPacketMTVU();
+					trace_packet.last_kick = RemixVU1Capture::KickSeq();
+					gifUnit.gifPath[GIF_PATH_1].FinishGSPacketMTVU(trace_packet);
 					semaXGkick.Post(); // Tell MTGS a path1 packet is complete
 					vuCycles[vuCycleIdx].store(VU1.cycle, std::memory_order_release);
 					vuCycleIdx = (vuCycleIdx + 1) & 3;
@@ -440,14 +448,19 @@ void VU_Thread::WaitVU()
 
 void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 {
+	const auto trace_job = RemixCameraTrace::OnEEPoint(RemixCameraTrace::JobEnqueue, cpuRegs.pc, vu_addr, vif_top, vif_itop);
 	MTVU_LOG("MTVU - ExecuteVU!");
 	Get_MTVUChanges(); // Clear any pending interrupts
-	ReserveSpace(5);
+	ReserveSpace(9);
 	Write(MTVU_VU_EXECUTE);
 	Write(vu_addr);
 	Write(vif_top);
 	Write(vif_itop);
 	Write(fbrst);
+	Write(trace_job.generation);
+	Write(trace_job.job_id);
+	Write(static_cast<u32>(trace_job.commit_epoch));
+	Write(static_cast<u32>(trace_job.commit_epoch >> 32));
 	CommitWritePos();
 	gifUnit.TransferGSPacketData(GIF_TRANS_MTVU, NULL, 0);
 	KickStart();

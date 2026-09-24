@@ -3,6 +3,7 @@
 
 #include "GS/Remix/RemixMaterials.h"
 #include "GS/Remix/RemixPaths.h"
+#include "GS/Remix/RemixSocomLighting.h"
 
 #include "GS/GSLocalMemory.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -98,8 +100,13 @@ namespace remix_ps2::materials
 		//   4 = full, including the pseudo-path that binds the two (default)
 		int material_stage()
 		{
-			static const int value =
-				static_cast<int>(std::clamp<s64>(read_env_int(L"PCSX2_REMIX_MATSTAGE", 4), 1, 4));
+			static u64 cached_generation = ~0ULL;
+			static int value = 4;
+			if (const u64 current = paths::knob_generation(); current != cached_generation)
+			{
+				cached_generation = current;
+				value = static_cast<int>(std::clamp<s64>(read_env_int(L"PCSX2_REMIX_MATSTAGE", 4), 1, 4));
+			}
 			return value;
 		}
 
@@ -117,23 +124,35 @@ namespace remix_ps2::materials
 		// the per-texture emissive tag list still works independently.
 		float lightmap_emissive()
 		{
-			static const float value = [] {
-				const std::wstring raw = read_env(L"PCSX2_REMIX_LIGHTMAPEMISSIVE");
-				if (raw.empty())
-					return 0.f;
-				return std::max(0.f, static_cast<float>(std::wcstod(raw.c_str(), nullptr)));
-			}();
+			static u64 cached_generation = ~0ULL;
+			static float value = 0.f;
+			if (const u64 current = paths::knob_generation(); current != cached_generation)
+			{
+				cached_generation = current;
+				value = [] {
+					const std::wstring raw = read_env(L"PCSX2_REMIX_LIGHTMAPEMISSIVE");
+					if (raw.empty())
+						return 0.f;
+					return std::max(0.f, static_cast<float>(std::wcstod(raw.c_str(), nullptr)));
+				}();
+			}
 			return value;
 		}
 
 		float legacy_roughness()
 		{
-			static const float value = [] {
-				const std::wstring raw = read_env(L"PCSX2_REMIX_ROUGHNESS");
-				if (raw.empty())
-					return 0.7f;
-				return std::clamp(static_cast<float>(std::wcstod(raw.c_str(), nullptr)), 0.f, 1.f);
-			}();
+			static u64 cached_generation = ~0ULL;
+			static float value = 0.7f;
+			if (const u64 current = paths::knob_generation(); current != cached_generation)
+			{
+				cached_generation = current;
+				value = [] {
+					const std::wstring raw = read_env(L"PCSX2_REMIX_ROUGHNESS");
+					if (raw.empty())
+						return 0.7f;
+					return std::clamp(static_cast<float>(std::wcstod(raw.c_str(), nullptr)), 0.f, 1.f);
+				}();
+			}
 			return value;
 		}
 
@@ -250,6 +269,7 @@ namespace remix_ps2::materials
 		struct material_entry
 		{
 			remixapi_TextureHandle texture = nullptr;
+			bool unit_alpha = false;
 			remixapi_MaterialHandle material = nullptr;
 			// The decoded BGRA8 payload, kept resident for the life of the texture. This is not
 			// belt-and-braces: the runtime does not take a copy at CreateTexture time, so a
@@ -438,6 +458,11 @@ namespace remix_ps2::materials
 		//    this closes.
 		std::unordered_set<u64> s_emissive;
 		u64 s_generation = 1;
+		bool s_categories_dirty = true;
+		std::string s_mission_game;
+		std::string s_mission_key;
+		std::string s_mission_variant;
+		u32 s_mission_identity = 0;
 
 		// Bit 31 is unused by remixapi_InstanceCategoryBit (which stops at 1 << 26), so the
 		// emissive marker can ride through the same parse/negate machinery as a real category
@@ -458,19 +483,25 @@ namespace remix_ps2::materials
 
 		float emissive_intensity()
 		{
-			static const float value = []() -> float {
-				if (const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVEINTENSITY"); !env.empty())
-				{
-					const float parsed = static_cast<float>(::_wtof(env.c_str()));
-					if (std::isfinite(parsed) && parsed >= 0.f)
-						return parsed;
-				}
+			static u64 cached_generation = ~0ULL;
+			static float value = 20.f;
+			if (const u64 current = paths::knob_generation(); current != cached_generation)
+			{
+				cached_generation = current;
+				value = []() -> float {
+					if (const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVEINTENSITY"); !env.empty())
+					{
+						const float parsed = static_cast<float>(::_wtof(env.c_str()));
+						if (std::isfinite(parsed) && parsed >= 0.f)
+							return parsed;
+					}
 
-				// Deliberately strong: the levels measured here contain no lights at all, so a
-				// timid default would look like the feature had not worked. The user is the one
-				// who can see the result, so this is the first knob they should reach for.
-				return 20.f;
-			}();
+					// Deliberately strong: the levels measured here contain no lights at all, so a
+					// timid default would look like the feature had not worked. The user is the one
+					// who can see the result, so this is the first knob they should reach for.
+					return 20.f;
+				}();
+			}
 
 			return value;
 		}
@@ -479,16 +510,22 @@ namespace remix_ps2::materials
 		// leaves only the explicit list.
 		remixapi_InstanceCategoryFlags emissive_from_category()
 		{
-			static const remixapi_InstanceCategoryFlags value = []() -> remixapi_InstanceCategoryFlags {
-				const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVEFROM");
-				if (env.empty())
-					return REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI;
+			static u64 cached_generation = ~0ULL;
+			static remixapi_InstanceCategoryFlags value = REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI;
+			if (const u64 current = paths::knob_generation(); current != cached_generation)
+			{
+				cached_generation = current;
+				value = []() -> remixapi_InstanceCategoryFlags {
+					const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVEFROM");
+					if (env.empty())
+						return REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI;
 
-				if (env == L"0" || env == L"none")
-					return 0;
+					if (env == L"0" || env == L"none")
+						return 0;
 
-				return static_cast<remixapi_InstanceCategoryFlags>(::wcstoull(env.c_str(), nullptr, 0));
-			}();
+					return static_cast<remixapi_InstanceCategoryFlags>(::wcstoull(env.c_str(), nullptr, 0));
+				}();
+			}
 
 			return value;
 		}
@@ -543,7 +580,108 @@ namespace remix_ps2::materials
 			return paths;
 		}
 
-		std::vector<std::string> conf_paths()
+		bool mission_component(std::string_view input, std::string& output)
+		{
+			if (input.empty() || input.size() > 64)
+				return false;
+			output.clear();
+			for (const unsigned char c : input)
+			{
+				if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+						(c >= '0' && c <= '9') || c == '_' || c == '-'))
+					return false;
+				output.push_back((c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c));
+			}
+			// These names address Windows devices even with a .conf suffix.
+			return output != "con" && output != "prn" && output != "aux" && output != "nul" &&
+			       !(output.size() == 4 && (output.starts_with("com") || output.starts_with("lpt")) &&
+					   output[3] >= '1' && output[3] <= '9');
+		}
+
+		bool mission_name(std::string_view input, bool allow_key, std::string& key, std::string& stem)
+		{
+			if (input.empty() || input.size() > 512)
+				return false;
+			if (input.find_first_of("/\\") == std::string_view::npos)
+				return allow_key && mission_component(input, key);
+
+			size_t start = 0;
+			std::string previous;
+			while (start < input.size())
+			{
+				const size_t end = input.find_first_of("/\\", start);
+				const std::string_view part = input.substr(start, end == std::string_view::npos ? end : end - start);
+				if (end == std::string_view::npos)
+				{
+					if (previous.empty() || part.size() < 5 ||
+						(part[part.size() - 4] != '.' || (part[part.size() - 3] != 'z' && part[part.size() - 3] != 'Z') ||
+							(part[part.size() - 2] != 'd' && part[part.size() - 2] != 'D') ||
+							(part.back() != 'b' && part.back() != 'B')) ||
+						!mission_component(part.substr(0, part.size() - 4), stem))
+						return false;
+					key = std::move(previous);
+					return true;
+				}
+				if (!mission_component(part, previous))
+					return false;
+				start = end + 1;
+			}
+			return false;
+		}
+
+		std::vector<std::string> mission_conf_paths()
+		{
+			std::vector<std::string> result;
+			const std::string serial = VMManager::GetDiscSerial();
+			if (s_mission_key.empty() || s_mission_game != serial || !socom::IsTitle(serial))
+				return result;
+			const std::string dir(Path::GetDirectory(FileSystem::GetProgramPath()));
+			const auto append = [&](const std::string& root) {
+				result.push_back(Path::Combine(root, s_mission_key + ".conf"));
+				if (!s_mission_variant.empty())
+					result.push_back(Path::Combine(Path::Combine(root, s_mission_key), s_mission_variant + ".conf"));
+			};
+			append(Path::Combine(Path::Combine(dir, "SOCOM missions"), Path::SanitizeFileName(serial)));
+			if (const std::string game_dir = remix_ps2::paths::game_dir(); !game_dir.empty())
+				append(Path::Combine(game_dir, "missions"));
+			return result;
+		}
+
+		u64 conf_signature(const std::vector<std::string>& files)
+		{
+			u64 signature = fnv_seed;
+			for (const std::string& value : {remix_ps2::paths::game_id(), s_mission_game, s_mission_key, s_mission_variant})
+			{
+				for (const unsigned char c : value)
+					signature = fnv_mix(signature, c);
+				signature = fnv_mix(signature, 0);
+			}
+			signature = fnv_mix(signature, s_mission_identity);
+			for (const std::string& path : files)
+			{
+				for (const unsigned char c : path)
+					signature = fnv_mix(signature, c);
+				signature = fnv_mix(signature, 0);
+				FILESYSTEM_STAT_DATA sd{};
+				const bool found = FileSystem::StatFile(path.c_str(), &sd);
+				signature = fnv_mix(signature, found);
+				if (found)
+				{
+					signature = fnv_mix(signature, static_cast<u64>(sd.ModificationTime));
+					signature = fnv_mix(signature, static_cast<u64>(sd.Size));
+				}
+			}
+			return signature;
+		}
+
+		bool bridge_hash_key(std::string_view key)
+		{
+			return key == "rtx.pcsx2EmissiveTextures" || key == "pcsx2.emissiveTextures" ||
+			       std::any_of(std::begin(s_category_options), std::end(s_category_options),
+					   [&](const category_option& option) { return key == option.key; });
+		}
+
+		std::vector<std::string> base_conf_paths()
 		{
 			std::vector<std::string> paths;
 
@@ -573,10 +711,18 @@ namespace remix_ps2::materials
 				}
 			}
 
+			return paths;
+		}
+
+		std::vector<std::string> conf_paths()
+		{
+			std::vector<std::string> paths = base_conf_paths();
 			// Per-game last, so a title's own tags outrank the shared layers. This is also what
 			// makes the digit-group-comma parser (see parse_hash_list) apply to per-game hash
 			// lists for free -- they go through exactly the same reader.
 			for (std::string& one : game_conf_paths())
+				paths.push_back(std::move(one));
+			for (std::string& one : mission_conf_paths())
 				paths.push_back(std::move(one));
 
 			return paths;
@@ -710,6 +856,11 @@ namespace remix_ps2::materials
 				std::fclose(file);
 			}
 
+			// Apply the environment list before splitting markers so its negations can retire
+			// emissive hashes inherited from a title or mission file.
+			if (const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVE"); !env.empty())
+				parse_hash_list(std::string(env.begin(), env.end()), s_emissive_marker_bit);
+
 			// Drop entries every layer cancelled out, so the count means what it says.
 			for (auto it = s_categories.begin(); it != s_categories.end();)
 				it = (it->second == 0) ? s_categories.erase(it) : std::next(it);
@@ -730,27 +881,6 @@ namespace remix_ps2::materials
 					s_emissive.insert(it->first);
 
 				it = (it->second == 0) ? s_categories.erase(it) : std::next(it);
-			}
-
-			// PCSX2_REMIX_EMISSIVE, same format, for iterating without touching a file.
-			if (const std::wstring env = read_env(L"PCSX2_REMIX_EMISSIVE"); !env.empty())
-			{
-				const std::string narrow(env.begin(), env.end());
-				const size_t before = s_categories.size();
-				parse_hash_list(narrow, s_emissive_marker_bit);
-
-				for (auto it = s_categories.begin(); it != s_categories.end();)
-				{
-					if ((it->second & s_emissive_marker_bit) != 0)
-					{
-						s_emissive.insert(it->first);
-						it->second &= ~s_emissive_marker_bit;
-					}
-
-					it = (it->second == 0) ? s_categories.erase(it) : std::next(it);
-				}
-
-				(void)before;
 			}
 
 			s_category_tags = s_categories.size();
@@ -794,7 +924,8 @@ namespace remix_ps2::materials
 		// Same route as GSTextureReplacements::DumpTexture (GSTextureReplacements.cpp:801-844),
 		// so what Remix gets is byte-for-byte what a PCSX2 texture dump would contain, modulo
 		// the alpha expansion and the channel order Remix wants.
-		bool decode(const GSTextureCache::Source& source, std::vector<u8>& out_pixels, u32& out_width, u32& out_height)
+		bool decode(const GSTextureCache::Source& source, std::vector<u8>& out_pixels, u32& out_width, u32& out_height,
+			bool* out_unit_alpha = nullptr)
 		{
 			const GIFRegTEX0& TEX0 = source.m_TEX0;
 			const GIFRegTEXA& TEXA = source.m_TEXA;
@@ -837,6 +968,7 @@ namespace remix_ps2::materials
 			out_pixels.resize(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
 
 			const bool alpha_expand = expand_alpha();
+			bool unit_alpha = true;
 			u8* dst = out_pixels.data();
 
 			for (int y = 0; y < th; ++y)
@@ -850,9 +982,13 @@ namespace remix_ps2::materials
 					dst[0] = src[2];
 					dst[1] = src[1];
 					dst[2] = src[0];
+					unit_alpha = unit_alpha && src[3] == 0x80;
 					dst[3] = alpha_expand ? static_cast<u8>(std::min<u32>(255u, static_cast<u32>(src[3]) * 2u)) : src[3];
 				}
 			}
+
+			if (out_unit_alpha)
+				*out_unit_alpha = unit_alpha && alpha_expand;
 
 			out_width = static_cast<u32>(tw);
 			out_height = static_cast<u32>(th);
@@ -888,7 +1024,7 @@ namespace remix_ps2::materials
 			}
 
 			const Common::Timer::Value decode_start = Common::Timer::GetCurrentValue();
-			const bool decoded = decode(source, entry.pixels, entry.width, entry.height);
+			const bool decoded = decode(source, entry.pixels, entry.width, entry.height, &entry.unit_alpha);
 			s_stats.decode_ticks += Common::Timer::GetCurrentValue() - decode_start;
 
 			if (!decoded)
@@ -1202,6 +1338,15 @@ namespace remix_ps2::materials
 		const char* key;
 		const char* backend_default;
 	};
+	static constexpr char s_ca_exposure_knob[] = "PCSX2_REMIX_EXPOSUREBIAS";
+	static constexpr ca_runtime_setting s_ca_exposure_setting = {"rtx.tonemap.exposureBias", "0"};
+
+	bool valid_exposure_bias(std::string_view value)
+	{
+		std::string_view trailing;
+		const std::optional<float> parsed = StringUtil::FromChars<float>(value, &trailing);
+		return parsed.has_value() && trailing.empty() && std::isfinite(*parsed);
+	}
 
 	static constexpr ca_runtime_setting s_ca_runtime_settings[] = {
 		{"rtx.fallbackLightMode", "1"},
@@ -1209,6 +1354,7 @@ namespace remix_ps2::materials
 		{"rtx.antiCulling.object.enableHighPrecisionAntiCulling", "True"},
 		{"rtx.antiCulling.object.enableInfinityFarFrustum", "False"},
 		{"rtx.antiCulling.object.farPlaneScale", "10"},
+		s_ca_exposure_setting,
 	};
 
 	std::unordered_map<std::string, std::string> capture_ca_runtime_baseline()
@@ -1218,12 +1364,17 @@ namespace remix_ps2::materials
 			result.emplace(setting.key, setting.backend_default);
 
 		// SetConfigVariable writes the runtime's user layer and has no getter or unset operation.
-		// Preserve any value from the rtx.conf layer that was actually loaded at startup, then
-		// write it back when CA is left. This avoids replacing a user's global/per-game tuning
+		// Preserve any value from the startup config, then write it back when CA is left. The
+		// appended user.conf pass is limited to exposure, whose mission override must restore
+		// the active user-layer value without changing the older keys' baseline contract.
+		// The API has no getter, so startup layers outside DXVK_RTX_CONFIG_FILE cannot be
+		// reconstructed here. This avoids replacing a user's global/per-game tuning
 		// with our compiled guesses merely because SCUS-97545 ran once in this process.
 		std::string config_paths = StringUtil::WideStringToUTF8String(read_env(L"DXVK_RTX_CONFIG_FILE"));
 		if (config_paths.empty())
 			config_paths = "rtx.conf";
+		const size_t exposure_user_path = config_paths.size() + 1;
+		config_paths += ",user.conf";
 
 		std::wstring module_path(32768, L'\0');
 		const DWORD module_length = GetModuleFileNameW(nullptr, module_path.data(), static_cast<DWORD>(module_path.size()));
@@ -1234,6 +1385,7 @@ namespace remix_ps2::materials
 		size_t begin = 0;
 		while (begin <= config_paths.size())
 		{
+			const size_t path_begin = begin;
 			const size_t comma = config_paths.find(',', begin);
 			const std::string path = config_paths.substr(begin,
 				(comma == std::string::npos) ? std::string::npos : comma - begin);
@@ -1272,11 +1424,12 @@ namespace remix_ps2::materials
 					return (first == std::string::npos) ? std::string() : s.substr(first, last - first + 1);
 				};
 				const std::string key = trim(text.substr(0, eq));
-				if (auto it = result.find(key); it != result.end())
+				if (auto it = result.find(key);
+					it != result.end() && (path_begin != exposure_user_path || key == s_ca_exposure_setting.key))
 				{
 					std::string value = trim(text.substr(eq + 1));
 					value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
-					if (!value.empty())
+					if (!value.empty() && (key != s_ca_exposure_setting.key || valid_exposure_bias(value)))
 						it->second = value;
 				}
 			}
@@ -1286,23 +1439,33 @@ namespace remix_ps2::materials
 		return result;
 	}
 
+	bool restore_ca_runtime_setting(const runtime& rt,
+		const std::unordered_map<std::string, std::string>& baseline, const ca_runtime_setting& setting)
+	{
+		const auto it = baseline.find(setting.key);
+		std::string value = (it == baseline.end()) ? setting.backend_default : it->second;
+		if (setting.key == s_ca_exposure_setting.key && !valid_exposure_bias(value))
+		{
+			WARNING_LOG("Remix: ignoring invalid pre-CA exposure '{}'; restoring {}", value, setting.backend_default);
+			value = setting.backend_default;
+		}
+		const u32 code = guarded_set_config_variable(rt.api().SetConfigVariable, setting.key, value.c_str());
+		if (code == REMIXAPI_ERROR_CODE_SUCCESS)
+		{
+			INFO_LOG("Remix:   {} = {} (restored pre-CA runtime value)", setting.key, value);
+			return true;
+		}
+
+		WARNING_LOG("Remix:   {} = {} RESTORE FAILED ({})", setting.key, value, error_name(code));
+		return false;
+	}
+
 	bool restore_ca_runtime_baseline(const runtime& rt,
 		const std::unordered_map<std::string, std::string>& baseline)
 	{
 		bool success = true;
 		for (const ca_runtime_setting& setting : s_ca_runtime_settings)
-		{
-			const auto it = baseline.find(setting.key);
-			const std::string value = (it == baseline.end()) ? setting.backend_default : it->second;
-			const u32 code = guarded_set_config_variable(rt.api().SetConfigVariable, setting.key, value.c_str());
-			if (code == REMIXAPI_ERROR_CODE_SUCCESS)
-				INFO_LOG("Remix:   {} = {} (restored pre-CA runtime value)", setting.key, value);
-			else
-			{
-				success = false;
-				WARNING_LOG("Remix:   {} = {} RESTORE FAILED ({})", setting.key, value, error_name(code));
-			}
-		}
+			success &= restore_ca_runtime_setting(rt, baseline, setting);
 		return success;
 	}
 
@@ -1328,6 +1491,45 @@ namespace remix_ps2::materials
 	void invalidate_game_config()
 	{
 		s_game_config_dirty = true;
+		s_categories_dirty = true;
+	}
+
+	bool set_socom_mission(std::string_view name, u32 identity, std::string_view mission_path)
+	{
+		std::string key;
+		std::string variant;
+		std::string world_stem;
+		const std::string game = VMManager::GetDiscSerial();
+		bool valid = name.empty() && mission_path.empty();
+		if (!name.empty() && socom::IsTitle(game))
+		{
+			valid = mission_name(name, true, key, world_stem);
+			if (valid && !mission_path.empty())
+			{
+				std::string mission_key;
+				valid = mission_name(mission_path, false, mission_key, variant) && mission_key == key;
+			}
+		}
+		if (!valid)
+		{
+			WARNING_LOG("Remix: rejected invalid SOCOM mission config path; retiring previous mission layer");
+			key.clear();
+			variant.clear();
+		}
+		if (key.empty())
+			identity = 0;
+		const std::string mission_game = key.empty() ? std::string() : game;
+		if (s_mission_game == mission_game && s_mission_key == key &&
+			s_mission_variant == variant && s_mission_identity == identity)
+			return false;
+		s_mission_game = mission_game;
+		s_mission_key = std::move(key);
+		s_mission_variant = std::move(variant);
+		s_mission_identity = identity;
+		invalidate_game_config();
+		INFO_LOG("Remix: SOCOM mission config context '{}' variant '{}' identity 0x{:08X}",
+			s_mission_key, s_mission_variant, s_mission_identity);
+		return true;
 	}
 
 	void on_state_loaded(const runtime& rt)
@@ -1369,9 +1571,20 @@ namespace remix_ps2::materials
 		static bool first = true;
 		static std::string configured_game;
 		static bool configured_ca_profile = false;
+		static bool configured_ca_exposure_override = false;
+		static std::optional<std::string> last_non_ca_exposure_bias;
 		static std::unordered_map<std::string, std::string> ca_runtime_baseline;
+		static std::string checked_game_id;
 
 		const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+		const std::string current_game_id = remix_ps2::paths::game_id();
+		if (checked_game_id != current_game_id)
+		{
+			checked_game_id = current_game_id;
+			if (!s_mission_game.empty() && s_mission_game != current_game_id)
+				set_socom_mission({}, 0, {});
+			invalidate_game_config();
+		}
 
 		// A save-state load can switch to a different game, and the once-a-second poll would
 		// leave up to a second of frames running the previous title's settings. The hook makes
@@ -1387,29 +1600,49 @@ namespace remix_ps2::materials
 
 		last_check = now;
 
-		const std::string current_game_id = remix_ps2::paths::game_id();
 		const bool next_ca_profile = current_game_id == "SCUS-97545";
-		const std::vector<std::string> paths = game_conf_paths();
-
-		u64 signature = fnv_seed;
-		for (const char c : current_game_id)
-			signature = fnv_mix(signature, static_cast<u64>(static_cast<unsigned char>(c)));
-		for (const std::string& path : paths)
+		std::optional<std::string> external_exposure_bias;
+		if (remix_ps2::paths::is_external_env(s_ca_exposure_knob))
 		{
-			// The identity itself is part of the signature: two games can both have no conf
-			// file, and switching between them must still be seen as a change.
-			for (const char c : path)
-				signature = fnv_mix(signature, static_cast<u64>(static_cast<unsigned char>(c)));
-
-			FILESYSTEM_STAT_DATA sd{};
-			if (FileSystem::StatFile(path.c_str(), &sd))
-			{
-				signature = fnv_mix(signature, static_cast<u64>(sd.ModificationTime));
-				signature = fnv_mix(signature, static_cast<u64>(sd.Size));
-			}
+			std::string value = remix_ps2::paths::env_value(s_ca_exposure_knob);
+			if (valid_exposure_bias(value))
+				external_exposure_bias = std::move(value);
 			else
+				WARNING_LOG("Remix: ignoring invalid external {} value '{}'", s_ca_exposure_knob, value);
+		}
+		const std::vector<std::string> title_paths = game_conf_paths();
+		const std::vector<std::string> mission_paths = mission_conf_paths();
+		std::vector<std::string> paths = base_conf_paths();
+		size_t base_count = paths.size();
+		paths.insert(paths.end(), title_paths.begin(), title_paths.end());
+		size_t mission_start = paths.size();
+		paths.insert(paths.end(), mission_paths.begin(), mission_paths.end());
+		u64 signature;
+		if (socom::IsTitle(current_game_id))
+		{
+			signature = conf_signature(paths);
+		}
+		else
+		{
+			// Keep the original title-only watch outside SOCOM: a GUI save to user.conf
+			// must not replay title runtime options over the user's current values.
+			signature = fnv_seed;
+			for (const char c : current_game_id)
+				signature = fnv_mix(signature, static_cast<u64>(static_cast<unsigned char>(c)));
+			for (const std::string& path : title_paths)
 			{
-				signature = fnv_mix(signature, 0);
+				for (const char c : path)
+					signature = fnv_mix(signature, static_cast<u64>(static_cast<unsigned char>(c)));
+				FILESYSTEM_STAT_DATA sd{};
+				if (FileSystem::StatFile(path.c_str(), &sd))
+				{
+					signature = fnv_mix(signature, static_cast<u64>(sd.ModificationTime));
+					signature = fnv_mix(signature, static_cast<u64>(sd.Size));
+				}
+				else
+				{
+					signature = fnv_mix(signature, 0);
+				}
 			}
 		}
 
@@ -1418,12 +1651,20 @@ namespace remix_ps2::materials
 
 		first = false;
 		last_signature = signature;
+		s_categories_dirty = true;
 		if (!remix_ps2::paths::clear_title_env())
 		{
 			// A transient Win32 environment failure must not turn into a permanent stale
 			// per-title override merely because the config-file signature did not change.
 			s_game_config_dirty = true;
+			return;
 		}
+		// PCSX2_REMIX_CONF can itself have been overridden by the departing mission.
+		paths = base_conf_paths();
+		base_count = paths.size();
+		paths.insert(paths.end(), title_paths.begin(), title_paths.end());
+		mission_start = paths.size();
+		paths.insert(paths.end(), mission_paths.begin(), mission_paths.end());
 
 		// Runtime settings land in Remix's user layer, which has no public unset operation. CA is
 		// the only profile that promises clean removal: restore the rtx.conf values captured
@@ -1438,16 +1679,21 @@ namespace remix_ps2::materials
 				return;
 			}
 			configured_ca_profile = false;
+			configured_ca_exposure_override = false;
 			ca_runtime_baseline.clear();
 		}
-
-		if (paths.empty())
+		else if (configured_ca_exposure_override && next_ca_profile)
 		{
-			configured_game.clear();
-			return;
+			// Retire the previous mission's override before the next mission layers are read.
+			if (!restore_ca_runtime_setting(rt, ca_runtime_baseline, s_ca_exposure_setting))
+			{
+				s_game_config_dirty = true;
+				return;
+			}
+			configured_ca_exposure_override = false;
 		}
 
-		const std::string game = paths.back();
+		const std::string game = title_paths.empty() ? std::string() : title_paths.back();
 		if (!configured_game.empty() && configured_game != game)
 		{
 			WARNING_LOG("Remix: per-game config changing from '{}' to '{}' in one process. "
@@ -1457,7 +1703,15 @@ namespace remix_ps2::materials
 		}
 
 		if (!configured_ca_profile && next_ca_profile)
+		{
 			ca_runtime_baseline = capture_ca_runtime_baseline();
+			// Remix has no config-value getter. This shadow preserves a value that another title
+			// successfully wrote through SetConfigVariable after the startup files were loaded.
+			if (last_non_ca_exposure_bias.has_value())
+				ca_runtime_baseline[s_ca_exposure_setting.key] = *last_non_ca_exposure_bias;
+			if (external_exposure_bias.has_value())
+				ca_runtime_baseline[s_ca_exposure_setting.key] = *external_exposure_bias;
+		}
 
 		configured_game = game;
 		configured_ca_profile = next_ca_profile;
@@ -1467,15 +1721,35 @@ namespace remix_ps2::materials
 		u32 failed = 0;
 		u32 env_applied = 0;
 		u32 env_skipped = 0;
-
-		for (const std::string& path : paths)
+		if (next_ca_profile && external_exposure_bias.has_value())
 		{
+			const u32 code = guarded_set_config_variable(rt.api().SetConfigVariable,
+				s_ca_exposure_setting.key, external_exposure_bias->c_str());
+			if (code != REMIXAPI_ERROR_CODE_SUCCESS)
+			{
+				s_game_config_dirty = true;
+				WARNING_LOG("Remix:   {} = {} FAILED ({})", s_ca_exposure_knob,
+					*external_exposure_bias, error_name(code));
+				return;
+			}
+			++applied;
+			INFO_LOG("Remix:   {} = {} (external process environment -> {})", s_ca_exposure_knob,
+				*external_exposure_bias, s_ca_exposure_setting.key);
+		}
+
+		for (size_t path_index = 0; path_index < paths.size(); ++path_index)
+		{
+			const std::string& path = paths[path_index];
+			const bool base_layer = path_index < base_count;
+			const bool mission_layer = path_index >= mission_start;
 			std::FILE* file = FileSystem::OpenCFile(path.c_str(), "r");
 			if (!file)
 				continue;
 
 			++found;
-			INFO_LOG("Remix: per-game config '{}'", path);
+			INFO_LOG("Remix: {} config '{}'", base_layer ? "base PCSX2 knob" : mission_layer ? "SOCOM mission" :
+																							   "per-game",
+				path);
 
 			char line[8192];
 			while (std::fgets(line, sizeof(line), file))
@@ -1499,6 +1773,46 @@ namespace remix_ps2::materials
 				const std::string value = trim(text.substr(eq + 1));
 				if (key.empty())
 					continue;
+
+				if (key == s_ca_exposure_knob)
+				{
+					if (!next_ca_profile || !mission_layer)
+					{
+						++failed;
+						WARNING_LOG("Remix: {} is only valid in Combined Assault mission configs", key);
+						continue;
+					}
+
+					if (external_exposure_bias.has_value())
+					{
+						++env_skipped;
+						INFO_LOG("Remix:   {} = {} SKIPPED (external process environment)", key, value);
+						continue;
+					}
+					if (!valid_exposure_bias(value))
+					{
+						++failed;
+						WARNING_LOG("Remix:   {} = {} IGNORED (expected finite float)", key, value);
+						continue;
+					}
+					const std::string& runtime_value = value;
+					const u32 code = guarded_set_config_variable(rt.api().SetConfigVariable,
+						s_ca_exposure_setting.key, runtime_value.c_str());
+					if (code == REMIXAPI_ERROR_CODE_SUCCESS)
+					{
+						++applied;
+						configured_ca_exposure_override = true;
+						INFO_LOG("Remix:   {} = {} (SOCOM mission -> {})", key, runtime_value,
+							s_ca_exposure_setting.key);
+					}
+					else
+					{
+						++failed;
+						s_game_config_dirty = true;
+						WARNING_LOG("Remix:   {} = {} FAILED ({})", key, runtime_value, error_name(code));
+					}
+					continue;
+				}
 
 				// Our own knobs, spelled exactly as the environment variables they already are,
 				// because that is the spelling every note and toggle table in this project uses.
@@ -1537,6 +1851,31 @@ namespace remix_ps2::materials
 				// double-apply and, worse, hand the runtime a key it does not know.
 				if (key == "rtx.pcsx2EmissiveTextures" || key == "pcsx2.emissiveTextures")
 					continue;
+				if (base_layer)
+					continue;
+				if (mission_layer)
+				{
+					if (!bridge_hash_key(key))
+					{
+						++failed;
+						WARNING_LOG("Remix: mission config '{}' rejects runtime key '{}'; "
+									"use PCSX2_REMIX_* knobs or bridge texture hash lists",
+							path, key);
+					}
+					continue;
+				}
+				if (next_ca_profile && key == s_ca_exposure_setting.key && external_exposure_bias.has_value())
+				{
+					++env_skipped;
+					INFO_LOG("Remix:   {} = {} SKIPPED (external {})", key, value, s_ca_exposure_knob);
+					continue;
+				}
+				if (key == s_ca_exposure_setting.key && !valid_exposure_bias(value))
+				{
+					++failed;
+					WARNING_LOG("Remix:   {} = {} IGNORED (expected finite float)", key, value);
+					continue;
+				}
 
 				const u32 code = guarded_set_config_variable(
 					rt.api().SetConfigVariable, key.c_str(), value.c_str());
@@ -1544,11 +1883,15 @@ namespace remix_ps2::materials
 				if (code == REMIXAPI_ERROR_CODE_SUCCESS)
 				{
 					++applied;
+					if (!next_ca_profile && key == s_ca_exposure_setting.key)
+						last_non_ca_exposure_bias = value;
 					INFO_LOG("Remix:   {} = {} (per-game conf)", key, value);
 				}
 				else
 				{
 					++failed;
+					if (key == s_ca_exposure_setting.key)
+						s_game_config_dirty = true;
 					WARNING_LOG("Remix:   {} = {} FAILED ({})", key, value, error_name(code));
 				}
 			}
@@ -1608,27 +1951,25 @@ namespace remix_ps2::materials
 		static Common::Timer::Value last_check = 0;
 		static u64 last_signature = 0;
 		static bool first = true;
+		static std::string checked_game_id;
+		static u64 checked_knob_generation = ~0ULL;
 
 		const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+		const std::string current_game_id = paths::game_id();
+		const u64 current_knob_generation = paths::knob_generation();
+		if (s_categories_dirty || checked_game_id != current_game_id || checked_knob_generation != current_knob_generation)
+		{
+			s_categories_dirty = false;
+			checked_game_id = current_game_id;
+			checked_knob_generation = current_knob_generation;
+			first = true;
+		}
 		if (!first && Common::Timer::ConvertValueToMilliseconds(now - last_check) < 1000.0)
 			return;
 
 		last_check = now;
 
-		u64 signature = fnv_seed;
-		for (const std::string& path : conf_paths())
-		{
-			FILESYSTEM_STAT_DATA sd{};
-			if (FileSystem::StatFile(path.c_str(), &sd))
-			{
-				signature = fnv_mix(signature, static_cast<u64>(sd.ModificationTime));
-				signature = fnv_mix(signature, static_cast<u64>(sd.Size));
-			}
-			else
-			{
-				signature = fnv_mix(signature, 0);
-			}
-		}
+		const u64 signature = fnv_mix(conf_signature(conf_paths()), current_knob_generation);
 
 		if (!first && signature == last_signature)
 			return;
@@ -1682,7 +2023,7 @@ namespace remix_ps2::materials
 		return decode(*source, out_pixels, out_width, out_height);
 	}
 
-	u64 hash_only(const GSTextureCache::Source* source)
+	u64 hash_only(const GSTextureCache::Source* source, bool include_clut)
 	{
 		if (!source || source->m_target || source->m_from_target)
 			return 0;
@@ -1696,8 +2037,11 @@ namespace remix_ps2::materials
 		const GSVector2i* lod =
 			(GSConfig.HWMipmap || GSConfig.TriFilter == TriFiltering::Forced) ? &source->m_lod : nullptr;
 
-		const GSTextureCache::HashCacheKey key =
+		GSTextureCache::HashCacheKey key =
 			GSTextureCache::HashCacheKey::Create(TEX0, source->m_TEXA, clut, lod, source->m_region);
+
+		if (!include_clut)
+			key.RemoveCLUTHash();
 
 		u64 content_hash = fnv_seed;
 		{
@@ -1859,6 +2203,62 @@ namespace remix_ps2::materials
 
 		out.material = s_untextured;
 		out.content_hash = untextured_hash;
+		return out;
+	}
+
+	binding bind_fog_sky(const runtime& rt)
+	{
+		static constexpr u64 white_hash = 0x554E544558545244ull; // UNTEXTRD
+		static constexpr u64 fog_sky_hash = 0x464F47534B595244ull; // FOGSKYRD
+		static remixapi_MaterialHandle s_fog_sky = nullptr;
+		static bool s_attempted = false;
+
+		binding out{};
+		// bind_untextured owns the shared 4x4 white texture used by this material.
+		if (!bind_untextured(rt).material)
+			return out;
+		if (!s_fog_sky && !s_attempted)
+		{
+			s_attempted = true;
+			remixapi_MaterialInfoOpaqueEXT opaque{};
+			opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+			opaque.albedoConstant = {1.f, 1.f, 1.f};
+			opaque.opacityConstant = 1.f;
+			opaque.roughnessConstant = legacy_roughness();
+			opaque.alphaTestType = 7; // always
+			opaque.useDrawCallAlphaState = (alpha_state_mode() != 0) ? 1 : 0;
+
+			wchar_t albedo_path[32]{};
+			::swprintf_s(albedo_path, L"0x%016llX", static_cast<unsigned long long>(white_hash));
+			remixapi_MaterialInfo material{};
+			material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+			material.pNext = &opaque;
+			material.hash = fog_sky_hash;
+			material.albedoTexture = albedo_path;
+			material.emissiveTexture = albedo_path;
+			material.emissiveColorConstant = {1.f, 1.f, 1.f};
+			material.emissiveIntensity = 1.f;
+			material.spriteSheetRow = 1;
+			material.spriteSheetCol = 1;
+			material.filterMode = 1;
+			material.wrapModeU = 1;
+			material.wrapModeV = 1;
+			const u32 status = guarded_create_material(rt.api().CreateMaterial, &material, &s_fog_sky);
+			if (status != REMIXAPI_ERROR_CODE_SUCCESS || !s_fog_sky)
+			{
+				ERROR_LOG("Remix: CreateMaterial failed for GS fog sky ({})", error_name(status));
+				++s_stats.failures;
+				return out;
+			}
+		}
+		static bool s_logged = false;
+		if (!s_logged)
+		{
+			s_logged = true;
+			INFO_LOG("Remix: GS fog sky material bound");
+		}
+		out.material = s_fog_sky;
+		out.content_hash = fog_sky_hash;
 		return out;
 	}
 
@@ -2162,6 +2562,7 @@ namespace remix_ps2::materials
 
 		out.material = it->second.material;
 		out.content_hash = content_hash;
+		out.unit_alpha = it->second.unit_alpha && !it->second.is_render_target && it->second.albedo_file.empty();
 		return out;
 	}
 

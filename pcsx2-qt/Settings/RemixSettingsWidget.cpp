@@ -6,6 +6,7 @@
 #include "SettingWidgetBinder.h"
 #include "SettingsWindow.h"
 
+#include "GS/Remix/RemixCameraTrace.h"
 #include "GS/Remix/RemixKnobs.h"
 #include "VMManager.h"
 
@@ -124,6 +125,14 @@ void RemixSettingsWidget::buildKnobRows(SettingsInterface* sif)
 				QCheckBox* box = new QCheckBox(group);
 				SettingWidgetBinder::BindWidgetToBoolSetting(
 					sif, box, "Remix", k.env, k.default_value != 0.0);
+				if (key == QStringLiteral("CAMTRACE"))
+				{
+					// OFF/ON while paused can be coalesced before the GS thread reads the setting.
+					connect(box, &QCheckBox::checkStateChanged, this, [](Qt::CheckState state) {
+						if (state == Qt::Checked)
+							RemixCameraTrace::RequestRearm();
+					});
+				}
 				editor = box;
 				break;
 			}

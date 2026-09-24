@@ -14,6 +14,10 @@
 #include "IPU/yuv2rgb.h"
 #include "IPU/IPU_MultiISA.h"
 
+#if defined(_WIN32) && defined(_M_X64)
+#include "GS/Remix/RemixSubmit.h"
+#endif
+
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
 static const uint decoder_stride = 16;
 
@@ -1604,6 +1608,9 @@ __fi static bool mpeg2_slice()
 
 __fi static bool ipuVDEC(u32 val)
 {
+#if defined(_WIN32) && defined(_M_X64)
+	RemixSubmit::OnGuestMovieDecode();
+#endif
 	static int count = 0;
 	if (count++ > 5) {
 		if (!FMVstarted) {

@@ -7,6 +7,7 @@
 #include "GS/Renderers/HW/GSTextureCache.h"
 
 #include <string>
+#include <string_view>
 
 // The PS2 -> Remix material bridge.
 //
@@ -37,6 +38,9 @@ namespace remix_ps2
 			// folded into the caller's mesh hash: Remix binds the material at CreateMesh time,
 			// so two draws sharing geometry but not their texture must not share a mesh handle.
 			u64 content_hash = 0;
+
+			// Every decoded guest texel has alpha exactly 0x80 (unity before expansion).
+			bool unit_alpha = false;
 		};
 
 		// CPU-side decoded pixels for a resolved material, for the 2D overlay rasteriser.
@@ -61,7 +65,7 @@ namespace remix_ps2
 		// the texture never becomes a Remix material and its hash -- the value a modder types into
 		// rtx.conf, and the key the emissive and category lists match on -- was never computed at
 		// all. Returns 0 when there is no hashable source.
-		u64 hash_only(const GSTextureCache::Source* source);
+		u64 hash_only(const GSTextureCache::Source* source, bool include_clut = true);
 
 		// Decode a source's texels to BGRA8 on the CPU, using whatever CLUT is bound right now.
 		// For the lightmap fold-in: R6 3 writes one PSMT8 index page through three different CLUTs,
@@ -84,6 +88,9 @@ namespace remix_ps2
 		// Created once and cached for the session; it holds no texture, so it is outside the
 		// CreateTexture budget and the LRU entirely.
 		binding bind_untextured(const runtime& rt);
+
+		// White, emissive material for a black GS sky layer colored by fog.
+		binding bind_fog_sky(const runtime& rt);
 
 		// LRU release. Must run *after* the mesh reap: a live mesh holds its material handle,
 		// so meshes have to be released before the materials they reference.
@@ -134,6 +141,13 @@ namespace remix_ps2
 		// refresh_categories, which already reads them (conf_paths appends the per-game layers)
 		// with the digit-group-comma parser they need.
 		void refresh_game_config(const runtime& rt);
+
+		// GS thread only. Empty name retires the mission; otherwise accept a map key or a
+		// relative .zdb world path, plus an optional .zdb mission path in the same map.
+		// After a change, call refresh_game_config then refresh_categories before drawing.
+		// Mission files follow the title layers: SOCOM missions/<SERIAL>/<map>.conf, then
+		// <map>/<mission>.conf, with the same layers under game_dir()/missions last.
+		bool set_socom_mission(std::string_view name, u32 identity, std::string_view mission_path = {});
 
 		// Forces the next refresh_game_config to re-apply instead of waiting out its poll
 		// interval. Call when the running game may have changed under us -- a save-state load

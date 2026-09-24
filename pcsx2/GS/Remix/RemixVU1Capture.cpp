@@ -7,6 +7,7 @@
 // <windows.h>, which would otherwise macro-poison min/max for everything after it.
 #include "GS/Remix/RemixRuntime.h"
 #include "GS/Remix/RemixVU1Slice.h"
+#include "GS/Remix/RemixSocomCamera.h"
 
 #include "VU.h"
 #include "VUmicro.h"
@@ -31,6 +32,9 @@ namespace RemixVU1Capture
 	{
 		constexpr u32 s_qword = 16;
 		constexpr u32 s_matrix_bytes = 64;
+		std::atomic<bool> s_socom_title{false};
+		std::atomic<bool> s_socom_normalized_colours{false};
+		std::atomic<u32> s_capture_epoch{1};
 
 		constexpr u64 s_fnv_seed = 0xCBF29CE484222325ULL;
 		constexpr u64 s_fnv_prime = 0x100000001B3ULL;
@@ -73,9 +77,13 @@ namespace RemixVU1Capture
 		std::atomic<u32> s_drop_before_seq{0};
 
 		Frame s_published{};
+		// Zero leaves generic titles unchanged. A native SOCOM proof remains tied to the
+		// sampled scene epoch even if a reset overlaps its seqlock publication.
+		std::atomic<u32> s_published_native_epoch{0};
 
 		// ---- VU-thread private state -------------------------------------------------------
 		Frame s_frame{};
+		u32 s_frame_native_epoch = 0;
 		u64 s_frame_hashes[max_candidates]{};
 		u32 s_generation_seen = 0;
 
@@ -228,6 +236,30 @@ namespace RemixVU1Capture
 			return hash;
 		}
 
+		bool socom_raster_program()
+		{
+			const u8* const micro = vuRegs[1].Micro;
+			thread_local remix_ps2::socom_camera::RasterProgramWitness witness{};
+			if (remix_ps2::socom_camera::ValidateRasterProgramWitness(micro, VU1_PROGSIZE, witness))
+				return true;
+			return remix_ps2::socom_camera::MatchesRasterProgram(micro, VU1_PROGSIZE, &witness);
+		}
+
+		bool socom_lighting_program()
+		{
+			const u8* const micro = vuRegs[1].Micro;
+			thread_local remix_ps2::socom::VULightingProgramWitness witness{};
+			if (!micro)
+			{
+				witness = {};
+				return false;
+			}
+			const std::span<const u8> program(micro, VU1_PROGSIZE);
+			if (remix_ps2::socom::ValidateVULightingProgramWitness(program, witness))
+				return true;
+			return remix_ps2::socom::RecognizesVULightingProgram(program, &witness);
+		}
+
 		// Viewport-independent structural test, which is the only kind the VU thread can run:
 		// it has no idea what XYOFFSET or the render target size are.
 		//
@@ -330,9 +362,15 @@ namespace RemixVU1Capture
 		struct KickCameraSlot
 		{
 			std::atomic<u64> stamp; // kick_seq + 1 once complete; 0 while being written
+			std::atomic<u64> writing_seq;
 			float m[16];
 			u32 offset;
 			u32 valid; // 0 = no readable camera at the pinned offset for this kick
+			u32 epoch;
+			u32 generation;
+			u32 lighting_generation;
+			bool lighting_deferred;
+			remix_ps2::socom::LightingRig lighting;
 		};
 
 		KickCameraSlot s_kick_ring[kick_ring_size]{};
@@ -409,18 +447,101 @@ namespace RemixVU1Capture
 			return s_pin_hold_frames.load(std::memory_order_relaxed);
 		}
 
-		void record_kick_camera(u64 seq)
+		bool socom_raster_matrix(const float* matrix, bool program, u32 epoch, bool normalized_colours)
+		{
+			struct Cache
+			{
+				remix_ps2::mat4 matrix{};
+				bool program = false;
+				u32 epoch = 0;
+				bool normalized_colours = false;
+				bool initialized = false;
+				bool valid = false;
+			};
+			thread_local Cache cache{};
+			if (!matrix)
+			{
+				cache.initialized = false;
+				return false;
+			}
+			if (!cache.initialized || cache.program != program || cache.epoch != epoch ||
+				cache.normalized_colours != normalized_colours ||
+				std::memcmp(&cache.matrix, matrix, s_matrix_bytes) != 0)
+			{
+				std::memcpy(&cache.matrix, matrix, s_matrix_bytes);
+				cache.valid = usable_matrix(&cache.matrix.m[0][0]) && remix_ps2::socom_camera::IsRaster(cache.matrix);
+				cache.program = program;
+				cache.epoch = epoch;
+				cache.normalized_colours = normalized_colours;
+				cache.initialized = true;
+			}
+			return cache.valid;
+		}
+
+		remix_ps2::socom::LightingRig socom_vu_lighting(const u8* mem, bool program, u32 epoch, bool normalized_colours)
+		{
+			struct Cache
+			{
+				// ReadVULighting requires the full VU span, but reads only q16..q23.
+				u8 snapshot[VU1_MEMSIZE]{};
+				remix_ps2::socom::LightingRig rig{};
+				bool program = false;
+				u32 epoch = 0;
+				bool normalized_colours = false;
+				bool initialized = false;
+			};
+			thread_local Cache cache{};
+			if (!mem)
+			{
+				cache.initialized = false;
+				return {};
+			}
+			constexpr u32 offset = 16u * s_qword;
+			constexpr u32 bytes = 8u * s_qword;
+			if (!cache.initialized || cache.program != program || cache.epoch != epoch ||
+				cache.normalized_colours != normalized_colours ||
+				std::memcmp(cache.snapshot + offset, mem + offset, bytes) != 0)
+			{
+				std::memcpy(cache.snapshot + offset, mem + offset, bytes);
+				cache.rig = program ? remix_ps2::socom::ReadVULightingValues(
+					std::span<const u8>(cache.snapshot, VU1_MEMSIZE), normalized_colours) : remix_ps2::socom::LightingRig{};
+				cache.program = program;
+				cache.epoch = epoch;
+				cache.normalized_colours = normalized_colours;
+				cache.initialized = true;
+			}
+			return cache.rig;
+		}
+
+		struct NativeRasterSample
+		{
+			float matrix[16];
+			u32 epoch;
+			u32 start_pc;
+		};
+
+		bool record_kick_camera(u64 seq, NativeRasterSample* native_raster = nullptr)
 		{
 			KickCameraSlot& slot = s_kick_ring[seq & (kick_ring_size - 1)];
 
 			// Mark in-progress before touching the payload, and fence so the clear cannot be
 			// reordered after the writes it is meant to protect.
+			slot.writing_seq.store(seq + 1, std::memory_order_release);
 			slot.stamp.store(0, std::memory_order_relaxed);
 			std::atomic_thread_fence(std::memory_order_release);
+			const u32 capture_epoch = s_capture_epoch.load(std::memory_order_relaxed);
+			const u32 capture_start_pc = vuRegs[1].start_pc;
 
-			const u32 offset = s_pinned_offset.load(std::memory_order_relaxed);
+			// q4 draws the raster; q8 feeds a separate culling chain. (AI-assisted.)
+			const bool socom_title = s_socom_title.load(std::memory_order_relaxed);
+			const bool normalized_colours = s_socom_normalized_colours.load(std::memory_order_relaxed);
+			const bool socom_raster = socom_title && socom_raster_program();
+			const bool socom_lighting = socom_title && socom_lighting_program();
+			const u32 offset = socom_raster ? 4u * s_qword : s_pinned_offset.load(std::memory_order_relaxed);
 			const u8* const mem = vuRegs[1].Mem;
 			u32 valid = 0;
+			if (socom_title && (!socom_raster || !mem))
+				socom_raster_matrix(nullptr, socom_raster, capture_epoch, normalized_colours);
 
 			if (mem && offset != s_no_pin && (offset + s_matrix_bytes) <= VU1_MEMSIZE)
 			{
@@ -429,13 +550,73 @@ namespace RemixVU1Capture
 				// A kick with nothing at the pin must record nothing and let the lookup walk back.
 				// Accepting an empty address here is what produced a phantom "second camera" that
 				// was really sixteen zeros.
-				valid = usable_matrix(slot.m) ? 1u : 0u;
+				valid = (socom_raster ? socom_raster_matrix(slot.m, socom_raster, capture_epoch, normalized_colours) :
+					usable_matrix(slot.m)) ? 1u : 0u;
 			}
 
 			slot.offset = offset;
 			slot.valid = valid;
+			slot.epoch = capture_epoch;
+			remix_ps2::socom::LightingRig retained_lighting{};
+			const u32 generation = s_generation.load(std::memory_order_relaxed);
+			slot.generation = generation;
+			slot.lighting_deferred = false;
+			u32 retained_generation = generation;
+			if (socom_title)
+			{
+				const auto rig = socom_vu_lighting(mem, socom_lighting, capture_epoch, normalized_colours);
+				if (rig.valid || rig.menu)
+				{
+					retained_lighting = rig;
+					retained_generation = generation;
+				}
+			}
+			// EE and MTVU may alternate producers. Retain only from an earlier completed
+			// kick in this scene, keeping the original rig's age and explicit empty records.
+			if (socom_title && !retained_lighting.valid && !retained_lighting.menu)
+			{
+				for (u64 back = 1; back <= s_kick_lookback && back <= seq; ++back)
+				{
+					const u64 want = seq - back;
+					const auto& prior = s_kick_ring[want & (kick_ring_size - 1)];
+					const u64 stamp = prior.stamp.load(std::memory_order_acquire);
+					if (stamp != want + 1 && prior.writing_seq.load(std::memory_order_acquire) == want + 1)
+					{
+						slot.lighting_deferred = true;
+						break;
+					}
+					if (stamp != want + 1)
+						continue;
+					const auto rig = prior.lighting;
+					const u32 epoch = prior.epoch;
+					const u32 rig_generation = prior.lighting_generation;
+					const bool deferred = prior.lighting_deferred;
+					std::atomic_thread_fence(std::memory_order_acquire);
+					if (prior.stamp.load(std::memory_order_relaxed) != stamp || epoch != capture_epoch)
+						continue;
+					if (deferred)
+					{
+						slot.lighting_deferred = true;
+						break;
+					}
+					if ((generation - rig_generation) > 4)
+						break;
+					retained_lighting = rig;
+					retained_generation = rig_generation;
+					break;
+				}
+			}
+			slot.lighting_generation = retained_generation;
+			slot.lighting = retained_lighting;
 
+			if (valid && socom_raster && native_raster)
+			{
+				std::memcpy(native_raster->matrix, slot.m, s_matrix_bytes);
+				native_raster->epoch = capture_epoch;
+				native_raster->start_pc = capture_start_pc;
+			}
 			slot.stamp.store(seq + 1, std::memory_order_release);
+			return valid != 0 && socom_raster;
 		}
 
 		bool finite_window(const float* m)
@@ -540,7 +721,22 @@ namespace RemixVU1Capture
 			for (u32 i = 0; i < live; ++i)
 			{
 				if (s_frame_hashes[i] == content)
+				{
+					Candidate& prior = s_frame.items[i];
+					// Promote only the recognized SOCOM raster proof over weaker metadata.
+					if (source == 4 && offset == 64 && (flags & candidate_flag_feeds_div) &&
+						s_socom_title.load(std::memory_order_relaxed) &&
+						(prior.source != 4 || prior.mem_offset != 64 || !(prior.flags & candidate_flag_feeds_div)))
+					{
+						prior.score = std::max(prior.score, score);
+						prior.mem_offset = offset;
+						prior.start_pc = start_pc;
+						prior.ucode_hash = ucode;
+						prior.source = source;
+						prior.flags = flags;
+					}
 					return;
+				}
 			}
 
 			u32 slot = live;
@@ -982,6 +1178,7 @@ namespace RemixVU1Capture
 			std::atomic_thread_fence(std::memory_order_release);
 
 			std::memcpy(&s_published, &s_frame, sizeof(Frame));
+			s_published_native_epoch.store(s_frame_native_epoch, std::memory_order_relaxed);
 
 			std::atomic_thread_fence(std::memory_order_release);
 			s_seq.store(seq + 2, std::memory_order_release);
@@ -992,8 +1189,17 @@ namespace RemixVU1Capture
 	std::atomic<u64> g_kick_seq{0};
 	u64 g_gs_kick_seq = 0;
 
+	void SetSocomTitle(bool title, bool normalized_light_colours)
+	{
+		const bool changed = s_socom_title.exchange(title, std::memory_order_relaxed) != title;
+		const bool colour_changed = s_socom_normalized_colours.exchange(normalized_light_colours, std::memory_order_relaxed) != normalized_light_colours;
+		if (changed || colour_changed)
+			s_capture_epoch.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	void SetArmed(bool enabled)
 	{
+		s_capture_epoch.fetch_add(1, std::memory_order_relaxed);
 		if (enabled)
 		{
 			// A fresh session must not inherit the previous one's candidates.
@@ -1010,7 +1216,9 @@ namespace RemixVU1Capture
 			s_pin_retained_generation = 0;
 			s_drop_before_seq.store(0, std::memory_order_relaxed);
 			s_published = Frame{};
+			s_published_native_epoch.store(0, std::memory_order_relaxed);
 			s_frame = Frame{};
+			s_frame_native_epoch = 0;
 			s_generation.store(0, std::memory_order_relaxed);
 			s_generation_seen = 0;
 			s_scanning.store(false, std::memory_order_relaxed);
@@ -1078,6 +1286,7 @@ namespace RemixVU1Capture
 			std::memcpy(copy, slot.m, sizeof(copy));
 			const u32 copy_offset = slot.offset;
 			const u32 copy_valid = slot.valid;
+			const u32 copy_epoch = slot.epoch;
 
 			// Re-read the stamp after the copy: if a writer took this slot mid-read the payload
 			// above is a mix of two kicks and must be discarded, not returned.
@@ -1085,7 +1294,7 @@ namespace RemixVU1Capture
 			if (slot.stamp.load(std::memory_order_relaxed) != stamp)
 				continue;
 
-			if (copy_valid == 0)
+			if (copy_valid == 0 || copy_epoch != s_capture_epoch.load(std::memory_order_relaxed))
 				continue; // this kick genuinely had no camera; keep walking back
 
 			std::memcpy(m, copy, sizeof(copy));
@@ -1093,6 +1302,46 @@ namespace RemixVU1Capture
 			return true;
 		}
 
+		return false;
+	}
+
+	bool LookupKickLighting(u64 seq, remix_ps2::socom::LightingRig& out)
+	{
+		u32 requested_generation = 0;
+		bool have_generation = false;
+		for (u64 back = 0; back <= s_kick_lookback && back <= seq; ++back)
+		{
+			const u64 want = seq - back;
+			const auto& slot = s_kick_ring[want & (kick_ring_size - 1)];
+			const u64 stamp = slot.stamp.load(std::memory_order_acquire);
+			if (have_generation && stamp != want + 1 && slot.writing_seq.load(std::memory_order_acquire) == want + 1)
+				return false;
+			if (stamp != want + 1)
+				continue;
+			const auto copy = slot.lighting;
+			const u32 epoch = slot.epoch;
+			const u32 generation = slot.generation;
+			const u32 rig_generation = slot.lighting_generation;
+			const bool deferred = slot.lighting_deferred;
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (slot.stamp.load(std::memory_order_relaxed) != stamp ||
+				epoch != s_capture_epoch.load(std::memory_order_relaxed))
+				continue;
+			if (!have_generation)
+			{
+				requested_generation = generation;
+				have_generation = true;
+			}
+			if (deferred)
+				continue;
+			if ((requested_generation - rig_generation) > 4)
+			{
+				out = {};
+				return true;
+			}
+			out = copy;
+			return true;
+		}
 		return false;
 	}
 
@@ -1107,7 +1356,8 @@ namespace RemixVU1Capture
 		// search already found. At ~1053 kicks/frame against a budget of 16, putting it behind the
 		// gate would record 1.5% of kicks and defeat the point of a per-kick ring. Two threads
 		// cannot collide here: distinct kicks take distinct sequence numbers, so distinct slots.
-		record_kick_camera(seq);
+		NativeRasterSample native_raster;
+		const bool native_socom_raster = record_kick_camera(seq, &native_raster);
 
 		// VU1 is executed by the EE thread, or by the MTVU thread, or by both in the same
 		// session (vif1's _vuXGKICKTransfer runs on the EE side while vu1Thread executes the
@@ -1126,9 +1376,40 @@ namespace RemixVU1Capture
 		{
 			s_generation_seen = generation;
 			s_frame = Frame{};
+			s_frame_native_epoch = 0;
 		}
 
 		++s_frame.kicks_seen;
+		// The recognized raster upload is carried by this exact kick. Its arrival may be
+		// later than the generic search budget; publish each distinct positive block once
+		// per frame/epoch without hashing unchanged matrices or caching negative evidence.
+		struct NativePublication
+		{
+			float matrix[16]{};
+			u32 generation = 0;
+			u32 epoch = 0;
+			bool valid = false;
+		};
+		static NativePublication native_publication{};
+		if (native_socom_raster && s_socom_title.load(std::memory_order_relaxed) &&
+			native_raster.epoch == s_capture_epoch.load(std::memory_order_relaxed))
+		{
+			const u32 epoch = native_raster.epoch;
+			if (!native_publication.valid || native_publication.generation != generation ||
+				native_publication.epoch != epoch || std::memcmp(native_publication.matrix, native_raster.matrix, s_matrix_bytes) != 0)
+			{
+				if (s_frame_native_epoch != 0 && s_frame_native_epoch != epoch)
+					s_frame.count = 0; // A scene reset can retain the same frame generation.
+				s_frame_native_epoch = epoch;
+				insert_candidate(native_raster.matrix, 4000.f, 4u * s_qword, native_raster.start_pc, hash_ucode(), 4,
+					candidate_flag_feeds_div);
+				std::memcpy(native_publication.matrix, native_raster.matrix, s_matrix_bytes);
+				native_publication.generation = generation;
+				native_publication.epoch = epoch;
+				native_publication.valid = true;
+				publish();
+			}
+		}
 
 		// PCSX2_REMIX_ZENCAM. Deliberately AHEAD of the scan budget, on the same reasoning
 		// record_kick_camera() carries: the budget caps the SEARCH for a camera, and this is not a
@@ -1161,7 +1442,6 @@ namespace RemixVU1Capture
 		const u32 start_pc = vuRegs[1].start_pc;
 
 		trace("ucode", ucode, start_pc);
-
 		// --- the deterministic path, first -------------------------------------------------
 		// The microcode says where its transform lives, so these go in ahead of anything the
 		// shape scan finds. They still go through the GS side's normalise/split/score gate,
@@ -1193,7 +1473,7 @@ namespace RemixVU1Capture
 			// A title-specific fixed address, kept only because removing it is itself a picture
 			// change that nothing has yet measured. It is the hand-picked-address hack the
 			// back-slice exists to replace; the generic replacements are the two knobs above.
-			if (socom_fixed && ucode == 0xd74d4042a48b1ba8ULL)
+			if (socom_fixed && !s_socom_title.load(std::memory_order_relaxed) && ucode == 0xd74d4042a48b1ba8ULL)
 			{
 				constexpr u32 socom_camera_offset = 8u * s_qword;
 				float m[16];
@@ -1462,6 +1742,7 @@ namespace RemixVU1Capture
 
 	void DropPublished()
 	{
+		s_capture_epoch.fetch_add(1, std::memory_order_relaxed);
 		// Called from the GS thread when the guest's scene has been replaced wholesale (a
 		// save-state load). The published set describes the *old* scene, and the world camera
 		// solved from it would un-project the new scene's vertices into nonsense.
@@ -1490,11 +1771,16 @@ namespace RemixVU1Capture
 			if (seq & 1u)
 				continue; // a publish is in flight
 
+			const u32 native_epoch = s_published_native_epoch.load(std::memory_order_relaxed);
+			if (native_epoch != 0 && native_epoch != s_capture_epoch.load(std::memory_order_relaxed))
+				break;
 			std::memcpy(&out, &s_published, sizeof(Frame));
 			std::atomic_thread_fence(std::memory_order_acquire);
 
 			if (s_seq.load(std::memory_order_relaxed) == seq)
 			{
+				if (native_epoch != 0 && native_epoch != s_capture_epoch.load(std::memory_order_relaxed))
+					break;
 				have = true;
 				break;
 			}

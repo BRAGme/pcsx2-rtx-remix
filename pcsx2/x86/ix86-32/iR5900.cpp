@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "GS/Remix/RemixCameraTrace.h"
 #include "CDVD/CDVD.h"
 #include "DebugTools/Breakpoints.h"
 #include "Elfheader.h"
@@ -1687,6 +1688,14 @@ bool encodeMemcheck()
 
 void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 {
+	if (!delayslot && pc == 0x2EF410 && VMManager::GetCurrentCRC() == 0x21CC1EC3)
+	{
+		// Flush registers and PC before the observed instruction, exactly like the debugger hook.
+		// Always emit this callback for this title PC so it can be armed after compilation.
+		// Diagnostic callback; needs proper testing under live MTVU load.
+		iFlushCall(FLUSH_EVERYTHING | FLUSH_PC);
+		xFastCall((void*)RemixCameraTrace::OnNativeCommit, pc);
+	}
 	if (EmuConfig.EnablePatches)
 		Patch::ApplyDynamicPatches(pc);
 

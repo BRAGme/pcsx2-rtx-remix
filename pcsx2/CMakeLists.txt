@@ -66,6 +66,7 @@ set(pcsx2Sources
 	FiFo.cpp
 	FPU.cpp
 	GameList.cpp
+	GameRichPresence.cpp
 	Gif.cpp
 	Gif_Logger.cpp
 	Gif_Unit.cpp
@@ -152,6 +153,7 @@ set(pcsx2Headers
 	Elfheader.h
 	FW.h
 	GameList.h
+	GameRichPresence.h
 	Gif.h
 	Gif_Unit.h
 	GS.h
@@ -715,6 +717,8 @@ if(WIN32)
 			GS/Remix/RemixPaths.cpp
 			GS/Remix/RemixRuntime.cpp
 			GS/Remix/RemixSubmit.cpp
+			GS/Remix/RemixSocomCamera.cpp
+			GS/Remix/RemixSocomLighting.cpp
 			GS/Remix/RemixTransforms.cpp
 			GS/Remix/RemixVU1Capture.cpp
 			GS/Remix/RemixVU1Slice.cpp
@@ -726,6 +730,8 @@ if(WIN32)
 			GS/Remix/RemixPaths.h
 			GS/Remix/RemixRuntime.h
 			GS/Remix/RemixSubmit.h
+			GS/Remix/RemixSocomCamera.h
+			GS/Remix/RemixSocomLighting.h
 			GS/Remix/RemixTransforms.h
 			GS/Remix/RemixVU1Capture.h
 			GS/Remix/RemixVU1Slice.h

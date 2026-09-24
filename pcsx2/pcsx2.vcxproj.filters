@@ -1334,6 +1334,9 @@
     <ClCompile Include="GameList.cpp">
       <Filter>Misc</Filter>
     </ClCompile>
+    <ClCompile Include="GameRichPresence.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
     <ClCompile Include="Achievements.cpp">
       <Filter>Tools</Filter>
     </ClCompile>
@@ -2311,6 +2314,9 @@
       <Filter>System</Filter>
     </ClInclude>
     <ClInclude Include="GameList.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="GameRichPresence.h">
       <Filter>Misc</Filter>
     </ClInclude>
     <ClInclude Include="INISettingsInterface.h">

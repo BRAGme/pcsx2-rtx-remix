@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS.h"
+#include "R5900.h"
+#include "GS/Remix/RemixCameraTrace.h"
 #include "GS/Remix/RemixVU1Capture.h"
 #include "Gif_Unit.h"
 #include "MTGS.h"
@@ -30,6 +32,8 @@
 	{                 \
 	} while (0)
 #endif
+
+#include "GS/Remix/RemixCameraTraceGS.inc"
 
 namespace MTGS
 {
@@ -239,6 +243,7 @@ struct RingCmdPacket_Vsync
 
 void MTGS::PostVsyncStart(bool registers_written)
 {
+	RemixCameraTrace::OnEEPoint(RemixCameraTrace::ProducerVSync, cpuRegs.pc);
 	// Optimization note: Typically regset1 isn't needed.  The regs in that area are typically
 	// changed infrequently, usually during video mode changes.  However, on modern systems the
 	// 256-byte copy is only a few dozen cycles -- executed 60 times a second -- so probably
@@ -458,6 +463,19 @@ void MTGS::MainLoop()
 					break;
 				}
 
+				case Command::RemixCameraTrace:
+				{
+					ringposinc += tag.data[0];
+					if (tag.data[0] == sizeof(RemixCameraTrace::PoseObservation) / 16)
+					{
+						alignas(16) RemixCameraTrace::PoseObservation p;
+						u32 pos = (local_ReadPos + 1) & RingBufferMask;
+						MemCopy_WrappedSrc(RingBuffer.m_Ring, pos, RingBufferSize, reinterpret_cast<u128*>(&p), tag.data[0]);
+						RemixCameraTrace::AcceptPose(p);
+					}
+					break;
+				}
+
 				case Command::RemixKickSeq:
 				{
 					// GS thread. Names the kick the *next* packet command was built under; the
@@ -481,6 +499,8 @@ void MTGS::MainLoop()
 					}
 					Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 					GS_Packet gsPack = path.GetGSPacketMTVU(); // Get vu1 program's xgkick packet(s)
+					const auto trace_packet = path.GetTracePacketMTVU();
+					RemixCameraTrace::RecordWorker(trace_packet);
 					if (gsPack.size)
 						GSgifTransfer((u8*)&path.buffer[gsPack.offset], gsPack.size / 16);
 					path.readAmount.fetch_sub(gsPack.size + gsPack.readAmount, std::memory_order_acq_rel);
@@ -1070,6 +1090,7 @@ void MTGS::SetRunIdle(bool enabled)
 // Costs nothing when Remix is closed: Armed() is one relaxed atomic load.
 static void Gif_SendRemixKickSeq(GIF_PATH path)
 {
+	RemixCameraTrace::OnEEPoint(RemixCameraTrace::PacketEnqueue, cpuRegs.pc, static_cast<u32>(path));
 	if (!RemixVU1Capture::Armed())
 		return;
 
@@ -1120,3 +1141,5 @@ void Gif_MTGS_Wait(bool isMTVU)
 {
 	MTGS::WaitGS(false, true, isMTVU);
 }
+
+#include "GS/Remix/RemixCameraTraceEE.inc"

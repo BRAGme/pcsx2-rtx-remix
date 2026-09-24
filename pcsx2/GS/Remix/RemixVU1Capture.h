@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/Pcsx2Types.h"
+#include "GS/Remix/RemixSocomLighting.h"
 
 #include <atomic>
 
@@ -28,6 +29,8 @@
 // non-Remix run pays one predicted branch per kick and nothing else.
 namespace RemixVU1Capture
 {
+	// Updated by the GS title owner; no title or EE-memory reads on the VU thread.
+	void SetSocomTitle(bool title, bool normalized_light_colours = false);
 	// Candidates kept per frame. The GS side re-scores every one of them against the real
 	// viewport constants, which the VU side cannot know, so keeping a set rather than a
 	// single winner is what stops a shadow, cube-face or UI matrix from costing the frame
@@ -225,6 +228,7 @@ namespace RemixVU1Capture
 	// frame camera on false -- never guess, because a wrong camera places geometry in view space,
 	// which is the defect this whole mechanism exists to remove.
 	bool LookupKickCamera(u64 seq, float (&m)[16], u32& offset);
+	bool LookupKickLighting(u64 seq, remix_ps2::socom::LightingRig& out);
 
 	void SetArmed(bool enabled);
 

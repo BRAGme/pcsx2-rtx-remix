@@ -85,6 +85,7 @@ void GSRenderer::UpdateRenderFixes()
 
 bool GSRenderer::Merge(int field)
 {
+	m_remix_guest_frame_valid = false;
 	GSVector2i fs(0, 0);
 	GSTexture* tex[3] = { nullptr, nullptr, nullptr };
 	float tex_scale[3] = { 0.0f, 0.0f, 0.0f };
@@ -241,6 +242,14 @@ bool GSRenderer::Merge(int field)
 
 	const u32 c = (m_regs->BGCOLOR.U32[0] & 0x00FFFFFFu) | (m_regs->PMODE.ALP << 24);
 	g_gs_device->Merge(tex, src_gs_read, dst, fs, m_regs->PMODE, m_regs->EXTBUF, c);
+#if defined(_WIN32) && defined(_M_X64)
+	if (RemixSubmit::Armed())
+	{
+		const GSTexture* merged = g_gs_device->GetCurrent();
+		m_remix_guest_frame_valid = merged && merged->GetFormat() == GSTexture::Format::Color &&
+			merged->GetWidth() == fs.x && merged->GetHeight() == fs.y;
+	}
+#endif
 
 	if (isReallyInterlaced() && GSConfig.InterlaceMode != GSInterlaceMode::Off)
 	{
@@ -642,7 +651,17 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 #if defined(_WIN32) && defined(_M_X64)
 	// Remix's own frame boundary: camera, present, latch, reap, stats. Inert unless the Remix
 	// renderer is selected. Runs before the device present block so the two never interleave.
-	RemixSubmit::OnVSync();
+	GSTexture* remix_current = nullptr;
+	GSVector4i remix_crop(0, 0, 0, 0);
+	if (m_remix_guest_frame_valid && !blank_frame)
+	{
+		remix_current = g_gs_device->GetCurrent();
+		if (remix_current && remix_current->GetFormat() == GSTexture::Format::Color)
+			remix_crop = CalculateDrawSrcRect(remix_current, m_real_size);
+		else
+			remix_current = nullptr;
+	}
+	RemixSubmit::OnVSync(remix_current, remix_crop.x, remix_crop.y, remix_crop.z, remix_crop.w);
 #endif
 
 	// Skip presentation when running uncapped while vsync is on.

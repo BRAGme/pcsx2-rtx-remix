@@ -16,6 +16,9 @@ namespace remix_ps2
 		// `latched` was determined the same way: a read assigned to a `static const` local is
 		// captured once and never re-read.
 		const knob s_knobs[] = {
+			{"RTXVISION", "Post Processing", "Goggle rendering", knob_type::Choice, 0, 0, 2, 1,
+				"Original game vision|RTX night vision|RTX night and thermal",
+				"RTX night vision includes light bloom. RTX thermal uses the game's heat colors and cooling on ray-traced surfaces. Through-door silhouettes are not yet supported. Original game vision is the fallback without a matching runtime.", false},
 			// ------------------------------------------------------------------ Scene and Scale
 			{"CAMSCALE", "Scene and Scale", "World scale", knob_type::Float, 8.0, 0.01, 1000.0, 0.5,
 				nullptr,
@@ -207,13 +210,21 @@ namespace remix_ps2
 				"Recovers depth for draws that use FST texture coordinates.", false},
 			{"FSTFLAT", "Geometry and Filtering", "Accept flat-Z FST draws", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr, "Allows FST recovery on draws whose Z barely varies.", false},
-			{"SPRITE3D", "Geometry and Filtering", "Sprites are geometry", knob_type::Boolean, 0, 0, 1, 1,
-				nullptr,
+			{"SPRITE3D", "Geometry and Filtering", "Sprites are geometry", knob_type::Choice, 0, 0, 3, 1,
+				"Off|Textured sprites|Also untextured sprites|Also framebuffer blits",
 				"Expands each GS sprite into a quad and submits it as geometry the path tracer can "
 				"light, instead of discarding it. The PS2 draws 2D screens -- menus, the BIOS -- almost "
 				"entirely as sprites, so without this such a screen submits nothing and Remix keeps "
-				"re-presenting the last frame it was given. Turn it off for a game whose HUD should "
-				"stay a flat overlay.",
+				"re-presenting the last frame it was given. Raise it a step at a time: untextured "
+				"sprites are flat panels and gradients carried in vertex colour, and the last step "
+				"admits the guest sampling its own render target, which is usually a blit and not "
+				"content. Turn it off for a game whose HUD should stay a flat overlay.",
+				false},
+			{"SPRITEBLIT", "Geometry and Filtering", "Sprites may span the screen", knob_type::Boolean, 0, 0, 1, 1,
+				nullptr,
+				"Admits a sprite covering essentially the whole render target. Normally such a sprite "
+				"is a background or framebuffer blit rather than content -- but on a 2D screen the "
+				"full-target quad may be the backdrop itself.",
 				false},
 
 			// ------------------------------------------------------------------ Mesh Identity
@@ -249,6 +260,9 @@ namespace remix_ps2
 				"Logs each decoded texture's hash and mean colour.", true},
 			{"FBMSKDUMP", "Diagnostics", "Log framebuffer-mask draws", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr, "Logs draws rejected by the FBMSK gate.", false},
+			{"CAMTRACE", "Diagnostics", "Record camera diagnostic", knob_type::Boolean, 0, 0, 1, 1, nullptr,
+				"Record a short diagnostic after a Rainbow Six 3 USA mission has loaded. Requires the diagnostic launcher; "
+				"automatically stops. Turn off before starting another recording.", false},
 			{"ALBEDOPROBE", "Diagnostics", "Magenta albedo probe", knob_type::Boolean, 0, 0, 1, 1, nullptr,
 				"Fills every uploaded texture with magenta. Anything still white is not sampling our "
 				"texture at all.",

@@ -2760,6 +2760,9 @@ void GSRendererHW::RoundSpriteOffset()
 
 void GSRendererHW::Draw()
 {
+#if defined(_WIN32) && defined(_M_X64)
+	RemixSubmit::OnDrawLoadingFrame(*this, m_vertex->buff, m_vertex->next, m_index->buff, m_index->tail);
+#endif
 	static u32 num_skipped_channel_shuffle_draws = 0;
 	GSVertexBuff& vtx_buff = *m_vertex;
 	GSIndexBuff& idx_buff = *m_index;
@@ -3065,7 +3068,10 @@ void GSRendererHW::Draw()
 		return;
 	}
 
-	m_process_texture = PRIM->TME && !(NeedsBlending() && m_context->ALPHA.IsBlack() && !m_cached_ctx.TEX0.TCC) && !(no_rt && (!m_cached_ctx.TEST.ATE || m_cached_ctx.TEST.ATST <= ATST_ALWAYS));
+	const bool host_process_texture = PRIM->TME &&
+		(!(NeedsBlending() && m_context->ALPHA.IsBlack() && !m_cached_ctx.TEX0.TCC) &&
+			!(no_rt && (!m_cached_ctx.TEST.ATE || m_cached_ctx.TEST.ATST <= ATST_ALWAYS)));
+	m_process_texture = host_process_texture;
 
 	// We trigger the sw prim render here super early, to avoid creating superfluous render targets.
 	if (CanUseSwPrimRender(no_rt, no_ds, draw_sprite_tex && m_process_texture) && SwPrimRender(*this, true, true))
@@ -3539,7 +3545,7 @@ void GSRendererHW::Draw()
 			m_process_texture = false;
 			possible_shuffle = false;
 		}
-		else
+		if (m_process_texture)
 		{
 			src = tex_psm.depth ? g_texture_cache->LookupDepthSource(true, TEX0, m_cached_ctx.TEXA, MIP_CLAMP, tmm.coverage, possible_shuffle, m_vt.IsLinear(), m_cached_ctx.FRAME, req_color, req_alpha)
 			                    : g_texture_cache->LookupSource(true, TEX0, m_cached_ctx.TEXA, MIP_CLAMP, tmm.coverage, (GSConfig.HWMipmap || GSConfig.TriFilter == TriFiltering::Forced) ? &hash_lod_range : nullptr,
@@ -9279,7 +9285,8 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	// vertex buffer in place, and Lines2Sprites / the accurate_stq triangle path inside
 	// SetupIA set Q to 1.0 outright. Inert unless the Remix renderer is selected.
 	if (RemixSubmit::Armed())
-		RemixSubmit::OnDrawPrims(*this, rt ? rt->GetUnscaledWidth() : 0, rt ? rt->GetUnscaledHeight() : 0, tex);
+		RemixSubmit::OnDrawPrims(*this, rt ? rt->GetUnscaledWidth() : 0, rt ? rt->GetUnscaledHeight() : 0,
+			tex, rt);
 #endif
 
 	const GSDrawingEnvironment& env = *m_draw_env;

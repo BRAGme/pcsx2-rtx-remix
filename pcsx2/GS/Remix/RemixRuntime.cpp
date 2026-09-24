@@ -258,6 +258,8 @@ namespace remix_ps2
 		{
 			m_guest_vision = reinterpret_cast<guest_vision_function>(
 				::GetProcAddress(m_dll, "remixapi_SetGuestVisionMode"));
+			m_guest_sky = reinterpret_cast<guest_sky_function>(
+				::GetProcAddress(m_dll, "remixapi_SetGuestSkyFrame"));
 			m_guest_thermal = reinterpret_cast<guest_thermal_function>(
 				::GetProcAddress(m_dll, "remixapi_SetGuestThermalFrame"));
 			m_premultiplied_overlay = reinterpret_cast<PFN_remixapi_DrawScreenOverlay>(
@@ -269,6 +271,7 @@ namespace remix_ps2
 			m_guest_thermal ? "available" : "unavailable",
 			m_premultiplied_overlay ? "available" : "unavailable");
 
+		INFO_LOG("Remix: guest sky {}", m_guest_sky ? "available" : "unavailable");
 		INFO_LOG("Remix: runtime initialized on HWND {}", static_cast<void*>(hwnd));
 		return true;
 	}
@@ -347,6 +350,7 @@ namespace remix_ps2
 
 	void runtime::shutdown()
 	{
+		m_guest_sky = nullptr;
 		if (!m_dll)
 		{
 			m_storage = {};
@@ -639,6 +643,13 @@ namespace remix_ps2
 		return guarded_set_guest_vision(m_guest_vision, mode);
 	}
 
+	u32 runtime::set_guest_sky(const void* bgra_pixels, u32 width, u32 height, u32 row_pitch)
+	{
+		if (!m_ok || !m_guest_sky)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		return guarded_set_guest_sky(m_guest_sky, bgra_pixels, width, height, row_pitch);
+	}
+
 	u32 runtime::set_guest_thermal(const void* bgra_pixels, u32 width, u32 height, u32 row_pitch)
 	{
 		if (!m_ok || !m_guest_thermal)
@@ -663,6 +674,20 @@ namespace remix_ps2
 		__try
 		{
 			return fn(mode);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_set_guest_sky(guest_sky_function fn, const void* bgra_pixels, u32 width, u32 height, u32 row_pitch)
+	{
+		if (!fn)
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		__try
+		{
+			return fn(bgra_pixels, width, height, row_pitch);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{

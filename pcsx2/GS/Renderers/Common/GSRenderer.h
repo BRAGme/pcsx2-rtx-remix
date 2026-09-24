@@ -22,6 +22,7 @@ private:
 
 	// Tracking draw counters for idle frame detection.
 	u64 m_last_draw_n = 0;
+	bool m_remix_guest_frame_valid = false;
 	u64 m_last_transfer_n = 0;
 
 protected:

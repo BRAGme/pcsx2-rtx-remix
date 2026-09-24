@@ -8,6 +8,8 @@
 #include "GS.h"
 #include "GS/GSRegs.h"
 #include "MTGS.h"
+#include "GS/Remix/RemixCameraTrace.h"
+#include "GS/Remix/RemixVU1Capture.h"
 
 // FIXME common path ?
 #include "common/boost_spsc_queue.hpp"
@@ -200,11 +202,14 @@ struct Gif_Path_MTVU
 	// memory overhead. Note the struct is instantied 3 times (for each gif
 	// path)
 	ringbuffer_base<GS_Packet, MTGS::RingBufferSize / 2> gsPackQueue;
+	// Same SPSC capacity/lifetime as the associated packet. This tail is excluded from savestates.
+	ringbuffer_base<RemixCameraTrace::WorkerObservation, MTGS::RingBufferSize / 2> traceQueue;
 	Gif_Path_MTVU() { Reset(); }
 	void Reset()
 	{
 		fakePackets = 0;
 		gsPackQueue.reset();
+		traceQueue.reset();
 		fakePacket.Reset();
 		fakePacket.size = ~0u; // Used to indicate that its a fake packet
 	}
@@ -485,16 +490,23 @@ struct Gif_Path
 	}
 
 	// MTVU: Gets called after VU1 execution on MTVU thread
-	void FinishGSPacketMTVU()
+	void FinishGSPacketMTVU(const RemixCameraTrace::WorkerObservation& trace_packet)
 	{
 		// Performance note: fetch_add atomic operation might create some stall for atomic
 		// operation in gsPack.push
 		readAmount.fetch_add(gsPack.size + gsPack.readAmount, std::memory_order_acq_rel);
 		while (!mtvu.gsPackQueue.push(gsPack))
 			;
+		while (!mtvu.traceQueue.push(trace_packet))
+			;
 
 		gsPack.Reset();
 		gsPack.offset = curOffset;
+	}
+
+	RemixCameraTrace::WorkerObservation GetTracePacketMTVU()
+	{
+		return mtvu.traceQueue.empty() ? RemixCameraTrace::WorkerObservation{} : mtvu.traceQueue.front();
 	}
 
 	// MTVU: Gets called by MTGS thread
@@ -515,6 +527,7 @@ struct Gif_Path
 	void PopGSPacketMTVU()
 	{
 		mtvu.gsPackQueue.pop();
+		mtvu.traceQueue.pop();
 	}
 
 	// MTVU: Returns the amount of pending
