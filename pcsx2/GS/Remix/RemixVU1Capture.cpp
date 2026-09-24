@@ -62,12 +62,17 @@ namespace RemixVU1Capture
 			return static_cast<u32>(std::min<s64>(env, 4096));
 		}
 
-		// Whether the exhaustive 16 KB shape scan runs at all, independent of the per-frame kick
-		// budget above. These were one setting, which meant turning the scan off also turned off
-		// the back-slice that shares the same handler -- so the only stability escape hatch also
-		// removed the working camera. Off by default; PCSX2_REMIX_SCANWINDOWS=1 restores it for
-		// a title whose microcode does not decode.
-		const bool s_scan_windows = remix_ps2::read_env_int(L"PCSX2_REMIX_SCANWINDOWS", 0) > 0;
+		// PCSX2_REMIX_SCANWINDOWS lived here, as a namespace-scope `const bool` initialised at
+		// STATIC-INIT TIME -- before main, and therefore long before any per-game <SERIAL>.conf or
+		// settings overlay is applied. Neither could ever reach it: only a real process environment
+		// variable set before launch could. env_flag_live() below names this exact defect and used
+		// to name this exact variable as the surviving instance of it.
+		//
+		// That mattered more than it looks. The shape scan is the ONLY generic mechanism for finding
+		// a camera whose address is unknown, so the one knob that could rescue an unsolved title was
+		// the one knob a per-game profile could not turn on -- which puts a hole in the discovery
+		// loop precisely where a new title needs it. It is now read live per kick, at the loop, like
+		// every other flag on this path.
 
 		// ---- seqlock slot: written by the VU thread, read by the GS thread -----------------
 		std::atomic<u32> s_seq{0};
@@ -702,7 +707,8 @@ namespace RemixVU1Capture
 		// worse, at static-init -- is the pre-conf value for the whole session. The per-game conf
 		// also calls SetEnvironmentVariableW directly and bumps no generation counter, so a
 		// generation-cached reader never re-reads it either. Both of those have already shipped
-		// here as silent no-ops (see s_scan_windows above, which still has the defect).
+		// here as silent no-ops. SCANWINDOWS was the last surviving instance and is now read here
+		// too; SCANKICKS remains latched in SetArmed() by necessity, and its own comment says so.
 		//
 		// The cost is one GetEnvironmentVariableW per scanned kick -- the scan budget is 16 kicks
 		// per frame by default -- so these are read ONCE per kick into locals, never per candidate
@@ -1615,7 +1621,13 @@ namespace RemixVU1Capture
 		// from here. It stays available as the fallback for a title whose microcode does not
 		// decode, but it is off by default -- an untargeted sweep of all 16 KB on every kick is
 		// far too expensive to run speculatively once the deterministic path is answering.
-		for (u32 offset = 0; s_scan_windows && (offset + s_matrix_bytes) <= VU1_MEMSIZE; offset += s_qword)
+		//
+		// Hoisted into a local rather than read in the loop condition: this reads the environment,
+		// and the loop below runs a thousand-odd iterations per kick. Once per kick is the same
+		// cost the other live flags on this path already pay.
+		const bool scan_windows = env_flag_live(L"PCSX2_REMIX_SCANWINDOWS");
+
+		for (u32 offset = 0; scan_windows && (offset + s_matrix_bytes) <= VU1_MEMSIZE; offset += s_qword)
 		{
 			++s_frame.windows_examined;
 
