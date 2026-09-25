@@ -230,6 +230,15 @@ namespace remix_ps2
 				"that inspects draws can ever see. FMVs will look like ordinary emulator output, "
 				"because that is what they are.",
 				false},
+			{"UIRASTER", "Geometry and Filtering", "Composite 2D draws as an overlay", knob_type::Boolean, 1, 0, 1, 1,
+				nullptr,
+				"Draws the HUD, menus and other flat 2D art into an overlay composited over the finished "
+				"image, instead of submitting them as world surfaces for the path tracer to light. On by "
+				"default: a HUD hanging out in the world is the usual reason a title looks broken on "
+				"first run. It only acts while no world camera has been recovered, so a title whose "
+				"camera works is unaffected. Turn it off if flat art that belongs in the world -- a "
+				"billboard, a distant sign -- is being flattened onto the screen.",
+				false},
 			{"SPRITEBLIT", "Geometry and Filtering", "Sprites may span the screen", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr,
 				"Admits a sprite covering essentially the whole render target. Normally such a sprite "
