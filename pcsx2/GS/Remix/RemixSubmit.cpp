@@ -3626,6 +3626,209 @@ namespace RemixSubmit
 			return std::clamp(value, 0.f, 1.f);
 		}
 
+		// PCSX2_REMIX_GUESTPOSTFX -- drive the runtime's own post-processing from the guest's screen
+		// effect state, as "<blurBase>,<blurOff>,<stateOff>,<tintBase>,<tintOff>" in DECIMAL.
+		// A base of 0 disables that half; an empty value disables both. Default off.
+		//
+		// WHY THIS HAS TO COME FROM MEMORY. Both effects are framebuffer-feedback sprite passes:
+		// the blur re-samples the colour buffer as a texture, and the tint re-draws the colour
+		// buffer over itself modulated by a colour. A path-traced backend has no colour buffer to
+		// feed back, so both vanish silently -- the same failure mode as the fade above, and the
+		// same remedy: read what drives them and push it into the runtime.
+		//
+		// For Black (SLUS-21376): 4256984,539824,539860,4256960,53904, i.e. blur mix at
+		// gWorld(0x0040F4D8)+0x83CB0, effect state at +0x83CD4, and the drawn tint vec4 at
+		// gRenderCtx(0x0040F4C0)+0xD290.
+		bool guest_postfx_chain(u32 (&out)[5])
+		{
+			const std::wstring spec = remix_ps2::read_env(L"PCSX2_REMIX_GUESTPOSTFX");
+			if (spec.empty())
+				return false;
+
+			size_t start = 0;
+			for (u32 i = 0; i < 5; ++i)
+			{
+				const size_t comma = spec.find(L',', start);
+				const s64 value = ::_wtoi64(spec.substr(start, (comma == std::wstring::npos)
+						? std::wstring::npos : (comma - start)).c_str());
+				if (value < 0 || value > 0x01FFFFFF)
+					return false;
+
+				out[i] = static_cast<u32>(value);
+				if (comma == std::wstring::npos)
+					return i == 4;
+
+				start = comma + 1;
+			}
+			return false;
+		}
+
+		// Resolves *(base) + offset and copies `bytes` out of guest RAM. False leaves `out`
+		// untouched and every caller reads that as "the effect is not running" -- the same
+		// fail-inert contract as read_guest_fade(): a bad chain must never APPLY an effect.
+		bool read_guest_block(u32 base, u32 offset, void* out, u32 bytes)
+		{
+			constexpr u32 ram_size = 0x02000000;
+			if (!eeMem || base == 0 || (base & 3) != 0 || base > ram_size - sizeof(u32))
+				return false;
+
+			u32 object = 0;
+			std::memcpy(&object, eeMem->Main + base, sizeof(object));
+			object &= (ram_size - 1);
+
+			const u32 address = object + offset;
+			if (object == 0 || (address & 3) != 0 || bytes > ram_size || address > ram_size - bytes)
+				return false;
+
+			std::memcpy(out, eeMem->Main + address, bytes);
+			return true;
+		}
+
+		bool read_guest_floats(u32 base, u32 offset, float* out, u32 count)
+		{
+			if (!read_guest_block(base, offset, out, count * sizeof(float)))
+				return false;
+
+			for (u32 i = 0; i < count; ++i)
+				if (!std::isfinite(out[i]))
+					return false;
+
+			return true;
+		}
+
+		// Pushed only when the formatted value MOVES. SetConfigVariable writes the runtime's user
+		// layer and has no getter, so re-sending an unchanged value every frame is pure churn on a
+		// path that is already the frame's critical section.
+		void push_config_once(const char* key, const std::string& value, std::string& last)
+		{
+			if (value == last)
+				return;
+
+			const u32 code = remix_ps2::guarded_set_config_variable(
+				s_remix.api().SetConfigVariable, key, value.c_str());
+			if (code != REMIXAPI_ERROR_CODE_SUCCESS)
+			{
+				static u64 failures = 0;
+				if ((failures++ % 300) == 0)
+					ERROR_LOG("Remix: GUESTPOSTFX could not set {} = {} ({}) -- {} refusals so far",
+						key, value, remix_ps2::error_name(code), failures);
+				return;
+			}
+
+			last = value;
+		}
+
+		// Mirror the guest's blur and tint into rtx.dof.* and rtx.tonemap.*. While GUESTPOSTFX is
+		// armed the backend OWNS those keys: it rewrites them whenever the guest's values move, so a
+		// hand edit in the Remix menu survives only until the next change.
+		void apply_guest_postfx()
+		{
+			u32 chain[5] = {};
+			if (!s_remix.ok() || !guest_postfx_chain(chain))
+				return;
+
+			static std::string s_dof_enable, s_dof_focus, s_dof_length, s_dof_fnumber, s_dof_radius;
+			static std::string s_grade_enable, s_grade_balance;
+
+			// 1/256. Below this the guest's own FIX byte, trunc(x * 128), is zero, so the effect is
+			// not being drawn at all and the runtime should not be paying for it either.
+			constexpr float threshold = 1.f / 256.f;
+
+			// --- the blur ---------------------------------------------------------------------
+			//
+			// Black has NO depth of field. It is a uniform, fixed-radius, depth-independent blur,
+			// and a lens is depth-dependent by definition, so a lens cannot reproduce it -- but the
+			// CLAMP can. Saturating the lens (widest aperture, focus 5 cm) drives the circle of
+			// confusion 10x to 60x past maxBlurRadius for everything beyond ~6 cm, including the sky
+			// at its far-field asymptote, so every pixel takes the clamped value and the gather
+			// radius is exactly maxBlurRadius. Depth drops out, which is the whole point.
+			//
+			// What is left approximate is the RAMP: the guest cross-fades a sharp and a blurred
+			// image, so a partial effect keeps a sharp core under a soft halo, while scaling the
+			// radius gives a uniformly softer image. The endpoints match; the middle does not.
+			float blur = 0.f;
+			if (!read_guest_floats(chain[0], chain[1], &blur, 1))
+				blur = 0.f;
+
+			// States 0 and 4 publish a mix but skip the draw, so the float alone over-blurs. The
+			// gate applies only when the state actually reads; a bad stateOff leaves it ungated
+			// rather than silently killing the blur.
+			s32 effect_state = 0;
+			if (read_guest_block(chain[0], chain[2], &effect_state, sizeof(effect_state))
+				&& (effect_state == 0 || effect_state == 4))
+				blur = 0.f;
+
+			blur = std::clamp(blur, 0.f, 1.f);
+			const bool blur_on = blur > threshold;
+			push_config_once("rtx.dof.dofEnable", blur_on ? "True" : "False", s_dof_enable);
+
+			if (blur_on)
+			{
+				push_config_once("rtx.dof.focusDistance", "0.05", s_dof_focus);
+				push_config_once("rtx.dof.focalLength", "28.0", s_dof_length);
+				push_config_once("rtx.dof.fNumber", "1.0", s_dof_fnumber);
+
+				// 25.27 px at 1080p = 2.34% of frame height, the disc radius whose marginal sigma
+				// (R/2) equals the 1.17% of frame height measured off the guest kernel. The runtime
+				// scales this by height/1080 itself, so it stays a constant fraction of the image.
+				push_config_once("rtx.dof.maxBlurRadius", fmt::format("{:.2f}", 25.27f * blur),
+					s_dof_radius);
+			}
+
+			// --- the tint ---------------------------------------------------------------------
+			//
+			// EXACT, not an approximation. The guest does screen = lerp(screen, screen * c, w) with
+			// the drawn colour c and blend factor w read below, which is the per-channel multiply
+			// screen * (1 + (c - 1) * w). rtx.tonemap.colorBalance is literally
+			// `inputColor * colorBalance`, so that gain goes straight in.
+			//
+			// It is NOT a saturation control and rtx.tonemap.saturation is deliberately left alone:
+			// Black contains no cross-channel colour mix at all. The low-health "greyscale" is
+			// state 9, gain (0.8, 0, 0) -- green and blue multiplied by zero. That reads as the
+			// colour draining out, but it is channel annihilation, not a luminance matrix, and
+			// routing it through a BT.709 desaturation would give the wrong image.
+			//
+			// Verified against seven measured states: the gain below reproduces every published
+			// row to within 0.01, including both exact endpoints (state 8 neutral, state 9 red).
+			float tint[4] = {1.f, 1.f, 1.f, 0.f};
+			if (!read_guest_floats(chain[3], chain[4], tint, 4))
+				tint[3] = 0.f;
+
+			const float mix = std::clamp(tint[3], 0.f, 1.f);
+			float gain[3] = {1.f, 1.f, 1.f};
+			bool tinted = false;
+			for (u32 i = 0; i < 3; ++i)
+			{
+				gain[i] = 1.f + (std::clamp(tint[i], 0.f, 1.f) - 1.f) * mix;
+				tinted = tinted || (gain[i] < 1.f - threshold);
+			}
+
+			// Enabling grading also switches on rtx.tonemap.contrast and .saturation, whose
+			// defaults (1.0, 1.0) are identity. They are left untouched so a user grade still
+			// applies on top instead of being stamped over every frame.
+			push_config_once("rtx.tonemap.colorGradingEnabled", tinted ? "True" : "False",
+				s_grade_enable);
+
+			if (tinted)
+				push_config_once("rtx.tonemap.colorBalance",
+					fmt::format("{:.4f}, {:.4f}, {:.4f}", gain[0], gain[1], gain[2]), s_grade_balance);
+
+			// One line when the chain first resolves, and one per effect-state change after that.
+			// The addresses are build-specific, so this is the only way to tell from a log whether
+			// they still point at anything: a live line with a moving state means yes, silence
+			// after arming the knob means the chain is wrong for this executable.
+			static bool announced = false;
+			static s32 last_state = -1;
+			if (!announced || effect_state != last_state)
+			{
+				announced = true;
+				last_state = effect_state;
+				INFO_LOG("Remix: GUESTPOSTFX state {} blur {:.3f} tint ({:.3f} {:.3f} {:.3f}) w {:.3f}"
+						 " -> gain ({:.4f} {:.4f} {:.4f})",
+					effect_state, blur, tint[0], tint[1], tint[2], mix, gain[0], gain[1], gain[2]);
+			}
+		}
+
 		bool read_ee_camera(float (&pos)[3], remix_ps2::mat4& view, float (&angles_deg)[3],
 			float* out_fov_y = nullptr, float* out_aspect = nullptr)
 		{
@@ -16725,6 +16928,11 @@ namespace RemixSubmit
 			vision_end_frame(merged_frame_active);
 			merged_frame_present(merged_texture, crop_left, crop_top, crop_right, crop_bottom,
 				native_width, native_height, merged_frame_active);
+
+			// The guest's blur and tint, mirrored into the runtime's own post-processing. Done
+			// here rather than per draw: both are whole-frame effects whose values move once per
+			// guest frame.
+			apply_guest_postfx();
 
 			// The guest's screen fade, folded into the overlay just before it is handed over.
 			//
