@@ -12,6 +12,7 @@
 #include "common/Path.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cwchar>
 #include <optional>
@@ -107,21 +108,39 @@ namespace remix_ps2
 		{
 			const std::string narrow_path = narrow(path);
 
-			std::optional<std::vector<u8>> bytes = FileSystem::ReadBinaryFile(narrow_path.c_str());
-			if (!bytes.has_value())
+			// The runtime DLL is around 200 MB. ReadBinaryFile pulled the whole file into one
+			// vector just to walk it once, so a diagnostic was making a 200 MB transient
+			// allocation on the startup path. Stream it instead.
+			//
+			// FNV-1a is a fold, so chunking produces the IDENTICAL fingerprint -- every value
+			// already recorded in logs and comments stays comparable. That is the reason this
+			// keeps FNV rather than moving to the much faster XXH3 the backend already links.
+			std::FILE* file = FileSystem::OpenCFile(narrow_path.c_str(), "rb");
+			if (!file)
 			{
 				WARNING_LOG("Remix: runtime DLL '{}' could not be opened for fingerprinting", narrow_path);
 				return;
 			}
 
+			std::vector<u8> chunk(size_t{1} << 20);
 			u64 hash = fnv_seed;
-			for (const u8 b : bytes.value())
+			u64 size = 0;
+			for (;;)
 			{
-				hash ^= static_cast<u64>(b);
-				hash *= fnv_prime;
-			}
+				const size_t got = std::fread(chunk.data(), 1, chunk.size(), file);
+				if (got == 0)
+					break;
 
-			INFO_LOG("Remix: runtime DLL '{}' size={} fnv1a={:016x}", narrow_path, bytes->size(), hash);
+				size += got;
+				for (size_t i = 0; i < got; ++i)
+				{
+					hash ^= static_cast<u64>(chunk[i]);
+					hash *= fnv_prime;
+				}
+			}
+			std::fclose(file);
+
+			INFO_LOG("Remix: runtime DLL '{}' size={} fnv1a={:016x}", narrow_path, size, hash);
 		}
 	} // namespace
 

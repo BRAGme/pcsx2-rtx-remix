@@ -13433,9 +13433,14 @@ namespace RemixSubmit
 		double s_moonfit_up_lum = 0.0, s_moonfit_down_lum = 0.0;
 		u64 s_moonfit_up_n = 0, s_moonfit_down_n = 0;
 
+		// Default 0, i.e. OFF. accumulate_moon_fit() runs per DRAW over every scratch vertex, and
+		// per vertex it does a 4x4 outer product plus a residual -- about twenty multiply-adds --
+		// purely to report a light direction once every `window` draws. A sampling profile of Black
+		// in a level put it at 1.57% of the whole frame, which is a lot for a line of log nobody
+		// is reading during play. Set it to 900 when you actually want the fit for a new title.
 		int moonfit_window()
 		{
-			static live_int value(L"PCSX2_REMIX_MOONFIT", 900, 0, 100000);
+			static live_int value(L"PCSX2_REMIX_MOONFIT", 0, 0, 100000);
 			return value.get();
 		}
 
@@ -13961,7 +13966,6 @@ namespace RemixSubmit
 			u64 start = Common::Timer::GetCurrentValue();
 			~submit_clock() { s_submit_ticks += Common::Timer::GetCurrentValue() - start; }
 		} clock;
-		profile_start();
 
 		if (!armed())
 			return;
@@ -13970,6 +13974,12 @@ namespace RemixSubmit
 
 		if (!s_live)
 			return;
+
+		// Armed AFTER the runtime is live, not at the top of the function. ensure_initialized()
+		// runs inside the first draw and fingerprints a 200 MB DLL while it is there, so arming
+		// earlier charged that one-time startup work to the steady-state profile and made it
+		// look like a per-frame cost.
+		profile_start();
 
 		if (remix_ps2::socom::IsTitle(remix_ps2::paths::game_id()))
 		{

@@ -295,6 +295,15 @@ namespace remix_ps2
 				nullptr, "Writes remix_draws.txt describing every submitted draw for N frames.", false},
 			{"TEXDUMP", "Diagnostics", "Log decoded textures", knob_type::Boolean, 1, 0, 1, 1, nullptr,
 				"Logs each decoded texture's hash and mean colour.", true},
+			{"MOONFIT", "Diagnostics", "Fit the baked light direction (draws)", knob_type::Integer, 0, 0, 100000, 100,
+				nullptr,
+				"Recovers the direction a level's BAKED lighting came from, by least-squares fitting "
+				"vertex luminance against vertex normals, and prints it every N draws along with the "
+				"KEYELEV and KEYAZIM values that reproduce it. Useful once per title when setting up "
+				"lighting, and pure overhead afterwards: it walks every vertex of every draw and "
+				"measured 1.57 percent of the frame on a busy scene. 900 is a good working value. "
+				"0 is off.",
+				false},
 			{"PROFILE", "Diagnostics", "Sampling profiler (Hz)", knob_type::Integer, 0, 0, 8000, 100,
 				nullptr,
 				"Samples the instruction pointer of the draw-submission thread and writes "
