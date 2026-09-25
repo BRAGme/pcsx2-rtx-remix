@@ -1698,9 +1698,59 @@ namespace RemixSubmit
 					maxy = std::min(maxy, static_cast<int>(options.scissor.SCAY1));
 				}
 
+				if (maxx < minx || maxy < miny)
+					continue;
+
+				// Each edge function is LINEAR in x, so the pixels that can pass the coverage test
+				// on a scanline form one contiguous span and the rest of the bounding box is known
+				// to fail before it is visited. Measured on the PS2 BIOS: the rasteriser cost 0.77 ms
+				// per draw whether it wrote 155k texels or 439k, because it was paying for the whole
+				// bounding box -- and for a full-screen quad split into two triangles, half of that
+				// box is outside the triangle by construction.
+				//
+				// dw2/dx = -(dw0/dx + dw1/dx) because w2 is defined as 1 - w0 - w1 below.
+				const float dw0dx = (y1 - y2) * inv_area;
+				const float dw1dx = (y2 - y0) * inv_area;
+				const float dw2dx = -(dw0dx + dw1dx);
+				const float span_max = static_cast<float>(maxx - minx);
+
 				for (int y = miny; y <= maxy; ++y)
 				{
-					for (int x = minx; x <= maxx; ++x)
+					// Solve each edge for the x range where it is non-negative, then intersect. The
+					// span is widened by a pixel on each side and the exact per-pixel test below is
+					// left untouched, so coverage is bit-identical to scanning the whole box -- this
+					// only decides which pixels are worth asking about.
+					const float row_y = static_cast<float>(y) + 0.5f;
+					const float row_x = static_cast<float>(minx) + 0.5f;
+					const float e0 = (((x1 - row_x) * (y2 - row_y)) - ((x2 - row_x) * (y1 - row_y))) * inv_area;
+					const float e1 = (((x2 - row_x) * (y0 - row_y)) - ((x0 - row_x) * (y2 - row_y))) * inv_area;
+					const float edge_value[3] = {e0, e1, 1.0f - e0 - e1};
+					const float edge_slope[3] = {dw0dx, dw1dx, dw2dx};
+
+					float span_lo = 0.f, span_hi = span_max;
+					bool row_empty = false;
+					for (u32 e = 0; e < 3; ++e)
+					{
+						// A slope of zero cannot bring a negative edge back: the whole row is outside.
+						if (edge_slope[e] > 1e-12f)
+							span_lo = std::max(span_lo, -edge_value[e] / edge_slope[e]);
+						else if (edge_slope[e] < -1e-12f)
+							span_hi = std::min(span_hi, -edge_value[e] / edge_slope[e]);
+						else if (edge_value[e] < 0.f)
+							row_empty = true;
+					}
+
+					// Clamped before the cast: a near-zero slope can still divide out to something
+					// far outside the row, and converting that to int is undefined.
+					span_lo = std::clamp(span_lo, 0.f, span_max);
+					span_hi = std::clamp(span_hi, 0.f, span_max);
+					if (row_empty || !(span_hi >= span_lo))
+						continue;
+
+					const int row_begin = std::max(minx, minx + static_cast<int>(span_lo) - 1);
+					const int row_end = std::min(maxx, minx + static_cast<int>(span_hi) + 1);
+
+					for (int x = row_begin; x <= row_end; ++x)
 					{
 						const float pxc = (float)x + 0.5f, pyc = (float)y + 0.5f;
 						float w0 = (((x1 - pxc) * (y2 - pyc)) - ((x2 - pxc) * (y1 - pyc))) * inv_area;
@@ -1751,8 +1801,15 @@ namespace RemixSubmit
 							w2 * (static_cast<float>(s_socom_hud_vertices[i2].z) - static_cast<float>(s_socom_hud_vertices[i0].z)) : 0.f;
 						if (!socom_hud_depth_pass(pixel, depth, options))
 							continue;
+						// GOURAUD. Interpolating only for the SOCOM HUD meant every other draw was
+						// FLAT-filled from vertex 0, so a shaded quad came out as its two triangles in
+						// two different solid colours with a hard seam along the shared diagonal. The
+						// PS2 BIOS backgrounds are gradients, which is exactly where it showed.
+						//
+						// The equality test keeps the flat case -- text, icons, solid fills, the large
+						// majority -- on the cheap path, so this costs nothing where it is not needed.
 						u32 color = s_scratch_vertices[i0].color;
-						if (options.socom_hud)
+						if (color != s_scratch_vertices[i1].color || color != s_scratch_vertices[i2].color)
 						{
 							color = 0;
 							for (u32 k = 0; k < 4; ++k)
