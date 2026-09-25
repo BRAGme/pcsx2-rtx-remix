@@ -247,6 +247,16 @@ namespace remix_ps2
 				nullptr,
 				"A flat draw further than this is treated as world geometry, not UI. Dirt and muzzle-flash billboards are camera-facing quads at a single depth, so they look exactly like a HUD element to every other test -- depth is what separates them. Genuine UI sits at a small, fixed w; a billboard's w is its real distance from the eye. Lower it if world art is being flattened onto the screen, raise it if UI is missing. 0 removes the limit.",
 				false},
+			{"RASTERTHREADS", "Geometry and Filtering", "Overlay rasteriser threads", knob_type::Integer, 4, 1, 32, 1,
+				nullptr,
+				"How many threads share one overlay draw. The overlay rasteriser runs on the EE "
+				"thread, so on a title whose whole screen is 2D it IS the emulation speed -- measured "
+				"at 87-90 percent of wall clock on the PS2 BIOS. Each thread takes a band of scanlines, "
+				"so no two threads ever touch the same pixel and draws still composite in submission "
+				"order. Only draws covering at least a quarter of the screen are split; a glyph would "
+				"spend longer being handed out than drawn. 1 restores the single-threaded path. "
+				"Clamped to leave two cores for the EE and GS threads. Takes effect on restart.",
+				true},
 			{"SPRITEBLIT", "Geometry and Filtering", "Sprites may span the screen", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr,
 				"Admits a sprite covering essentially the whole render target. Normally such a sprite "

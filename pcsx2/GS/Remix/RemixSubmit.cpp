@@ -21,6 +21,11 @@
 #include "common/FileSystem.h"
 #include "common/Path.h"
 #include "common/Timer.h"
+
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include "common/WindowInfo.h"
 
 #include "fmt/format.h"
@@ -813,6 +818,146 @@ namespace RemixSubmit
 		u64 s_overlay_nopixels = 0;   // ... but had no CPU texture to sample
 		u64 s_overlay_texels = 0;     // texels actually written
 		u64 s_overlay_raster_ticks = 0; // wall time spent inside the CPU rasteriser
+
+		// PCSX2_REMIX_RASTERTHREADS -- how many threads share one overlay draw. 1 is serial.
+		//
+		// The overlay rasteriser runs on the EE thread, so on a fully 2D title it is emulation
+		// speed: measured at 87-90% of wall clock on the PS2 BIOS. It is also embarrassingly
+		// parallel, but only along ONE axis.
+		//
+		// SPLIT BY ROW, NEVER BY TRIANGLE OR BY DRAW. Compositing is alpha blending, which does
+		// not commute, so two triangles that overlap must be applied in submission order. Give
+		// each thread a band of scanlines and that ordering is preserved for free: every pixel
+		// belongs to exactly one band, so one thread applies every draw touching it, in order.
+		// The output is identical to the serial path rather than merely close, and there is no
+		// sharing to synchronise -- which is why this is a band split and not a work queue.
+		//
+		// Latched, not live: changing it means rebuilding the pool, and a resize mid-draw is a
+		// race for no benefit. Clamped to leave two cores for the EE and GS threads themselves,
+		// since starving those to feed the rasteriser is a net loss.
+		u32 overlay_raster_threads()
+		{
+			static const u32 value = []() -> u32 {
+				const u32 hardware = std::max(1u, std::thread::hardware_concurrency());
+				const u32 ceiling = std::max(1u, (hardware > 2u) ? (hardware - 2u) : 1u);
+				const s64 requested = remix_ps2::read_env_int(L"PCSX2_REMIX_RASTERTHREADS", 4);
+				return static_cast<u32>(std::clamp<s64>(requested, 1, ceiling));
+			}();
+			return value;
+		}
+
+		// Fork/join over a fixed band count. Threads are made once and parked, because a draw is
+		// a millisecond of work and spawning per draw would cost more than it saves at the 600 to
+		// 2000 draws a second this sees.
+		class overlay_band_pool
+		{
+		public:
+			~overlay_band_pool()
+			{
+				{
+					std::lock_guard<std::mutex> lock(m_mutex);
+					m_stopping = true;
+					++m_generation;
+				}
+				m_start.notify_all();
+				for (std::thread& worker : m_workers)
+				{
+					if (worker.joinable())
+						worker.join();
+				}
+			}
+
+			// Runs body(0..bands-1), with the CALLING thread taking bands too -- it would only be
+			// blocked otherwise, and on a 2-thread split that halves the pool needed.
+			void run(u32 bands, const std::function<void(u32)>& body)
+			{
+				if (bands <= 1)
+				{
+					body(0);
+					return;
+				}
+
+				spawn(bands - 1);
+				{
+					std::lock_guard<std::mutex> lock(m_mutex);
+					m_body = &body;
+					m_bands.store(bands, std::memory_order_relaxed);
+					m_next.store(0, std::memory_order_relaxed);
+					m_pending.store(bands, std::memory_order_relaxed);
+					++m_generation;
+				}
+				m_start.notify_all();
+
+				consume();
+
+				std::unique_lock<std::mutex> lock(m_mutex);
+				m_done.wait(lock, [this] { return m_pending.load(std::memory_order_acquire) == 0; });
+				m_body = nullptr;
+			}
+
+		private:
+			void spawn(u32 wanted)
+			{
+				while (m_workers.size() < wanted)
+					m_workers.emplace_back([this] { worker(); });
+			}
+
+			// Claims bands until none are left. The fetch_add IS the scheduling: bands are equal
+			// sized but not equal cost, so a thread that draws an empty band comes back for more.
+			void consume()
+			{
+				for (;;)
+				{
+					const u32 band = m_next.fetch_add(1, std::memory_order_relaxed);
+					if (band >= m_bands.load(std::memory_order_relaxed))
+						return;
+
+					(*m_body)(band);
+
+					if (m_pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
+					{
+						// Under the lock, so the waiter cannot test the predicate and miss this.
+						std::lock_guard<std::mutex> lock(m_mutex);
+						m_done.notify_one();
+					}
+				}
+			}
+
+			void worker()
+			{
+				u64 seen = 0;
+				for (;;)
+				{
+					{
+						std::unique_lock<std::mutex> lock(m_mutex);
+						m_start.wait(lock, [this, seen] { return m_stopping || m_generation != seen; });
+						if (m_stopping)
+							return;
+						seen = m_generation;
+					}
+					consume();
+				}
+			}
+
+			std::vector<std::thread> m_workers;
+			std::mutex m_mutex;
+			std::condition_variable m_start;
+			std::condition_variable m_done;
+			const std::function<void(u32)>* m_body = nullptr;
+			// Atomic because a worker that has run out of bands can still be testing it while
+			// the next run() writes it; either value it reads sends it back to the wait.
+			std::atomic<u32> m_bands{0};
+			std::atomic<u32> m_next{0};
+			std::atomic<u32> m_pending{0};
+			u64 m_generation = 0;
+			bool m_stopping = false;
+		};
+
+		overlay_band_pool& overlay_bands()
+		{
+			static overlay_band_pool pool;
+			return pool;
+		}
 		u64 s_overlay_presents = 0;   // frames handed to DrawScreenOverlay
 		u64 s_overlay_fullscreen = 0; // sprites refused as full-target blits, not UI
 		u64 s_sprite_geometry_draws = 0; // sprite draws submitted as geometry under SPRITE3D
@@ -1662,8 +1807,14 @@ namespace RemixSubmit
 			const float fw = (float)s_overlay_w;
 			const float fh = (float)s_overlay_h;
 
-			for (size_t tri = 0; tri + 2 < s_scratch_indices.size(); tri += 3)
+			// One band of scanlines, [band_y0, band_y1] inclusive. Every triangle is walked, but
+			// only the rows inside the band are touched, so bands never share a pixel and the
+			// per-band results below are simply summed. Counters are per band rather than global
+			// because incrementing one shared counter per texel would cost more than the shading.
+			const auto raster_band = [&](int band_y0, int band_y1, u64& band_texels, bool& band_used)
 			{
+				for (size_t tri = 0; tri + 2 < s_scratch_indices.size(); tri += 3)
+				{
 				const u32 i0 = s_scratch_indices[tri], i1 = s_scratch_indices[tri + 1],
 						  i2 = s_scratch_indices[tri + 2];
 				if (i0 >= s_scratch_vertices.size() || i1 >= s_scratch_vertices.size() ||
@@ -1690,6 +1841,8 @@ namespace RemixSubmit
 				minx = std::max(minx, 0); miny = std::max(miny, 0);
 				maxx = std::min(maxx, (int)s_overlay_w - 1);
 				maxy = std::min(maxy, (int)s_overlay_h - 1);
+				miny = std::max(miny, band_y0);
+				maxy = std::min(maxy, band_y1);
 				if (options.native_sampler)
 				{
 					minx = std::max(minx, static_cast<int>(options.scissor.SCAX0));
@@ -1821,10 +1974,62 @@ namespace RemixSubmit
 						u8* dst = s_overlay.data() + pixel * 4;
 						if (!overlay_apply_texel(dst, texel, color, options))
 							continue;
-						s_overlay_used = true;
-						++s_overlay_texels;
+						band_used = true;
+						++band_texels;
 					}
 				}
+				}
+			};
+
+			// Splitting costs a fork and a join, so it has to be earning them. A glyph is a few
+			// hundred pixels and would spend more time being handed out than drawn; the threshold
+			// is a quarter of the overlay, which in practice separates the full-screen fills and
+			// backgrounds -- the draws that actually cost milliseconds -- from everything else.
+			const u32 threads = overlay_raster_threads();
+			u32 bands = 1;
+			if (threads > 1)
+			{
+				u64 covered = 0;
+				for (size_t tri = 0; tri + 2 < s_scratch_indices.size(); tri += 3)
+				{
+					const u32 a = s_scratch_indices[tri], b = s_scratch_indices[tri + 1],
+						  c = s_scratch_indices[tri + 2];
+					if (a >= s_scratch_vertices.size() || b >= s_scratch_vertices.size() ||
+						c >= s_scratch_vertices.size())
+						continue;
+
+					const float ax = s_scratch_ndc[a * 2], ay = s_scratch_ndc[a * 2 + 1];
+					const float bx = s_scratch_ndc[b * 2], by = s_scratch_ndc[b * 2 + 1];
+					const float cx = s_scratch_ndc[c * 2], cy = s_scratch_ndc[c * 2 + 1];
+					const float wide = (std::max(std::max(ax, bx), cx) - std::min(std::min(ax, bx), cx)) * 0.5f * fw;
+					const float tall = (std::max(std::max(ay, by), cy) - std::min(std::min(ay, by), cy)) * 0.5f * fh;
+					if (std::isfinite(wide) && std::isfinite(tall) && wide > 0.f && tall > 0.f)
+						covered += static_cast<u64>(wide) * static_cast<u64>(tall);
+				}
+
+				const u64 threshold = (static_cast<u64>(s_overlay_w) * s_overlay_h) / 4;
+				if (covered >= threshold)
+					bands = std::min<u32>(threads, std::max(1u, s_overlay_h / 8u));
+			}
+
+			u64 texels[32] = {};
+			bool used[32] = {};
+			bands = std::clamp<u32>(bands, 1, 32);
+			const int rows = static_cast<int>(s_overlay_h);
+
+			overlay_bands().run(bands, [&](u32 band) {
+				// Integer split, so the last band absorbs the remainder. Rows are half-open per band
+				// and inclusive at the call, which is what keeps the union exactly [0, rows - 1].
+				const int begin = static_cast<int>((static_cast<u64>(rows) * band) / bands);
+				const int end = static_cast<int>((static_cast<u64>(rows) * (band + 1)) / bands) - 1;
+				if (end >= begin)
+					raster_band(begin, end, texels[band], used[band]);
+			});
+
+			for (u32 band = 0; band < bands; ++band)
+			{
+				s_overlay_texels += texels[band];
+				s_overlay_used = s_overlay_used || used[band];
 			}
 
 			++s_overlay_draws;
