@@ -413,7 +413,10 @@ namespace RemixSubmit
 		bool s_drawdump_world_armed = false;
 
 		// Consecutive frames that submitted nothing, and how many of them the beacon waits for.
-		// ~2 seconds at 60Hz: long enough that a load or an all-2D stretch never triggers it.
+		// ~2 seconds at 60Hz. That threshold was chosen on the assumption that "a load or an all-2D
+		// stretch never triggers it", which is simply not true of a PS2 load screen -- Black's run
+		// well past two seconds -- and no threshold fixes that, because a longer load just needs a
+		// longer one. See beacon_enabled() for why it is now opt-in instead.
 		u64 s_empty_frame_streak = 0;
 		constexpr u64 s_beacon_after_empty_frames = 120;
 		stat_counters s_stats{};
@@ -2878,6 +2881,21 @@ namespace RemixSubmit
 		bool no_draw_instance()
 		{
 			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_NODRAWINSTANCE", 0) != 0;
+			return value;
+		}
+
+		// PCSX2_REMIX_BEACON -- draw the debug triangle after a long run of windows that submit no
+		// geometry, to answer "is the runtime alive with nothing to render?".
+		//
+		// DEFAULT 0, i.e. off, and that is a change: it used to be unconditional. It belongs to the
+		// same crash-bisection family as SUBMITDELAY, NODEBUGSCENE and NODRAWINSTANCE, every one of
+		// which is default off, and it was the only one that both defaulted ON and drew over the
+		// picture. Once a title is past bring-up the question it answers is already answered, while
+		// the cost -- a white triangle across every load screen and every 2D menu the overlay does
+		// not happen to carry -- is paid on every run.
+		bool beacon_enabled()
+		{
+			static const bool value = remix_ps2::read_env_int(L"PCSX2_REMIX_BEACON", 0) != 0;
 			return value;
 		}
 
@@ -16516,7 +16534,7 @@ namespace RemixSubmit
 			// menu that is working. Measured on the PS2 BIOS with SPRITE3D = 0: every sprite goes to
 			// the rasteriser, geometry is legitimately zero every frame, and the beacon covered the
 			// screen.
-			if (s_empty_frame_streak >= s_beacon_after_empty_frames && !s_overlay_used)
+			if (beacon_enabled() && s_empty_frame_streak >= s_beacon_after_empty_frames && !s_overlay_used)
 				submit_debug_triangle();
 
 			// The return code used to be discarded here, and that was the single remaining blind
