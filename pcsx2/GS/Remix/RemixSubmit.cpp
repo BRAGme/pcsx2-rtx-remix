@@ -16814,6 +16814,10 @@ namespace RemixSubmit
 	void OnVSync(const void* merged_texture, int crop_left, int crop_top, int crop_right, int crop_bottom,
 		int native_width, int native_height)
 	{
+		// Once a frame. game_id() is a cached reference everywhere else, including the per-draw
+		// path that reads it thousands of times a frame; this is the one place that re-reads it.
+		remix_ps2::paths::refresh_game_id();
+
 		const bool trace_world_seen = s_camera_trace_world_seen;
 		s_camera_trace_world_seen = false;
 		socom_hud_reset();

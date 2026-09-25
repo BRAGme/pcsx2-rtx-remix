@@ -45,7 +45,21 @@ namespace remix_ps2
 		std::string remix_root();
 
 		// Sanitized disc serial ("SLUS-20883"), or empty when no disc identity is known yet.
-		std::string game_id();
+		//
+		// Returns a REFERENCE to a cached string and does no work. It has to: this is called from
+		// the per-draw submit path, several times per draw, and the uncached form took the VM's
+		// info mutex and allocated three times on every call. On Black in a level that was about
+		// 4,000 lock acquisitions and 12,000 allocations a frame -- measured at 31% of the whole
+		// frame, the single largest cost in the backend.
+		//
+		// The cache is refreshed by refresh_game_id() once a frame, and primed on first use so
+		// that callers running before the first frame still see the right value. Do not hold the
+		// reference across frames.
+		const std::string& game_id();
+		
+		// Re-reads the disc serial and updates what game_id() returns. Cheap when unchanged, but
+		// it does take the VM info mutex, so call it once a frame rather than per draw.
+		void refresh_game_id();
 
 		// <remix_root>/<game_id>. Empty when per-game files are off or the serial is unknown --
 		// callers MUST treat empty as "no per-game layer", not as a relative path.

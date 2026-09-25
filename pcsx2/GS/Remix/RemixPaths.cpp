@@ -320,13 +320,33 @@ namespace remix_ps2
 			return configured;
 		}
 
-		std::string game_id()
-		{
-			const std::string serial = VMManager::GetDiscSerial();
-			if (serial.empty())
-				return {};
+		// The serial this was last built from, so an unchanged disc costs one string compare
+		// rather than a fresh sanitize pass.
+		std::string s_game_id_serial;
+		std::string s_game_id_cached;
+		bool s_game_id_primed = false;
 
-			return Path::SanitizeFileName(serial);
+		void refresh_game_id()
+		{
+			s_game_id_primed = true;
+
+			std::string serial = VMManager::GetDiscSerial();
+			if (serial == s_game_id_serial)
+				return;
+
+			s_game_id_serial = std::move(serial);
+			s_game_id_cached = s_game_id_serial.empty() ?
+				std::string{} : Path::SanitizeFileName(s_game_id_serial);
+		}
+
+		const std::string& game_id()
+		{
+			// Primed on first use so anything running before the first frame -- per-game config
+			// loading in particular -- still sees the real serial rather than an empty string.
+			if (!s_game_id_primed)
+				refresh_game_id();
+
+			return s_game_id_cached;
 		}
 
 		std::string game_dir()
