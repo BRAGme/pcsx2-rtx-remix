@@ -2309,6 +2309,32 @@ namespace remix_ps2::materials
 			return out;
 		}
 
+		// The snapshot below can only write a 32-bit colour format back, so refuse anything else
+		// rather than write noise over the source.
+		//
+		// GSTextureCache::Read(Source*) is not the format-aware readback its Target* sibling is.
+		// Target* switches on TEX0.PSM and picks a format and a shader convert per case
+		// (GSTextureCache.cpp:7331). Source* unconditionally downloads as Format::Color and calls
+		// WritePixel32 through an offset built from t->m_TEX0.PSM -- and TEX0.PSM is how the GAME
+		// SAMPLES the target, not how the target is stored. Its one in-tree caller
+		// (GSRendererHW.cpp:10587) hands it a known 32-bit source, so the mismatch never came up
+		// there.
+		//
+		// Sampling a 32-bit target through an indexed format is an ordinary PS2 idiom, and Black
+		// does it: its render-target textures report PSMT8 (0x13) and PSMT4 (0x14). Writing 32-bit
+		// pixels through an 8- or 4-bit offset mapping and then decoding the result as indexed is
+		// what produced the white noise recorded against RTTEX in bin/20080220-175343.conf -- where
+		// it also REPLACED glyph textures that had been rendering correctly, because the snapshot
+		// overwrote their local memory.
+		//
+		// PSMCT24 rides with PSMCT32: same page and block swizzle, and the alpha WritePixel32 adds
+		// is ignored when it is read back.
+		if (is_render_target && source->m_TEX0.PSM != PSMCT32 && source->m_TEX0.PSM != PSMCT24)
+		{
+			++s_stats.skip_target;
+			return out;
+		}
+
 		const GIFRegTEX0& TEX0 = source->m_TEX0;
 		const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
 
