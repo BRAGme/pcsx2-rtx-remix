@@ -3563,6 +3563,69 @@ namespace RemixSubmit
 		}
 
 		// Location + FRotator -> row-vector world->view. Unreal is Z-up, X forward, 65536 == 360 deg.
+		// PCSX2_REMIX_GUESTFADE -- the guest pointer chain to its screen fade scalar, as
+		// "<base>,<offset>" in DECIMAL (every env value here parses base 10). The backend reads
+		// *(float*)(*(u32*)base + offset) once per window and multiplies the finished image by it.
+		//
+		// WHY THIS NEEDS A KNOB AT ALL. Black does not fade with a black quad over the scene. The
+		// fade is a multiply folded into the VERTEX COLOUR of the blit that resolves the 32-bit
+		// scene buffer into the 16-bit display buffer -- RGB = FADE * (0.5*C + 128*gamma), on the
+		// present path. There is no separate draw to classify, so a backend that replaces
+		// rasterisation loses the fade silently and completely. Nothing in the draw stream can
+		// recover it; the value has to be read from the guest.
+		//
+		// For Black (SLUS-21376) the chain is 4256960,54624 -- i.e. 0x0040F4C0 + 0xD560, verified
+		// against the ELF: clamped to [0,1] at VA 0x001AEBD0 and read on the resolve blit at
+		// 0x001C4DA4. 1 is fully bright, 0 is black. Its ramps are linear: 1.000 s in, 0.500 s
+		// out, 3.000 s at mission end.
+		bool guest_fade_chain(u32& out_base, u32& out_offset)
+		{
+			const std::wstring spec = remix_ps2::read_env(L"PCSX2_REMIX_GUESTFADE");
+			if (spec.empty())
+				return false;
+
+			const size_t comma = spec.find(L',');
+			if (comma == std::wstring::npos)
+				return false;
+
+			const s64 base = ::_wtoi64(spec.substr(0, comma).c_str());
+			const s64 offset = ::_wtoi64(spec.substr(comma + 1).c_str());
+			if (base <= 0 || offset < 0 || base > 0x01FFFFFF || offset > 0x01FFFFFF)
+				return false;
+
+			out_base = static_cast<u32>(base);
+			out_offset = static_cast<u32>(offset);
+			return true;
+		}
+
+		// The scalar itself, or 1 (no fade) whenever anything about the read is not trustworthy.
+		// Deliberately fails BRIGHT: a bad pointer must never black the screen out.
+		float read_guest_fade()
+		{
+			u32 base = 0, offset = 0;
+			if (!eeMem || !guest_fade_chain(base, offset))
+				return 1.f;
+
+			constexpr u32 ram_size = 0x02000000;
+			if ((base & 3) != 0 || base > ram_size - sizeof(u32))
+				return 1.f;
+
+			u32 object = 0;
+			std::memcpy(&object, eeMem->Main + base, sizeof(object));
+			object &= (ram_size - 1);
+
+			const u32 address = object + offset;
+			if (object == 0 || (address & 3) != 0 || address > ram_size - sizeof(float))
+				return 1.f;
+
+			float value = 1.f;
+			std::memcpy(&value, eeMem->Main + address, sizeof(value));
+			if (!std::isfinite(value))
+				return 1.f;
+
+			return std::clamp(value, 0.f, 1.f);
+		}
+
 		bool read_ee_camera(float (&pos)[3], remix_ps2::mat4& view, float (&angles_deg)[3],
 			float* out_fov_y = nullptr, float* out_aspect = nullptr)
 		{
@@ -16662,6 +16725,44 @@ namespace RemixSubmit
 			vision_end_frame(merged_frame_active);
 			merged_frame_present(merged_texture, crop_left, crop_top, crop_right, crop_bottom,
 				native_width, native_height, merged_frame_active);
+
+			// The guest's screen fade, folded into the overlay just before it is handed over.
+			//
+			// The guest multiplies its FINISHED image -- world and HUD together -- by this scalar,
+			// so the fade has to be applied after the UI is already in the buffer, not before.
+			//
+			// The overlay composites as out = c*a + traced*(1-a), and the target is that same
+			// composite scaled by f. Solving for a modified (c', a'):
+			//
+			//     a' = 1 - (1-a)*f        c' = c*a*f / a'
+			//
+			// which is EXACT, not an approximation: at a = 0 it leaves black at alpha 1-f, so the
+			// traced image comes through at exactly f, and at a = 1 it scales the UI by f and
+			// leaves it opaque. A fade to black and a multiply toward black are the same operation,
+			// which is why this is expressible in an alpha composite at all.
+			if (const float fade = read_guest_fade(); fade < 0.999f)
+			{
+				// A window with no UI has no buffer yet, and the fade still has to darken the
+				// traced image, so make one at the size the overlay would have used.
+				if (!s_overlay_used && native_width > 0 && native_height > 0)
+				{
+					overlay_reset(static_cast<u32>(native_width), static_cast<u32>(native_height));
+					s_overlay_used = true;
+				}
+
+				for (size_t i = 0; i + 3 < s_overlay.size(); i += 4)
+				{
+					const float a = static_cast<float>(s_overlay[i + 3]) / 255.f;
+					const float a_out = 1.f - ((1.f - a) * fade);
+					const float scale = (a_out > 0.f) ? ((a * fade) / a_out) : 0.f;
+
+					for (u32 k = 0; k < 3; ++k)
+						s_overlay[i + k] = static_cast<u8>(std::clamp(
+							static_cast<float>(s_overlay[i + k]) * scale + 0.5f, 0.f, 255.f));
+
+					s_overlay[i + 3] = static_cast<u8>(std::clamp(a_out * 255.f + 0.5f, 0.f, 255.f));
+				}
+			}
 
 			// The HUD, composited over the traced image. Submitted before Present so the runtime
 			// has it for this frame; the buffer is cleared at the top of the next one.
