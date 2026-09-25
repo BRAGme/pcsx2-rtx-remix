@@ -13843,6 +13843,23 @@ namespace RemixSubmit
 		const bool fallback_screen_ui = (!untex_draw || sprite_geometry) &&
 			!s_active_camera.valid && flat_2d;
 		const bool ui_candidate = !untex_draw && ui_mode() != 0 && flat_2d && !world_depth_draw;
+		// An UNTEXTURED 2D draw is UI too -- a solid panel, a bar, a letterbox, a background fill.
+		// It has no material to bind and never will, and overlay_raster already handles exactly that
+		// with a 1x1 white texel so the vertex colour carries the fill.
+		//
+		// It needs its own classification because fallback_screen_ui deliberately excludes
+		// untextured draws unless SPRITE3D put them in the view-space tier, and ui_candidate
+		// excludes them outright. That exclusion is about Q: an untextured draw never wrote one, so
+		// in the GEOMETRY tier it has to take the Z-recovery route. The rasteriser works in NDC and
+		// never touches depth, so the reason does not apply to it.
+		//
+		// CLASSIFIED HERE, not at the point of use, because the untextured Z-recovery gate a few
+		// lines below returns early -- so a draw the rasteriser could have taken was being dropped
+		// roughly 1,480 lines before the overlay was ever offered it. That is what made the PS2
+		// BIOS memory card screen black: its white background is one untextured full-screen fill,
+		// it has no Z solution to recover, and it died on a depth gate it never needed to pass.
+		const bool ui_untextured = untex_draw && ui_raster_mode() != 0 && !s_active_camera.valid &&
+			flat_2d && !sprite_geometry;
 		// Font sprites use flat UVs at the maximum guest depth with a GEQUAL test.
 		// They have no perspective Q; use unit depth for their screen raster path.
 		// Other flat draws retain their depth and the UIWMAX distance guard.
@@ -13868,7 +13885,10 @@ namespace RemixSubmit
 		// Untextured: no texture means no Q was ever written, and also no material -- these come
 		// back from materials::bind() with the null binding and shade like Rainbow Six 3's white
 		// geometry. Untextured-and-placed beats absent, which is what dropping them amounted to.
-		if (untex_draw && !fallback_screen_ui && (untex_z_mode() == 0 || !fst_z_solution(fst_z_a, fst_z_b)))
+		// `!ui_untextured` keeps the overlay route open: this gate is about recovering a DEPTH for
+		// the geometry tier, and a draw bound for the NDC rasteriser needs no depth at all.
+		if (untex_draw && !fallback_screen_ui && !ui_untextured &&
+			(untex_z_mode() == 0 || !fst_z_solution(fst_z_a, fst_z_b)))
 		{
 			++s_stats.skip_untextured;
 			return;
@@ -13892,7 +13912,12 @@ namespace RemixSubmit
 		// viewed exactly head-on is lost -- applied to the only varying quantity FST draws have.
 		// Applies to every Z-depth draw, textured or not: for an untextured draw Q is not merely
 		// the wrong divisor, it was never written, so testing it would pass everything through.
-		if (!fallback_screen_ui && !ui_candidate && !world_depth_draw && (z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q))
+		// `!ui_untextured` for the same reason the two named above are here: this gate REJECTS a
+		// draw for being 2D, and being 2D is exactly why the rasteriser wants it. Both existing
+		// exemptions exclude untextured draws, so without this an untextured full-screen fill is
+		// rejected by the one test it was always going to fail.
+		if (!fallback_screen_ui && !ui_candidate && !ui_untextured && !world_depth_draw &&
+			(z_depth ? (r.m_vt.m_eq.z && fst_flat_mode() == 0) : r.m_vt.m_eq.q))
 		{
 			// Counted separately: "how many FST draws have no depth variation at all" is the
 			// number that decides whether depth-from-Z can recover geometry for this title or
@@ -14740,7 +14765,15 @@ namespace RemixSubmit
 			// Q = a*zn + b fitted on this title's FST=0 draws. Non-positive or non-finite
 			// results fall out at the same finite check -- Z below the far plane inverts to a
 			// negative w, and rejecting it is correct.
-			const float q = (fallback_screen_ui || fst_screen_ui) ? 1.f : (z_depth ?
+			// ui_untextured joins the two screen-UI routes at q = 1. An untextured draw NEVER WROTE
+			// a Q, so neither branch below can produce a depth for it: v.RGBAQ.Q is whatever was left
+			// in the register, and the Z fit needs a solution this title does not have. Measured on
+			// the PS2 BIOS memory card screen, it came out "w inf pos -inf inf inf" and the draw died
+			// on the finite check -- which is why the const-Q gate above used to drop it on sight.
+			//
+			// q = 1 is not a fallback here, it is the right answer: this draw is bound for the NDC
+			// rasteriser, which takes ndc_x/ndc_y straight from XYZ and never divides by w at all.
+			const float q = (fallback_screen_ui || fst_screen_ui || ui_untextured) ? 1.f : (z_depth ?
 				static_cast<float>((static_cast<double>(v.XYZ.Z) * zfit_scale * fst_z_a) + fst_z_b) :
 				v.RGBAQ.Q);
 			const float w = 1.0f / q;
@@ -14965,7 +14998,10 @@ namespace RemixSubmit
 			// 2D that the exact const-Q test missed. Placed here because min_w/max_w only exist
 			// once the vertex loop has run; see w_flat_limit() for the menu measurement behind it.
 			const float flat_limit = w_flat_limit();
-			if (!fallback_screen_ui && !ui_candidate && !world_depth_draw && flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
+			// Exempts ui_untextured alongside the other two: this is the inexact form of the same
+			// "it is 2D, drop it" test, and an overlay-bound draw must survive both.
+			if (!fallback_screen_ui && !ui_candidate && !ui_untextured && !world_depth_draw &&
+				flat_limit > 0.f && max_w > 0.f && ((max_w - min_w) / max_w) < flat_limit)
 			{
 				++s_stats.skip_w_flat;
 				return;
@@ -15339,20 +15375,8 @@ namespace RemixSubmit
 				max_vertex_alpha, material.content_hash, material.material ? 1 : 0, sky_draw ? 1 : 0);
 		}
 
-		// An UNTEXTURED 2D draw is UI too -- a solid panel, a bar, a letterbox, a fade. It has no
-		// material to bind and never will, and overlay_raster already handles exactly that with a
-		// 1x1 white texel so the vertex colour carries the fill. The SOCOM HUD path has always set
-		// options.untextured; the generic path never did, so the capability existed and was
-		// unreachable for every other title.
-		//
-		// It needs its own admission because fallback_screen_ui deliberately excludes untextured
-		// draws unless SPRITE3D put them in the view-space tier, and ui_candidate excludes them
-		// outright. That exclusion is about Q: an untextured draw never wrote one, so in the
-		// GEOMETRY tier it has to take the Z-recovery route. The rasteriser works in NDC and never
-		// touches depth, so the reason does not apply to it.
-		const bool ui_untextured = untex_draw && ui_raster_mode() != 0 && !s_active_camera.valid &&
-			flat_2d && !sprite_geometry;
-
+		// ui_untextured was classified next to fallback_screen_ui and ui_candidate; see the note
+		// there for why it cannot wait until this point to be decided.
 		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok)
 		{
 			if (material.content_hash == 0 && !ui_untextured)
