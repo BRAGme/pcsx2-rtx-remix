@@ -20,6 +20,7 @@
 #include "common/Console.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
+#include "common/Timer.h"
 #include "common/WindowInfo.h"
 
 #include "fmt/format.h"
@@ -811,6 +812,7 @@ namespace RemixSubmit
 		u64 s_overlay_draws = 0;      // draws that reached the rasteriser
 		u64 s_overlay_nopixels = 0;   // ... but had no CPU texture to sample
 		u64 s_overlay_texels = 0;     // texels actually written
+		u64 s_overlay_raster_ticks = 0; // wall time spent inside the CPU rasteriser
 		u64 s_overlay_presents = 0;   // frames handed to DrawScreenOverlay
 		u64 s_overlay_fullscreen = 0; // sprites refused as full-target blits, not UI
 		u64 s_sprite_geometry_draws = 0; // sprite draws submitted as geometry under SPRITE3D
@@ -1629,6 +1631,18 @@ namespace RemixSubmit
 
 		void overlay_raster(u64 content_hash, const overlay_raster_options& options = {})
 		{
+			// This is a SOFTWARE rasteriser running on the EE thread, so its cost lands directly
+			// on emulation speed rather than on the GPU -- and a title whose whole screen is 2D
+			// sends every pixel of every frame through it. Scoped so the several early returns
+			// below all land in the same clock. Read it against the frame time: if `raster ms`
+			// approaches the wall clock, the overlay IS the frame budget and the texel count is
+			// the thing to cut.
+			struct raster_clock
+			{
+				u64 start = Common::Timer::GetCurrentValue();
+				~raster_clock() { s_overlay_raster_ticks += Common::Timer::GetCurrentValue() - start; }
+			} clock;
+
 			const u8* px = nullptr;
 			u32 tw = 0, th = 0;
 			const u8 white[4] = {255, 255, 255, 255};
@@ -12783,13 +12797,14 @@ namespace RemixSubmit
 			// user reported on turns, and the reason mode 2 exists.
 			const int hold_mode_now = hold_empty_mode();
 			INFO_LOG("Remix: overlay {}x{} | screen-ui seen {} nomat {} nondc {} | "
-					 "raster draws {} nopixels {} texels {} fullscreen {} | presents {} | "
+					 "raster draws {} nopixels {} texels {} ({:.0f} ms) fullscreen {} | presents {} | "
 					 "DrawScreenOverlay {} | uiraster {} uimode {} | "
 					 "sprite3d {} draws {} | sprite skip: untex {} nomat {} blit {} | "
 					 "movie {} active {} decodes {} presented {} refused {}",
 				s_overlay_w, s_overlay_h,
 				s_screen_ui_seen, s_screen_ui_nomat, s_screen_ui_nondc,
-				s_overlay_draws, s_overlay_nopixels, s_overlay_texels, s_overlay_fullscreen,
+				s_overlay_draws, s_overlay_nopixels, s_overlay_texels,
+				Common::Timer::ConvertValueToMilliseconds(s_overlay_raster_ticks), s_overlay_fullscreen,
 				s_overlay_presents,
 				(s_remix.api().DrawScreenOverlay != nullptr) ? "available" : "NULL IN INTERFACE",
 				ui_raster_mode(), ui_mode(), sprite_geometry_mode(), s_sprite_geometry_draws,
