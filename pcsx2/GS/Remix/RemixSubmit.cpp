@@ -571,6 +571,20 @@ namespace RemixSubmit
 			return value;
 		}
 
+		// PCSX2_REMIX_MULTIPASSSTAT -- compute the `multipass` statistic. Off by default.
+		//
+		// That counter reports how many draws repeat geometry already submitted this frame, and
+		// it is the ONLY consumer of s_frame_geometry_hashes -- nothing is skipped on the
+		// strength of it. Producing it means FNV-hashing every vertex position and every index
+		// of every draw and then inserting into a set, per draw, per frame. On Black in a level
+		// that is 1,406 draws a frame paying for a diagnostic nobody is reading.
+		int multipass_stat_mode()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_MULTIPASSSTAT", 0), 0, 1));
+			return value;
+		}
+
 		int batch_mode()
 		{
 			static const int value =
@@ -827,6 +841,8 @@ namespace RemixSubmit
 		u64 s_submit_ticks = 0;      // all of OnDrawPrims
 		u64 s_api_mesh_ticks = 0;    // ... of which CreateMesh
 		u64 s_api_instance_ticks = 0;// ... of which DrawInstance
+		u64 s_xform_ticks = 0;       // ... of which the per-vertex transform loop
+		u64 s_pre_ticks = 0;         // ... of which everything BEFORE that loop
 
 		// PCSX2_REMIX_RASTERTHREADS -- how many threads share one overlay draw. 1 is serial.
 		//
@@ -12908,7 +12924,7 @@ namespace RemixSubmit
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
 					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
 				 "batch: mode {} groups/frame avg {} peak {} | surfaces peak {} verts peak {} meshes {} reused {} cached {} | "
-				 "cost: draw {:.0f} ms (CreateMesh {:.0f} DrawInstance {:.0f})",
+				 "cost: draw {:.0f} ms (pre {:.0f} xform {:.0f} CreateMesh {:.0f} DrawInstance {:.0f})",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -12932,6 +12948,8 @@ namespace RemixSubmit
 				s_stats.batch_groups_peak, s_stats.batch_surfaces_peak, s_stats.batch_vertices_peak,
 				s_stats.batch_meshes_created, s_batch_reused, s_batch_mesh_cache.size(),
 				Common::Timer::ConvertValueToMilliseconds(s_submit_ticks),
+				Common::Timer::ConvertValueToMilliseconds(s_pre_ticks),
+				Common::Timer::ConvertValueToMilliseconds(s_xform_ticks),
 				Common::Timer::ConvertValueToMilliseconds(s_api_mesh_ticks),
 				Common::Timer::ConvertValueToMilliseconds(s_api_instance_ticks));
 
@@ -15023,6 +15041,10 @@ namespace RemixSubmit
 		else
 			s_scratch_ndc.clear();
 
+		// Splits the entry point in three: gates and material bind, then the vertex loop,
+		// then identity and submission. `post` is what the report subtracts out.
+		s_pre_ticks += Common::Timer::GetCurrentValue() - clock.start;
+		const u64 xform_start = Common::Timer::GetCurrentValue();
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
 			if (s_scratch_referenced[i] == 0)
@@ -15267,6 +15289,7 @@ namespace RemixSubmit
 				draw_effect_zfit.add(zn, 1.0 / raw_q);
 			}
 		}
+		s_xform_ticks += Common::Timer::GetCurrentValue() - xform_start;
 
 		// The eye-plane gate. w = 1/Q is the depth the guest divided by; the per-vertex check
 		// above only rejects w <= 0, so a draw whose vertices all sit at w = 1e-4 still passes
@@ -15960,6 +15983,7 @@ namespace RemixSubmit
 		}
 
 		// Hash geometry directly: XOR cannot remove a material folded through FNV.
+		if (multipass_stat_mode() != 0)
 		{
 			u64 geometry_key = fnv_mix(fnv_seed, 0x47454F4D45545259ull);
 			geometry_key = fnv_mix(geometry_key, s_scratch_vertices.size());

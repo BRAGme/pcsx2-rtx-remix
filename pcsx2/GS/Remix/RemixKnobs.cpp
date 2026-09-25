@@ -295,6 +295,13 @@ namespace remix_ps2
 				nullptr, "Writes remix_draws.txt describing every submitted draw for N frames.", false},
 			{"TEXDUMP", "Diagnostics", "Log decoded textures", knob_type::Boolean, 1, 0, 1, 1, nullptr,
 				"Logs each decoded texture's hash and mean colour.", true},
+			{"MULTIPASSSTAT", "Diagnostics", "Count repeated geometry", knob_type::Boolean, 0, 0, 1, 1, nullptr,
+				"Produces the `multipass` figure in the stats line, which counts draws repeating "
+				"geometry already submitted this frame. Nothing is skipped on the strength of it, and "
+				"producing it means hashing every vertex and index of every draw into a set. Costs "
+				"about a millisecond a frame on a title submitting 1400 draws, so it is off unless "
+				"you are actually investigating duplicate geometry.",
+				true},
 			{"FBMSKDUMP", "Diagnostics", "Log framebuffer-mask draws", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr, "Logs draws rejected by the FBMSK gate.", false},
 			{"CAMTRACE", "Diagnostics", "Record camera diagnostic", knob_type::Boolean, 0, 0, 1, 1, nullptr,
