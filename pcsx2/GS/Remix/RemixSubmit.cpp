@@ -13572,7 +13572,10 @@ namespace RemixSubmit
 			if (!overlay_display_extent(r, width, height) || rt_unscaled_width < width || rt_unscaled_height < height ||
 				r.m_context->SCISSOR.SCAX0 > r.m_context->SCISSOR.SCAX1 ||
 				r.m_context->SCISSOR.SCAY0 > r.m_context->SCISSOR.SCAY1 ||
-				r.m_context->SCISSOR.SCAX0 >= width || r.m_context->SCISSOR.SCAY0 >= height ||
+				// Cast to int: the scissor fields are u32:11, so the compare would otherwise be
+				// done in unsigned and warn (C4018). Lossless -- 11 bits max out at 2047.
+				static_cast<int>(r.m_context->SCISSOR.SCAX0) >= width ||
+				static_cast<int>(r.m_context->SCISSOR.SCAY0) >= height ||
 				!overlay_begin_draw(r, width, height))
 				return;
 			if (s_socom_hud_depth.size() != static_cast<size_t>(s_overlay_w) * s_overlay_h)
