@@ -15005,7 +15005,18 @@ namespace RemixSubmit
 		// the untextured and blit counts came back at 0 and 1,632 frozen. Snapshotting still costs
 		// a GPU->CPU download and is itself gated by PCSX2_REMIX_RTTEX (0 = off), so this only
 		// opens the door; it does not take anything on its own.
-		const bool allow_render_target_snapshot = sky_draw || sprite_geometry;
+		// ... and a 2D screen going to the RASTERISER, for the same reason as sprite_geometry above.
+		// The note above already names this case -- "the PS2 composites menu art through render
+		// targets" -- but only covered the SPRITE3D route into it. A title that reaches the overlay
+		// through UIRASTER instead had its menu art refused before RTTEX was ever consulted, which
+		// is Black: SKY 0 and SPRITE3D 0 leave both existing terms false, and its main menu
+		// rasterises 1,143 draws while 317 are refused as `skip: target`.
+		//
+		// Safe to open now only because the snapshot itself refuses formats it cannot write back
+		// (see the PSM gate in RemixMaterials::bind). Before that, opening this door on an indexed
+		// source wrote noise over GS local memory and took working textures with it.
+		const bool allow_render_target_snapshot = sky_draw || sprite_geometry ||
+			((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0);
 		// An untextured draw has no source to key a material on, so bind() would hand back null and
 		// the surface would shade colourless -- and since UNTEXZ these are the majority of a SOCOM
 		// frame. Give them the shared white material instead, so their per-vertex colour lands.
