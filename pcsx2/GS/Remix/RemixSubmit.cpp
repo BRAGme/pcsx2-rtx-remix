@@ -1975,6 +1975,22 @@ namespace RemixSubmit
 			const float fw = (float)s_overlay_w;
 			const float fh = (float)s_overlay_h;
 
+			// SAMPLER STATE IS FIXED FOR THE WHOLE DRAW, so resolve it here rather than re-testing
+			// it and calling through a non-inlined helper for every texel. A profile of Black put
+			// overlay_sample_coordinate at 1.67% of busy time and socom_hud_depth_pass at 1.29% --
+			// the latter on a title that is not SOCOM, where the call exists only to return true.
+			const bool textured = !options.untextured;
+			const bool native_sampler = options.native_sampler;
+			const bool hud_depth = options.socom_hud;
+
+			// REPEAT wrapping is a modulo, which is an integer division, and there were two per
+			// texel. For a power-of-two texture it is exactly a mask -- including for negative
+			// coordinates, because two's complement AND agrees with the "% then add size" form
+			// the helper uses (-9 % 8 + 8 == 7, and -9 & 7 == 7).
+			const int wrap_mask_u = (tw != 0 && (tw & (tw - 1)) == 0) ? (static_cast<int>(tw) - 1) : -1;
+			const int wrap_mask_v = (th != 0 && (th & (th - 1)) == 0) ? (static_cast<int>(th) - 1) : -1;
+			const bool fast_repeat = !native_sampler && wrap_mask_u >= 0 && wrap_mask_v >= 0;
+
 			// One band of scanlines, [band_y0, band_y1] inclusive. Every triangle is walked, but
 			// only the rows inside the band are touched, so bands never share a pixel and the
 			// per-band results below are simply summed. Counters are per band rather than global
@@ -2094,9 +2110,14 @@ namespace RemixSubmit
 							continue;
 
 						int su = 0, sv = 0;
-						if (!options.untextured)
+						if (textured)
 						{
-							if (options.native_sampler)
+							if (fast_repeat)
+							{
+								su = static_cast<int>(u * tw) & wrap_mask_u;
+								sv = static_cast<int>(v * th) & wrap_mask_v;
+							}
+							else if (native_sampler)
 							{
 								su = overlay_sample_coordinate(static_cast<int>(std::floor(u * options.texture_width)),
 									static_cast<int>(options.texture_width), options.clamp.WMS,
@@ -2117,11 +2138,21 @@ namespace RemixSubmit
 						const u8* texel = px + (((size_t)sv * tw) + su) * 4;
 
 						const size_t pixel = static_cast<size_t>(y) * s_overlay_w + x;
-						const float depth = options.socom_hud ? static_cast<float>(s_socom_hud_vertices[i0].z) +
-							w1 * (static_cast<float>(s_socom_hud_vertices[i1].z) - static_cast<float>(s_socom_hud_vertices[i0].z)) +
-							w2 * (static_cast<float>(s_socom_hud_vertices[i2].z) - static_cast<float>(s_socom_hud_vertices[i0].z)) : 0.f;
-						if (!socom_hud_depth_pass(pixel, depth, options))
-							continue;
+
+						// Both helpers begin by returning on options.socom_hud, which cannot change inside a
+						// draw -- so every other title was paying two calls and a depth interpolation per
+						// texel to be told nothing. The write moves up with the test; only the colour block
+						// sat between them and it does not touch the depth buffer.
+						if (hud_depth)
+						{
+							const float depth = static_cast<float>(s_socom_hud_vertices[i0].z) +
+								w1 * (static_cast<float>(s_socom_hud_vertices[i1].z) - static_cast<float>(s_socom_hud_vertices[i0].z)) +
+								w2 * (static_cast<float>(s_socom_hud_vertices[i2].z) - static_cast<float>(s_socom_hud_vertices[i0].z));
+							if (!socom_hud_depth_pass(pixel, depth, options))
+								continue;
+
+							socom_hud_write_depth(pixel, depth, options);
+						}
 						// GOURAUD. Interpolating only for the SOCOM HUD meant every other draw was
 						// FLAT-filled from vertex 0, so a shaded quad came out as its two triangles in
 						// two different solid colours with a hard seam along the shared diagonal. The
@@ -2138,7 +2169,6 @@ namespace RemixSubmit
 									w1 * ((s_scratch_vertices[i1].color >> (k * 8)) & 255u) +
 									w2 * ((s_scratch_vertices[i2].color >> (k * 8)) & 255u), 0.f, 255.f)) << (k * 8);
 						}
-						socom_hud_write_depth(pixel, depth, options);
 						u8* dst = s_overlay.data() + pixel * 4;
 						if (!overlay_apply_texel(dst, texel, color, options))
 							continue;
