@@ -52,6 +52,24 @@ for c in "$BIN"/[A-Z][A-Z][A-Z][A-Z]-[0-9][0-9][0-9][0-9][0-9].conf; do
   [ -e "$c" ] && cp -- "$c" "$OUT/$(basename "$c")"
 done
 
+# --- shipped per-game cheats (tracked in git) ----------------------------
+# portable.ini above is what makes these reachable: EmuFolders::Cheats is
+# <DataRoot>/cheats (Pcsx2Config.cpp, EmuFolders::LoadSettings), and DataRoot == AppRoot
+# under portable, so this folder is the one the Cheats tab reads. On a non-portable
+# install it would be Documents\PCSX2\cheats instead and nothing here would be found.
+#
+# Named one by one, and copied from the repo rather than from "$BIN": bin/cheats is a
+# user-data directory in a dev tree and carries whatever the packager has been testing
+# with, so `cp -r` would ship somebody's local cheats. That is the same mistake the .pdb
+# strip above exists to clean up after, and an allowlist is the whole point of this script.
+CHEATS=(
+  SCUS-97545_D7CFDCCF.pnach
+)
+mkdir -p "$OUT/cheats"
+for c in "${CHEATS[@]}"; do
+  cp -- "$REPO/bin/cheats/$c" "$OUT/cheats/$c"
+done
+
 # --- a minimal rtx.conf ---------------------------------------------------
 # Only the setting every user needs. The runtime's new GUI input method creates
 # a top-level window that swallows keyboard input before the emulator sees it,

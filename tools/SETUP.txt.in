@@ -95,8 +95,29 @@ folder rather than Documents\PCSX2. That is deliberate: it means installing this
 next to a normal PCSX2 cannot overwrite that install's configuration. Delete
 portable.ini if you want the usual behaviour.
 
+cheats\ is read from this folder for the same reason, and that is the only reason
+the file described below is found at all. Deleting portable.ini moves the lookup
+to Documents\PCSX2\cheats, where nothing shipped in this zip exists.
+
 updater.exe is also deliberately absent. It updates to upstream PCSX2 releases,
 which would overwrite this build with one that has no Remix backend in it.
+
+
+SOCOM COMBINED ASSAULT: CO-OP AI SCAFFOLD (DOES NOTHING YET)
+------------------------------------------------------------
+
+cheats\SCUS-97545_D7CFDCCF.pnach is a plan, not a feature. It is groundwork for
+commandable AI teammates in Combined Assault's co-op LAN, and every patch line in
+it is commented out, so the boxes it adds under Properties -> Cheats are inert.
+It ships in that state on purpose, so the design and the toggles can be reviewed,
+and so two people on a LAN can confirm they see the same list, before any of the
+reverse-engineering work starts.
+
+If it ever does something, both players must tick exactly the same boxes: a
+different set of enabled groups is a different patch, which is a desync.
+
+The plan, and what has to be measured on a real disc to finish it, is
+docs/SOCOM/COOP-AI-COMMAND.md in the repository -- not in this zip.
 
 
 WHAT WORKS, AND WHAT DOES NOT

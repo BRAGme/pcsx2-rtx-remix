@@ -77,7 +77,12 @@ oprofile_data/
 /bin/qt.conf
 /bin/bios
 /bin/cache
-/bin/cheats
+# /bin/cheats is a user-data directory in a dev tree, so its contents stay ignored.
+# Cheats this fork ships are named one by one -- a blanket !*.pnach would un-ignore
+# whatever the developer has been testing with. The directory itself must NOT be
+# excluded outright, or git cannot re-include anything inside it.
+/bin/cheats/*
+!/bin/cheats/SCUS-97545_D7CFDCCF.pnach
 /bin/patches
 /bin/covers
 /bin/dumps

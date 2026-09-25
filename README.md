@@ -400,8 +400,8 @@ measurement from this fork, including the ones quoted above.
 ## License and credits
 
 GPL-3.0, unchanged from upstream. This fork adds files under `pcsx2/GS/Remix/`,
-`pcsx2-qt/Settings/Remix*`, `tools/remix-harness/`, `docs/Remix/` and `docs/SOCOM/`; everything
-else is PCSX2's.
+`pcsx2-qt/Settings/Remix*`, `tools/remix-harness/`, `docs/Remix/`, `docs/SOCOM/` and
+`bin/cheats/`; everything else is PCSX2's.
 
 - **[PCSX2](https://github.com/PCSX2/pcsx2)** and its contributors -- the emulator this is a fork
   of, and the source of everything that is not the Remix backend.

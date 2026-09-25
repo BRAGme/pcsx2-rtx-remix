@@ -12,13 +12,22 @@
 // reviewed and shared before anyone spends a week in a disassembler, and so that a tester
 // can confirm the checkboxes appear in the GUI before any game logic is touched.
 //
+// WHERE IT LIVES
+//   It SHIPS, in cheats/ beside the executable, staged by tools/package-release.sh from
+//   bin/cheats/ in the repo. That path is only the one PCSX2 reads because the release is
+//   portable: EmuFolders::Cheats is <DataRoot>/cheats and portable.ini makes DataRoot the
+//   install folder. In a non-portable install the folder is Documents\PCSX2\cheats and
+//   this file would have to be copied there by hand.
+//
+//   A local copy in cheats/ wins over anything bundled, so a tester can edit theirs in
+//   place without touching the build (Patch.cpp:365-407).
+//
 // HOW TO USE IT
-//   1. Copy this file into the cheats/ folder of your PCSX2 install, keeping the name.
-//   2. Settings -> Emulation -> Enable Cheats.
-//   3. Right-click the game -> Properties -> Cheats. The groups below appear as a tree.
-//   4. BOTH PLAYERS TICK EXACTLY THE SAME BOXES. A different set of enabled groups is a
+//   1. Settings -> Emulation -> Enable Cheats.
+//   2. Right-click the game -> Properties -> Cheats. The groups below appear as a tree.
+//   3. BOTH PLAYERS TICK EXACTLY THE SAME BOXES. A different set of enabled groups is a
 //      different patch, which is a desync.
-//   5. Do not click the RTX Remix tab while you are in that dialog. It re-serialises the
+//   4. Do not click the RTX Remix tab while you are in that dialog. It re-serialises the
 //      Remix knob state into the per-game overlay and has broken this title's rendering
 //      twice. See bin/SCUS-97545.conf:229-237.
 //
@@ -26,6 +35,10 @@
 // cheat (pcsx2/VMManager.cpp:3165-3172).
 //
 // RULES FOR EDITING THIS FILE
+//   - The group names are part of the interface once this ships: a tick is stored by name
+//     in gamesettings/, so renaming a label silently unticks it for everyone. Settle the
+//     names before a release, and drop the "(not implemented yet)" from the parent in the
+//     same commit that makes the first group do something.
 //   - Every patch line stays inside a [Label]. A patch line before the first label is
 //     "unlabelled", gets no checkbox, and auto-applies whenever cheats are enabled
 //     (pcsx2/Patch.cpp:408-438). That is how you end up patched on one box and not the
@@ -81,7 +94,7 @@
 // M1 -- cheap failover. No orders, no UI, no new packets. Start here.
 // ================================================================================
 
-[SOCOM Co-op AI\1. Bravo follows Jester when Specter is down]
+[SOCOM Co-op AI (not implemented yet)\1. Bravo follows Jester when Specter is down]
 author=pcsx2-rtx-remix (AI-assisted scaffold)
 description=HOST ONLY, NOT YET IMPLEMENTED. On Specter's death, repoints the Bravo element's leader reference at Jester so they follow and cover player 2 instead of a corpse. A single host-side pointer write: no command UI and nothing added to the wire. Needs ADDR_P1_STATE, ADDR_P2_AVATAR_PTR, ADDR_AI_LEADER_PTR, ADDR_SCRATCH.
 // Trampoline, per the skeleton above. Assemble with the real addresses, then paste the
@@ -102,7 +115,7 @@ description=HOST ONLY, NOT YET IMPLEMENTED. On Specter's death, repoints the Bra
 // M2 -- Specter's command menu. Requires the M0 probe to have found Bravo present in co-op.
 // ================================================================================
 
-[SOCOM Co-op AI\2. Command menu for Specter]
+[SOCOM Co-op AI (not implemented yet)\2. Command menu for Specter]
 author=pcsx2-rtx-remix (AI-assisted scaffold)
 description=HOST ONLY, NOT YET IMPLEMENTED. Un-gates the fireteam command menu for player 1 in co-op and routes its orders into the single-player order dispatcher. Do not enable unless Specter is hosting: on a client the orders have no AI to act on. Needs ADDR_MENU_GATE and ADDR_ORDER_DISPATCH_FN.
 // The branch that suppresses the command menu in MP modes. Usually a single conditional
@@ -120,7 +133,7 @@ description=HOST ONLY, NOT YET IMPLEMENTED. Un-gates the fireteam command menu f
 // M3 -- Jester's orders. ONLY viable if probe step 4 found pad bits in the input stream.
 // ================================================================================
 
-[SOCOM Co-op AI\3. Jester can command when Specter is down]
+[SOCOM Co-op AI (not implemented yet)\3. Jester can command when Specter is down]
 author=pcsx2-rtx-remix (AI-assisted scaffold)
 description=HOST ONLY, NOT YET IMPLEMENTED, AND MAY NOT BE POSSIBLE. Decodes player 2's command selection host-side out of the input the host already receives for Jester's avatar, and feeds the existing dispatcher while authority sits with Jester. Dead in the water if that input arrives as cooked movement vectors rather than pad bits. Needs ADDR_P2_INPUT_FIELD and everything M1 and M2 need.
 // Authority is derived from live player state every frame, never stored: a stored flag has
@@ -134,7 +147,7 @@ description=HOST ONLY, NOT YET IMPLEMENTED, AND MAY NOT BE POSSIBLE. Decodes pla
 // Diagnostics. Enable one at a time, and never during a session that matters.
 // ================================================================================
 
-[SOCOM Co-op AI\Debug\Freeze the AI element's order slot]
+[SOCOM Co-op AI (not implemented yet)\Debug\Freeze the AI element's order slot]
 author=pcsx2-rtx-remix (AI-assisted scaffold)
 description=NOT YET IMPLEMENTED. Pins the order slot to one value every vsync so you can see on screen which behaviour an order id maps to while mapping the dispatcher's arguments. A probing aid, not a feature.
 // patch=1,EE,ADDR_AI_ORDER_SLOT,word,00000000

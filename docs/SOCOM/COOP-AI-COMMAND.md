@@ -3,8 +3,8 @@
 **STATUS: DESIGN AND PROBE PLAN. NOTHING IN THIS DOCUMENT HAS BEEN MEASURED.**
 
 There are no addresses here, because none have been taken. Every address in the companion
-scaffold (`SCUS-97545_D7CFDCCF.pnach`) is a named placeholder, and every `patch=` line in it is
-commented out. The file is inert until someone fills it in from a debugger session on a real
+scaffold (`bin/cheats/SCUS-97545_D7CFDCCF.pnach`) is a named placeholder, and every `patch=` line
+in it is commented out. The file is inert until someone fills it in from a debugger session on a real
 disc. Nothing here should be quoted as fact about the game; it is a plan for finding the facts.
 
 Serial `SCUS-97545`, CRC `D7CFDCCF` (NTSC-U retail), per `bin/resources/GameIndex.yaml:12797`.
@@ -205,18 +205,18 @@ boot. An address that only holds within one session is not an address.
 
 ## Delivering it: the GUI toggle
 
-Your friend does not need to build anything, edit anything, or read this document. One file, one
-checkbox.
+Your friend does not need to build anything, edit anything, or read this document. It ships with
+the build, and it is one checkbox.
 
-1. Drop `SCUS-97545_D7CFDCCF.pnach` into the `cheats/` folder of their PCSX2 install (the Cheats
-   folder shown in Settings -> Folders; `EmuFolders::Cheats`).
-2. Settings -> Emulation -> **Enable Cheats** must be on (`EmuCore/EnableCheats`).
-3. Right-click SOCOM in the game list -> Properties -> **Cheats**. Each labelled group in the
+1. Settings -> Emulation -> **Enable Cheats** (`EmuCore/EnableCheats`).
+2. Right-click SOCOM in the game list -> Properties -> **Cheats**. Each labelled group in the
    pnach appears as its own checkbox with its author and description
-   (`pcsx2-qt/Settings/SettingsWindow.cpp:142`, `pcsx2-qt/Settings/GameCheatSettingsWidget.cpp:339-345`).
-   Labels use `\` to nest, so the groups arrive as a tree under one `SOCOM Co-op AI` parent
-   (`pcsx2/Patch.cpp:547-563`).
-4. Ticked groups are saved per game as `[Cheats] Enable` in
+   (`pcsx2-qt/Settings/SettingsWindow.cpp:142`, `pcsx2-qt/Settings/GameCheatSettingsWidget.cpp:261-273`).
+   Labels use `\` to nest, so the groups arrive as a tree under one parent
+   (`pcsx2/Patch.cpp:547-563`). Groups with no patch lines still list, which is why an inert
+   scaffold is still worth shipping -- a tester can confirm they see the same tree you do before
+   a single address exists.
+3. Ticked groups are saved per game as `[Cheats] Enable` in
    `gamesettings/SCUS-97545_D7CFDCCF.ini` (`pcsx2/Patch.cpp:120-121`).
 
 **Both players must tick exactly the same boxes.** Different sets of enabled groups is the same
@@ -226,10 +226,41 @@ both people read it back before launching.
 Two things that silently swallow the whole feature:
 
 - **RetroAchievements Hardcore Mode disables every cheat**, with one OSD message and no other
-  sign (`pcsx2/VMManager.cpp:3165-3172`). If nothing happens, check this first.
+  sign (`pcsx2/VMManager.cpp:3165-3172`, `pcsx2/Patch.cpp:588-590`). If nothing happens, check
+  this first.
 - Patch lines placed *before* any `[Label]` are "unlabelled" and activate automatically whenever
   cheats are on, with no checkbox (`pcsx2/Patch.cpp:408-438`). The scaffold has none, and must
   never gain any -- that is how you end up with a patch running on one box and not the other.
+
+### How it ships, and the two routes that do not work
+
+`tools/package-release.sh` stages `bin/cheats/SCUS-97545_D7CFDCCF.pnach` into `cheats/` beside the
+executable, named explicitly rather than by a recursive copy, because `bin/cheats` is a user-data
+directory in a dev tree and would otherwise ship whatever the packager was testing with.
+
+**This only works because the release is portable.** `EmuFolders::Cheats` is `<DataRoot>/cheats`,
+and `package-release.sh` writes a `portable.ini` that makes `DataRoot` the install folder. On a
+non-portable install that path is `Documents\PCSX2\cheats` and nothing shipped in the build tree
+would ever be found. If the portable default is ever dropped, this delivery route dies with it.
+
+`/bin/cheats` is gitignored for the same user-data reason, so the one shipped file is un-ignored by
+name (`.gitignore`). A blanket `!*.pnach` would have un-ignored the packager's own cheats too.
+
+Two other routes look plausible and are not:
+
+| Route | Why not |
+|---|---|
+| `bin/resources/patches.zip` | Cheats never read the zip at all -- `EnumeratePnachFiles` returns early when the cheats flag is set (`pcsx2/Patch.cpp:393`), so this could only ever be a Patches-tab entry. Worse, the zip is not in this repo: CI downloads it from upstream's `pcsx2_patches` releases on every build (`.github/workflows/windows_build_qt.yml:118-121`), so injecting a file means editing the release pipeline to modify a file that is replaced each time. |
+| `bin/resources/GameIndex.yaml` `patches:` | Ships, and already carries this title's sun-slowdown fix, but it cannot give a checkbox. GameDB patches are enabled with an empty enable list (`pcsx2/Patch.cpp:776`), and a group with a name that is not in the enable list is skipped (`pcsx2/Patch.cpp:651`). So a labelled group there is loaded and then never enabled and never shown, while an unlabelled one auto-applies to every user with no way to turn it off. Unsuitable in both directions. |
+
+A local copy in `cheats/` takes precedence over anything bundled (`pcsx2/Patch.cpp:365-407`), so a
+tester can edit their own copy in place without rebuilding or touching the shipped file.
+
+One cost of shipping it inert, accepted knowingly: anyone who loads Combined Assault on a release
+build sees four groups that do nothing. That is why the parent label reads "(not implemented yet)"
+-- the collapsed row is all a passer-by sees. Group names are stored by name in `gamesettings/`, so
+renaming them later silently unticks them for everyone; settle the names before the first release
+that makes them do something.
 
 ### Hazard: the per-game settings overlay
 
