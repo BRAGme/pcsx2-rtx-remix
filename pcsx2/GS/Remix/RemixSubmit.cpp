@@ -15004,21 +15004,29 @@ namespace RemixSubmit
 				max_vertex_alpha, material.content_hash, material.material ? 1 : 0, sky_draw ? 1 : 0);
 		}
 
+		// An UNTEXTURED 2D draw is UI too -- a solid panel, a bar, a letterbox, a fade. It has no
+		// material to bind and never will, so requiring one dropped it: measured 58,907 of 233,881
+		// screen-UI draws on Black, which is why its menus rendered in pieces. overlay_raster already
+		// handles this case with a 1x1 white texel so the vertex colour carries the fill, and the
+		// SOCOM HUD path above has always set it. Only the generic path never did.
+		const bool ui_untextured = !r.m_process_texture;
+
 		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok)
 		{
-			if (material.content_hash == 0)
+			if (material.content_hash == 0 && !ui_untextured)
 				++s_screen_ui_nomat;
 			else if (s_scratch_ndc.empty())
 				++s_screen_ui_nondc;
 		}
 
 		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok &&
-			!sprite_geometry && material.content_hash != 0 && !s_scratch_ndc.empty())
+			!sprite_geometry && (material.content_hash != 0 || ui_untextured) && !s_scratch_ndc.empty())
 		{
 			if (overlay_begin_draw(r, rt_unscaled_width, rt_unscaled_height))
 			{
 				overlay_rebase_ndc(rt_unscaled_width, rt_unscaled_height);
 				overlay_raster_options options = overlay_native_options(*r.m_context, source);
+				options.untextured = ui_untextured;
 				// Ordinary UI retains raw GS RGB: 128 is neutral for MODULATE.
 				options.gs_modulation = r.PRIM->TME && r.m_context->TEX0.TFX == TFX_MODULATE &&
 					(vcolor_mode() != 0 || (native_ca_menu && fallback_screen_ui));
