@@ -838,9 +838,22 @@ namespace RemixSubmit
 			s_socom_hud_vertices.clear();
 		}
 
+		// DEFAULT 1. A 2D draw composited flat beats the same draw path traced as a world surface on
+		// every title, and a game whose HUD is hanging in the world is a game nobody can evaluate --
+		// which made this the single biggest barrier to trying a new one.
+		//
+		// It is safe to default because of what it is gated on rather than because it is harmless.
+		// With UIMODE at its default of 0 the only route in is fallback_screen_ui, which requires
+		// !s_active_camera.valid. So on a title whose camera solves this does NOTHING, and on a title
+		// whose camera does not it composites the UI -- it applies exactly where it helps. UIMODE is
+		// deliberately NOT defaulted with it: that one admits 2D draws whatever the camera is doing,
+		// and can claim a distant billboard.
+		//
+		// Every shipped profile that mentions UIRASTER already sets it to 1, so none of them changes
+		// behaviour here; their lines are kept as documentation of what the title needs.
 		int ui_raster_mode()
 		{
-			static live_int value(L"PCSX2_REMIX_UIRASTER", 0, 0, 1);
+			static live_int value(L"PCSX2_REMIX_UIRASTER", 1, 0, 1);
 			return value.get();
 		}
 
