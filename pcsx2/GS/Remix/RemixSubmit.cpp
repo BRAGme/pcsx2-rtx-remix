@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <chrono>
 #include <thread>
 #include "common/WindowInfo.h"
 
@@ -839,6 +840,148 @@ namespace RemixSubmit
 		// and the two API buckets are carved out of it -- so OUR cost is draw minus mesh minus
 		// instance minus the raster figure on the overlay line.
 		u64 s_submit_ticks = 0;      // all of OnDrawPrims
+
+		// PCSX2_REMIX_PROFILE -- sampling profiler, in samples per second. 0 is off.
+		//
+		// WHY IN-PROCESS. ETW CPU sampling (wpr, xperf) needs SeSystemProfilePrivilege and
+		// refuses without elevation. Sampling a thread of our OWN process needs no privilege.
+		//
+		// WHY INSTRUCTION POINTERS AND NOT STACKS. The question is which code inside one
+		// enormous function is hot; a stack walk would keep answering "OnDrawPrims", which is
+		// already known. Suspend, read RIP, resume.
+		//
+		// WHY NOT MORE PHASE TIMERS. Bracketing statements with clock reads mis-attributed here:
+		// a function whose first line is an early return measured 2,526 ms, and calling the
+		// identical function again on the next line measured 5 ms. Sampling does not care where
+		// the statement boundaries are, which is the whole point of using it instead.
+		int profile_hz()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_PROFILE", 0), 0, 8000));
+			return value;
+		}
+
+		HANDLE s_profile_target = nullptr;
+		std::thread s_profile_thread;
+		std::atomic<bool> s_profile_stop{false};
+		std::mutex s_profile_mutex;
+		std::unordered_map<u64, u64> s_profile_hits; // instruction pointer -> sample count
+		u64 s_profile_samples = 0;
+		u64 s_profile_failed = 0;
+
+		// Arms on the first draw, so the thread it samples is by construction the one running the
+		// submit path. Idempotent.
+		void profile_start()
+		{
+			if (profile_hz() <= 0 || s_profile_target != nullptr)
+				return;
+
+			if (!::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(), ::GetCurrentProcess(),
+					&s_profile_target, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, 0))
+			{
+				ERROR_LOG("Remix: PROFILE could not duplicate the submit thread handle ({})", ::GetLastError());
+				return;
+			}
+
+			s_profile_thread = std::thread([]() {
+				const long long period_ns = 1000000000LL / std::max(1, profile_hz());
+				auto next = std::chrono::steady_clock::now();
+				while (!s_profile_stop.load(std::memory_order_relaxed))
+				{
+					next += std::chrono::nanoseconds(period_ns);
+					std::this_thread::sleep_until(next);
+
+					// Nothing between suspend and resume may allocate or take a lock the target might
+					// already hold -- that is the classic way to deadlock a sampling profiler.
+					CONTEXT context{};
+					context.ContextFlags = CONTEXT_CONTROL;
+					if (::SuspendThread(s_profile_target) == static_cast<DWORD>(-1))
+					{
+						++s_profile_failed;
+						continue;
+					}
+					const bool ok = ::GetThreadContext(s_profile_target, &context) != 0;
+					const DWORD64 rip = context.Rip;
+					::ResumeThread(s_profile_target);
+
+					if (!ok)
+					{
+						++s_profile_failed;
+						continue;
+					}
+
+					std::lock_guard<std::mutex> lock(s_profile_mutex);
+					++s_profile_hits[static_cast<u64>(rip)];
+					++s_profile_samples;
+				}
+			});
+
+			INFO_LOG("Remix: PROFILE sampling the submit thread at {} Hz", profile_hz());
+		}
+
+		// Written next to the log, MODULE-RELATIVE, so it can be symbolized against the PDB
+		// after the fact. Rewritten each stats interval because this harness is usually killed
+		// rather than exited cleanly.
+		void profile_dump()
+		{
+			if (profile_hz() <= 0)
+				return;
+
+			std::vector<std::pair<u64, u64>> hits;
+			u64 samples = 0, failed = 0;
+			{
+				std::lock_guard<std::mutex> lock(s_profile_mutex);
+				hits.assign(s_profile_hits.begin(), s_profile_hits.end());
+				samples = s_profile_samples;
+				failed = s_profile_failed;
+			}
+			if (hits.empty())
+				return;
+
+			std::sort(hits.begin(), hits.end(),
+				[](const std::pair<u64, u64>& a, const std::pair<u64, u64>& b) { return a.second > b.second; });
+
+			const std::string& dir = EmuFolders::Logs.empty() ? EmuFolders::AppRoot : EmuFolders::Logs;
+			const std::string path = Path::Combine(dir, "remix_profile.txt");
+			std::FILE* file = FileSystem::OpenCFile(path.c_str(), "w");
+			if (!file)
+				return;
+
+			std::fprintf(file, "# samples %llu failed %llu distinct %zu\n",
+				static_cast<unsigned long long>(samples), static_cast<unsigned long long>(failed), hits.size());
+			std::fprintf(file, "# module rva count\n");
+
+			for (const std::pair<u64, u64>& hit : hits)
+			{
+				// VirtualQuery gives the allocation base, which for a mapped image is the module base,
+				// so this resolves samples in any DLL rather than only the executable.
+				MEMORY_BASIC_INFORMATION info{};
+				wchar_t module_path[MAX_PATH] = {};
+				if (::VirtualQuery(reinterpret_cast<LPCVOID>(hit.first), &info, sizeof(info)) == 0 ||
+					::GetModuleFileNameW(reinterpret_cast<HMODULE>(info.AllocationBase), module_path, MAX_PATH) == 0)
+				{
+					std::fprintf(file, "? %llx %llu\n", static_cast<unsigned long long>(hit.first),
+						static_cast<unsigned long long>(hit.second));
+					continue;
+				}
+
+				// Basename only. Module names are ASCII, so a narrowing copy is safe here.
+				const wchar_t* leaf = module_path;
+				for (const wchar_t* p = module_path; *p != 0; ++p)
+					if (*p == L'/' || *p == static_cast<wchar_t>(92))
+						leaf = p + 1;
+
+				char name[MAX_PATH] = {};
+				for (size_t n = 0; leaf[n] != 0 && (n + 1) < sizeof(name); ++n)
+					name[n] = static_cast<char>(leaf[n] & 0x7F);
+
+				std::fprintf(file, "%s %llx %llu\n", name,
+					static_cast<unsigned long long>(hit.first - reinterpret_cast<u64>(info.AllocationBase)),
+					static_cast<unsigned long long>(hit.second));
+			}
+
+			std::fclose(file);
+		}
 		u64 s_api_mesh_ticks = 0;    // ... of which CreateMesh
 		u64 s_api_instance_ticks = 0;// ... of which DrawInstance
 		u64 s_xform_ticks = 0;       // ... of which the per-vertex transform loop
@@ -12953,6 +13096,8 @@ namespace RemixSubmit
 				Common::Timer::ConvertValueToMilliseconds(s_api_mesh_ticks),
 				Common::Timer::ConvertValueToMilliseconds(s_api_instance_ticks));
 
+			profile_dump();
+
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
 			// 'explode' is the A-vs-B verdict for the reported vertex explosions, and it is on this
@@ -13816,6 +13961,7 @@ namespace RemixSubmit
 			u64 start = Common::Timer::GetCurrentValue();
 			~submit_clock() { s_submit_ticks += Common::Timer::GetCurrentValue() - start; }
 		} clock;
+		profile_start();
 
 		if (!armed())
 			return;

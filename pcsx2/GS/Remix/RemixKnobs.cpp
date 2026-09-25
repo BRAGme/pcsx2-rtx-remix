@@ -295,6 +295,15 @@ namespace remix_ps2
 				nullptr, "Writes remix_draws.txt describing every submitted draw for N frames.", false},
 			{"TEXDUMP", "Diagnostics", "Log decoded textures", knob_type::Boolean, 1, 0, 1, 1, nullptr,
 				"Logs each decoded texture's hash and mean colour.", true},
+			{"PROFILE", "Diagnostics", "Sampling profiler (Hz)", knob_type::Integer, 0, 0, 8000, 100,
+				nullptr,
+				"Samples the instruction pointer of the draw-submission thread and writes "
+				"remix_profile.txt next to the log: one line per address, module-relative, hottest "
+				"first. 2000 is a good figure. Symbolize it with tools/pdb-symbolize/pdbsym.py, "
+				"which reads the PDB directly because Windows dbghelp cannot load these. Sampling "
+				"in-process needs no privileges, unlike ETW (wpr/xperf), which wants an elevated "
+				"shell. 0 is off and costs nothing.",
+				true},
 			{"MULTIPASSSTAT", "Diagnostics", "Count repeated geometry", knob_type::Boolean, 0, 0, 1, 1, nullptr,
 				"Produces the `multipass` figure in the stats line, which counts draws repeating "
 				"geometry already submitted this frame. Nothing is skipped on the strength of it, and "
