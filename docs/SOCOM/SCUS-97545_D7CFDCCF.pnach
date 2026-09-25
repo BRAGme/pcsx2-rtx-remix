@@ -1,0 +1,140 @@
+// SOCOM: U.S. Navy SEALs -- Combined Assault (SCUS-97545, CRC D7CFDCCF)
+// Commandable AI teammates in co-op LAN -- SCAFFOLD (AI-assisted)
+//
+// THIS FILE DOES NOTHING YET, BY DESIGN.
+//
+// Every patch line below is commented out and every address is a named placeholder
+// (ADDR_*). No address in here has been measured. Filling them in requires a debugger
+// session on a real disc -- see docs/SOCOM/COOP-AI-COMMAND.md, which carries the probe
+// recipe and the table to record them in.
+//
+// It is committed inert so that the structure, the hook technique and the labels can be
+// reviewed and shared before anyone spends a week in a disassembler, and so that a tester
+// can confirm the checkboxes appear in the GUI before any game logic is touched.
+//
+// HOW TO USE IT
+//   1. Copy this file into the cheats/ folder of your PCSX2 install, keeping the name.
+//   2. Settings -> Emulation -> Enable Cheats.
+//   3. Right-click the game -> Properties -> Cheats. The groups below appear as a tree.
+//   4. BOTH PLAYERS TICK EXACTLY THE SAME BOXES. A different set of enabled groups is a
+//      different patch, which is a desync.
+//   5. Do not click the RTX Remix tab while you are in that dialog. It re-serialises the
+//      Remix knob state into the per-game overlay and has broken this title's rendering
+//      twice. See bin/SCUS-97545.conf:229-237.
+//
+// If nothing happens at all: RetroAchievements Hardcore Mode silently disables every
+// cheat (pcsx2/VMManager.cpp:3165-3172).
+//
+// RULES FOR EDITING THIS FILE
+//   - Every patch line stays inside a [Label]. A patch line before the first label is
+//     "unlabelled", gets no checkbox, and auto-applies whenever cheats are enabled
+//     (pcsx2/Patch.cpp:408-438). That is how you end up patched on one box and not the
+//     other.
+//   - No "//" inside a description value. Trailing comments are stripped from every line
+//     including that one (pcsx2/Patch.cpp:153-166).
+//   - AI must be simulated host-side only. If a line makes the client compute AI state it
+//     is wrong, however right it looks on screen.
+//   - Never change the size or layout of anything that crosses the network.
+//
+//
+// ================================================================================
+// THE HOOK TECHNIQUE, ONCE, SO THE GROUPS BELOW CAN BE SHORT
+// ================================================================================
+//
+// Injection primitive: patch=0,EE,<addr>,bytes,<hex blob> writes an arbitrary blob at load
+// (pcsx2/Patch.cpp:928, pcsx2/Patch.h:74). Put a trampoline in a verified-free EE region,
+// then overwrite ONE instruction at the hook site with a jump to it.
+//
+//   j ADDR_SCRATCH  encodes as  0x08000000 | ((ADDR_SCRATCH >> 2) & 0x03FFFFFF)
+//   worked example: ADDR_SCRATCH = 0x00300000  ->  0x080C0000
+//
+// MIND THE DELAY SLOT. The instruction at hook_site+4 executes after the jump is taken,
+// before control reaches the trampoline. So: put the jump at hook_site, let hook_site+4 run
+// as the delay slot untouched, re-execute the DISPLACED instruction (the one that was at
+// hook_site) inside the trampoline, and return to hook_site+8.
+//
+//   trampoline, assembled at ADDR_SCRATCH:
+//
+//     lui   $t0, %hi(ADDR_P1_STATE)
+//     lw    $t0, %lo(ADDR_P1_STATE)($t0)   ; Specter alive/incap state
+//     bnez  $t0, keep                      ; alive: change nothing
+//     nop
+//     lui   $t1, %hi(ADDR_P2_AVATAR_PTR)
+//     lw    $t1, %lo(ADDR_P2_AVATAR_PTR)($t1)
+//     lui   $t2, %hi(ADDR_AI_LEADER_PTR)
+//     sw    $t1, %lo(ADDR_AI_LEADER_PTR)($t2)
+//   keep:
+//     <displaced original instruction from hook_site>
+//     j     ADDR_HOOK_SITE + 8
+//     nop
+//
+// PRESERVE REGISTERS. $t0-$t2 above are a guess for readability, not a finding. Read the
+// hook site and its neighbours in the disassembler and pick registers that are genuinely
+// dead there, or save and restore. A clobbered register surfaces far from the hook and is
+// the classic injected-code bug. Needs proper testing at every site.
+//
+// Once the sites are known and stable, consider porting these to dpatch
+// (pcsx2/Patch.cpp:999) so a shifted address does not silently stop matching.
+//
+//
+// ================================================================================
+// M1 -- cheap failover. No orders, no UI, no new packets. Start here.
+// ================================================================================
+
+[SOCOM Co-op AI\1. Bravo follows Jester when Specter is down]
+author=pcsx2-rtx-remix (AI-assisted scaffold)
+description=HOST ONLY, NOT YET IMPLEMENTED. On Specter's death, repoints the Bravo element's leader reference at Jester so they follow and cover player 2 instead of a corpse. A single host-side pointer write: no command UI and nothing added to the wire. Needs ADDR_P1_STATE, ADDR_P2_AVATAR_PTR, ADDR_AI_LEADER_PTR, ADDR_SCRATCH.
+// Trampoline, per the skeleton above. Assemble with the real addresses, then paste the
+// machine code as one hex blob.
+// patch=0,EE,ADDR_SCRATCH,bytes,00000000
+//
+// The hook. One instruction at the site the AI element reads its leader from, or a
+// per-frame AI update entry. Value is the encoded j to ADDR_SCRATCH.
+// patch=0,EE,ADDR_HOOK_SITE,word,08000000
+//
+// Alternative while probing, if a hook site is proving hard to choose: assert the leader
+// pointer every vsync instead. Cruder, costs a write per frame, and will fight the game's
+// own writes rather than replacing them -- acceptable for a first look, not for a release.
+// patch=1,EE,ADDR_AI_LEADER_PTR,word,00000000
+
+
+// ================================================================================
+// M2 -- Specter's command menu. Requires the M0 probe to have found Bravo present in co-op.
+// ================================================================================
+
+[SOCOM Co-op AI\2. Command menu for Specter]
+author=pcsx2-rtx-remix (AI-assisted scaffold)
+description=HOST ONLY, NOT YET IMPLEMENTED. Un-gates the fireteam command menu for player 1 in co-op and routes its orders into the single-player order dispatcher. Do not enable unless Specter is hosting: on a client the orders have no AI to act on. Needs ADDR_MENU_GATE and ADDR_ORDER_DISPATCH_FN.
+// The branch that suppresses the command menu in MP modes. Usually a single conditional
+// branch to neutralise, found by breakpointing the menu-open path in single player and
+// then looking at what diverges in co-op.
+// patch=0,EE,ADDR_MENU_GATE,word,00000000
+//
+// If the menu opens but orders do not land, the dispatch call is gated separately. Hook it
+// rather than forcing it: an order dispatched with a null or single-player-shaped element
+// pointer is a crash, not a bug report.
+// patch=0,EE,ADDR_ORDER_DISPATCH_FN,word,00000000
+
+
+// ================================================================================
+// M3 -- Jester's orders. ONLY viable if probe step 4 found pad bits in the input stream.
+// ================================================================================
+
+[SOCOM Co-op AI\3. Jester can command when Specter is down]
+author=pcsx2-rtx-remix (AI-assisted scaffold)
+description=HOST ONLY, NOT YET IMPLEMENTED, AND MAY NOT BE POSSIBLE. Decodes player 2's command selection host-side out of the input the host already receives for Jester's avatar, and feeds the existing dispatcher while authority sits with Jester. Dead in the water if that input arrives as cooked movement vectors rather than pad bits. Needs ADDR_P2_INPUT_FIELD and everything M1 and M2 need.
+// Authority is derived from live player state every frame, never stored: a stored flag has
+// to be reset correctly on mission restart, checkpoint reload and host migration, and each
+// of those is a bug waiting to be written.
+// patch=0,EE,ADDR_SCRATCH,bytes,00000000
+// patch=0,EE,ADDR_HOOK_SITE,word,08000000
+
+
+// ================================================================================
+// Diagnostics. Enable one at a time, and never during a session that matters.
+// ================================================================================
+
+[SOCOM Co-op AI\Debug\Freeze the AI element's order slot]
+author=pcsx2-rtx-remix (AI-assisted scaffold)
+description=NOT YET IMPLEMENTED. Pins the order slot to one value every vsync so you can see on screen which behaviour an order id maps to while mapping the dispatcher's arguments. A probing aid, not a feature.
+// patch=1,EE,ADDR_AI_ORDER_SLOT,word,00000000
