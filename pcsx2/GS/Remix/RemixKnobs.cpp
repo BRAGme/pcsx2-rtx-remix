@@ -239,6 +239,14 @@ namespace remix_ps2
 				"camera works is unaffected. Turn it off if flat art that belongs in the world -- a "
 				"billboard, a distant sign -- is being flattened onto the screen.",
 				false},
+			{"UIMODE", "Geometry and Filtering", "When a 2D draw counts as UI", knob_type::Choice, 0, 0, 1, 1,
+				"Only when no camera is recovered|Always, whatever the camera is doing",
+				"Widens what the overlay above is allowed to claim. The default only treats a flat draw as UI while no world camera exists, which is what makes the overlay safe to leave on: a title whose camera works is untouched. Always is for a title whose menus are missing DURING play -- the camera from the last gameplay frame stays latched over a pause menu, so the flat draws are refused and the menu is simply absent. It can also claim a world billboard, so raise the w limit below with it.",
+				false},
+			{"UIWMAX", "Geometry and Filtering", "UI depth limit (w)", knob_type::Float, 50.0, 0.0, 100000.0, 5.0,
+				nullptr,
+				"A flat draw further than this is treated as world geometry, not UI. Dirt and muzzle-flash billboards are camera-facing quads at a single depth, so they look exactly like a HUD element to every other test -- depth is what separates them. Genuine UI sits at a small, fixed w; a billboard's w is its real distance from the eye. Lower it if world art is being flattened onto the screen, raise it if UI is missing. 0 removes the limit.",
+				false},
 			{"SPRITEBLIT", "Geometry and Filtering", "Sprites may span the screen", knob_type::Boolean, 0, 0, 1, 1,
 				nullptr,
 				"Admits a sprite covering essentially the whole render target. Normally such a sprite "
