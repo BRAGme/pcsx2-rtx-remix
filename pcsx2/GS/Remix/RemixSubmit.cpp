@@ -1104,8 +1104,17 @@ namespace RemixSubmit
 
 		bool overlay_begin_draw(const GSRendererHW& r, int rt_width, int rt_height)
 		{
+			// The DISPLAY extent, not the render target, for every title. A render target is routinely
+			// taller than the region the PCRTC actually scans out -- a field-mode display halves the
+			// read height -- so sizing the overlay to the target puts the UI in part of a buffer and
+			// leaves the rest to composite as whatever it happens to hold. On the PS2 BIOS that reads
+			// as the menu occupying the top half of the screen with the background showing below it.
+			//
+			// This was gated to SLUS-20883, which is the one title it had been measured on. The gate
+			// was the mistake, not the correction: every title wants the region the guest displays.
+			// overlay_display_extent() reads DISPLAY/DISPFB and returns false when it cannot tell, so
+			// the render-target size stays the fallback rather than the default.
 			int width = rt_width, height = rt_height;
-			if (remix_ps2::paths::game_id() == "SLUS-20883")
 			{
 				int display_width, display_height;
 				if (overlay_display_extent(r, display_width, display_height))
