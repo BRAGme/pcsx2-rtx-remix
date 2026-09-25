@@ -819,6 +819,15 @@ namespace RemixSubmit
 		u64 s_overlay_texels = 0;     // texels actually written
 		u64 s_overlay_raster_ticks = 0; // wall time spent inside the CPU rasteriser
 
+		// Where a frame actually goes. Black in a level submits ~1300 meshes a frame and runs at
+		// 22 fps while the rasteriser accounts for only a quarter of the wall clock, so the rest
+		// had to be attributed rather than guessed at. `draw` is the whole per-draw entry point,
+		// and the two API buckets are carved out of it -- so OUR cost is draw minus mesh minus
+		// instance minus the raster figure on the overlay line.
+		u64 s_submit_ticks = 0;      // all of OnDrawPrims
+		u64 s_api_mesh_ticks = 0;    // ... of which CreateMesh
+		u64 s_api_instance_ticks = 0;// ... of which DrawInstance
+
 		// PCSX2_REMIX_RASTERTHREADS -- how many threads share one overlay draw. 1 is serial.
 		//
 		// The overlay rasteriser runs on the EE thread, so on a fully 2D title it is emulation
@@ -12898,7 +12907,8 @@ namespace RemixSubmit
 					 "maxpos {:.0f}/{:.0f} | scene r {:.0f} | sky {} sky_hash {} cutout {} | degen tris {} alldegen {} | "
 					 "mesh/frame peak +{} -{} | instbudget-skip {} | distinct handles/frame avg {} peak {} | "
 					 "pinned pool {} | id: mode {} reuse {} create {} rebuild {} probes {} | "
-				 "batch: mode {} groups/frame avg {} peak {} | surfaces peak {} verts peak {} meshes {} reused {} cached {}",
+				 "batch: mode {} groups/frame avg {} peak {} | surfaces peak {} verts peak {} meshes {} reused {} cached {} | "
+				 "cost: draw {:.0f} ms (CreateMesh {:.0f} DrawInstance {:.0f})",
 				s_frame_counter, s_stats.draws_seen, s_stats.draws_submitted, s_meshes.size(),
 				s_stats.meshes_created, s_stats.meshes_destroyed,
 				s_stats.skip_not_triangle, s_stats.skip_untextured, s_stats.skip_fst,
@@ -12920,7 +12930,10 @@ namespace RemixSubmit
 				batch_mode(),
 				(s_stats.batch_frames > 0) ? (s_stats.batch_groups_total / s_stats.batch_frames) : 0,
 				s_stats.batch_groups_peak, s_stats.batch_surfaces_peak, s_stats.batch_vertices_peak,
-				s_stats.batch_meshes_created, s_batch_reused, s_batch_mesh_cache.size());
+				s_stats.batch_meshes_created, s_batch_reused, s_batch_mesh_cache.size(),
+				Common::Timer::ConvertValueToMilliseconds(s_submit_ticks),
+				Common::Timer::ConvertValueToMilliseconds(s_api_mesh_ticks),
+				Common::Timer::ConvertValueToMilliseconds(s_api_instance_ticks));
 
 			// The w distribution of everything submitted, which is what the min-w gate is set
 			// from. A pile in the first buckets is geometry collapsing onto the eye plane.
@@ -13778,6 +13791,14 @@ namespace RemixSubmit
 
 	void OnDrawPrims(const GSRendererHW& r, int rt_unscaled_width, int rt_unscaled_height, const void* tex_source, const void* rt_target)
 	{
+		// Scoped: this function returns from dozens of places and every one of them still spent
+		// the time it took to decide.
+		struct submit_clock
+		{
+			u64 start = Common::Timer::GetCurrentValue();
+			~submit_clock() { s_submit_ticks += Common::Timer::GetCurrentValue() - start; }
+		} clock;
+
 		if (!armed())
 			return;
 
@@ -16614,7 +16635,9 @@ namespace RemixSubmit
 			mesh_info.surfaces_count = 1;
 
 			remixapi_MeshHandle handle = nullptr;
+			const u64 mesh_start = Common::Timer::GetCurrentValue();
 			const u32 status = remix_ps2::guarded_create_mesh(api.CreateMesh, &mesh_info, &handle);
+			s_api_mesh_ticks += Common::Timer::GetCurrentValue() - mesh_start;
 
 			if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
 			{
@@ -16703,7 +16726,9 @@ namespace RemixSubmit
 			return;
 		}
 
+		const u64 instance_start = Common::Timer::GetCurrentValue();
 		const u32 status = remix_ps2::guarded_draw_instance(api.DrawInstance, &instance);
+		s_api_instance_ticks += Common::Timer::GetCurrentValue() - instance_start;
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
 		{
 			s_poisoned.insert(hash);
