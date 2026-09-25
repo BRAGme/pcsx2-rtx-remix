@@ -15005,11 +15005,18 @@ namespace RemixSubmit
 		}
 
 		// An UNTEXTURED 2D draw is UI too -- a solid panel, a bar, a letterbox, a fade. It has no
-		// material to bind and never will, so requiring one dropped it: measured 58,907 of 233,881
-		// screen-UI draws on Black, which is why its menus rendered in pieces. overlay_raster already
-		// handles this case with a 1x1 white texel so the vertex colour carries the fill, and the
-		// SOCOM HUD path above has always set it. Only the generic path never did.
-		const bool ui_untextured = !r.m_process_texture;
+		// material to bind and never will, and overlay_raster already handles exactly that with a
+		// 1x1 white texel so the vertex colour carries the fill. The SOCOM HUD path has always set
+		// options.untextured; the generic path never did, so the capability existed and was
+		// unreachable for every other title.
+		//
+		// It needs its own admission because fallback_screen_ui deliberately excludes untextured
+		// draws unless SPRITE3D put them in the view-space tier, and ui_candidate excludes them
+		// outright. That exclusion is about Q: an untextured draw never wrote one, so in the
+		// GEOMETRY tier it has to take the Z-recovery route. The rasteriser works in NDC and never
+		// touches depth, so the reason does not apply to it.
+		const bool ui_untextured = untex_draw && ui_raster_mode() != 0 && !s_active_camera.valid &&
+			flat_2d && !sprite_geometry;
 
 		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok)
 		{
@@ -15019,8 +15026,9 @@ namespace RemixSubmit
 				++s_screen_ui_nondc;
 		}
 
-		if ((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok &&
-			!sprite_geometry && (material.content_hash != 0 || ui_untextured) && !s_scratch_ndc.empty())
+		if (((fallback_screen_ui || ui_candidate) && ui_raster_mode() != 0 && ui_depth_ok &&
+				material.content_hash != 0 && !sprite_geometry && !s_scratch_ndc.empty()) ||
+			(ui_untextured && !s_scratch_ndc.empty()))
 		{
 			if (overlay_begin_draw(r, rt_unscaled_width, rt_unscaled_height))
 			{
