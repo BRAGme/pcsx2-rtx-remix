@@ -1303,7 +1303,10 @@ namespace RemixSubmit
 			return options;
 		}
 
-		int overlay_sample_coordinate(int coordinate, int size, u32 mode, u32 minimum, u32 maximum)
+		// __fi: this is called per TEXEL. Left out of line it costs a call and a four-way
+		// switch on a value that is constant for the whole draw; inlined, the branch is
+		// perfectly predicted and the callee folds into the loop body.
+		__fi int overlay_sample_coordinate(int coordinate, int size, u32 mode, u32 minimum, u32 maximum)
 		{
 			switch (mode)
 			{
@@ -1991,6 +1994,27 @@ namespace RemixSubmit
 			const int wrap_mask_v = (th != 0 && (th & (th - 1)) == 0) ? (static_cast<int>(th) - 1) : -1;
 			const bool fast_repeat = !native_sampler && wrap_mask_u >= 0 && wrap_mask_v >= 0;
 
+			// The native sampler reads all of these out of `options` through a reference, per texel,
+			// for values that are fixed for the draw. Pull them into locals.
+			//
+			// Its REPEAT case gets the same mask treatment, and here it ALWAYS applies: a GS texture
+			// dimension is 1 << TEX0.TW, so it is a power of two by construction. That is why the
+			// earlier mask only helped the non-native path -- native draws kept taking the modulo.
+			const float native_wf = static_cast<float>(options.texture_width);
+			const float native_hf = static_cast<float>(options.texture_height);
+			const int native_w = static_cast<int>(options.texture_width);
+			const int native_h = static_cast<int>(options.texture_height);
+			const u32 native_mode_u = options.clamp.WMS;
+			const u32 native_mode_v = options.clamp.WMT;
+			const u32 native_min_u = options.clamp.MINU, native_max_u = options.clamp.MAXU;
+			const u32 native_min_v = options.clamp.MINV, native_max_v = options.clamp.MAXV;
+			const int native_origin_x = options.texture_origin_x;
+			const int native_origin_y = options.texture_origin_y;
+			const int native_mask_u = (native_mode_u == 0 && native_w > 0 &&
+				(native_w & (native_w - 1)) == 0) ? (native_w - 1) : -1;
+			const int native_mask_v = (native_mode_v == 0 && native_h > 0 &&
+				(native_h & (native_h - 1)) == 0) ? (native_h - 1) : -1;
+
 			// One band of scanlines, [band_y0, band_y1] inclusive. Every triangle is walked, but
 			// only the rows inside the band are touched, so bands never share a pixel and the
 			// per-band results below are simply summed. Counters are per band rather than global
@@ -2119,12 +2143,14 @@ namespace RemixSubmit
 							}
 							else if (native_sampler)
 							{
-								su = overlay_sample_coordinate(static_cast<int>(std::floor(u * options.texture_width)),
-									static_cast<int>(options.texture_width), options.clamp.WMS,
-									options.clamp.MINU, options.clamp.MAXU) - options.texture_origin_x;
-								sv = overlay_sample_coordinate(static_cast<int>(std::floor(v * options.texture_height)),
-									static_cast<int>(options.texture_height), options.clamp.WMT,
-									options.clamp.MINV, options.clamp.MAXV) - options.texture_origin_y;
+								const int cu = static_cast<int>(std::floor(u * native_wf));
+								const int cv = static_cast<int>(std::floor(v * native_hf));
+								su = ((native_mask_u >= 0) ? (cu & native_mask_u)
+									: overlay_sample_coordinate(cu, native_w, native_mode_u, native_min_u, native_max_u))
+									- native_origin_x;
+								sv = ((native_mask_v >= 0) ? (cv & native_mask_v)
+									: overlay_sample_coordinate(cv, native_h, native_mode_v, native_min_v, native_max_v))
+									- native_origin_y;
 							}
 							else
 							{
