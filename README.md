@@ -118,21 +118,35 @@ Read this before building anything. The backend renders, and it is not finished.
 | Tom Clancy's Ghost Recon 2 | `SLUS-21105` | World geometry, albedo textures, generated vertex normals, path-traced lighting | Capture 2026-08-08 08:58, branch tip `b87dc8e8f` -- **not re-verified since** |
 | Tom Clancy's Rainbow Six 3 | `SLUS-20883` | World geometry, albedo textures, characters, path-traced lighting | Capture 2026-08-08 08:24, branch tip `37a25ae09` |
 | SOCOM: U.S. Navy SEALs -- Combined Assault | `SCUS-97545` | World geometry, albedo textures, characters, path-traced lighting -- **still being worked on, not playable** | Capture 2026-08-02 23:11, tip `a311a7c5d` -- **not re-verified since** |
+| PlayStation 2 system menu | `20080220-175343` | The Browser and memory-card screens: readable text, gradient backgrounds, the card models. Entirely 2D, so it exercises the overlay rasteriser rather than the path tracer | Measured 2026-09-25 against GS dumps on tip `aadd688bf` |
+| Black | `SLUS-21376` | `.PSS` movies, the screen fade, and the low-health tint and reload blur mirrored into the runtime's own post-processing. **The world camera is not solved** | Measured 2026-09-25 on tip `aadd688bf` -- **not playable** |
 
 SOCOM is listed honestly rather than confidently, and it is **not a playable title on this
 backend yet**. Between `a311a7c5d` and the current tip the material path was rewritten several
 times over (`8f229137d`, `1952014f4`, `64d2b28f0`, `870e3f991`), and the device loss below makes
 SOCOM expensive to get into a mission at all, so it has not had a clean re-measurement. It is
-being actively worked on rather than parked -- 18 of the 83 commits since that capture touch it,
+being actively worked on rather than parked -- 50 of the 152 commits since that capture touch it,
 including the render-target gate, the sky classifier and the empty-window fix -- but treat the
 screenshot as a record of what the geometry and material path can do, not as a claim that you can
 sit down and play it.
 
 Ghost Recon 2 carries the same caveat for a duller reason: nothing has gone wrong with it, but its
-capture is 40 commits behind the preview-2 build and nobody has booted it since. The blend-enum fix and the sprite-text
+capture is 108 commits behind this build and nobody has booted it since. The blend-enum fix and the sprite-text
 gate both landed after that capture and both change what every title submits, so treat its row as
 "was working, unverified against the current build" rather than as a current result. Rainbow Six 3
 is the exception -- its camera, shadow-pass and lightmap work was measured on the current tip.
+
+Black is the newest row and the least finished. Its profile ships because the work that DID land
+is real -- full-motion video, the fade to black at mission start, and the damage tint and reload
+blur, all of which a path-traced backend otherwise loses silently because they are
+framebuffer-feedback passes with nothing in the draw stream to catch. What has not landed is the
+world camera: the VU1 matrix that would place geometry has not been identified, so the scene is
+submitted in view space and the world is wrong. Treat the row as "these specific effects were
+measured", not as a playable title.
+
+The system menu is listed because it is the first thing the backend renders for anyone, and
+because it is a useful shape: a title with no 3D at all, where the software overlay rasteriser
+is the entire frame rather than a HUD on top of one.
 
 No other title has been measured; absence from this table means untested, not broken.
 
