@@ -315,6 +315,15 @@ namespace remix_ps2::materials
 			// which is the standing rule this project has broken three times.
 			u64 replacement_probe = 0;
 			u64 skip_target = 0; // render-target source: no stable content identity
+			// Four different refusals used to share skip_target, which made the number useless the moment
+			// it mattered: Red Dead Revolver reported 2,594 refused binds WITH RTTEX on, and there was
+			// no way to tell whether the draw was not allowed to snapshot, the knob was off, a readback
+			// was blocked, or the format could not be written back. They are separate questions with
+			// separate fixes, so they are separate counters.
+			u64 skip_target_notui = 0;   // not sky, sprite geometry or a screen-UI candidate
+			u64 skip_target_off = 0;     // RTTEX off, or no texture/cache to read from
+			u64 skip_target_blocked = 0; // readback temporarily blocked
+			u64 skip_target_psm = 0;     // format the 32-bit readback cannot write back
 			u64 rt_snapshots = 0; // GPU->local-memory downloads taken for a render-target source
 			u64 skip_unsupported = 0; // no rtx entry point, or absurd dimensions
 			u64 skip_failed = 0; // quarantined after a decode / runtime failure
@@ -2298,18 +2307,21 @@ namespace remix_ps2::materials
 		if (is_render_target && !allow_render_target_snapshot)
 		{
 			++s_stats.skip_target;
+			++s_stats.skip_target_notui;
 			return out;
 		}
 
 		if (is_render_target && (rt_interval == 0 || !source->m_texture || !g_texture_cache))
 		{
 			++s_stats.skip_target;
+			++s_stats.skip_target_off;
 			return out;
 		}
 
 		if (is_render_target && s_rt_readback_block_frames > 0)
 		{
 			++s_stats.skip_target;
+			++s_stats.skip_target_blocked;
 			return out;
 		}
 
@@ -2336,6 +2348,12 @@ namespace remix_ps2::materials
 		if (is_render_target && source->m_TEX0.PSM != PSMCT32 && source->m_TEX0.PSM != PSMCT24)
 		{
 			++s_stats.skip_target;
+			++s_stats.skip_target_psm;
+			// Which format, so the next person does not have to guess what to teach the readback.
+			static std::unordered_set<u32> reported;
+			if (reported.insert(source->m_TEX0.PSM).second)
+				INFO_LOG("Remix: render-target snapshot refused PSM 0x{:02X} -- the readback can only "
+					"write PSMCT32/24 back", static_cast<u32>(source->m_TEX0.PSM));
 			return out;
 		}
 
@@ -2687,12 +2705,14 @@ namespace remix_ps2::materials
 
 		return fmt::format(
 			"Remix: mat live {} | bind {} hit {} miss {} created {} destroyed {} deferred {} | "
-			"skip: nosrc {} target {} unsup {} failed {} | fail {} | rt snapshots {} | "
+			"skip: nosrc {} target {} (notui {} off {} blocked {} psm {}) unsup {} failed {} | fail {} | rt snapshots {} | "
 			"unique content {} tex0 {} (clut variants {}) | replacement dds {} skipped-nondds {} probe {} "
 			"packmap {} | tags {} hits {} | "
 			"hash {:.0f} ms ({:.2f} us/bind) decode {:.0f} ms",
 			s_entries.size(), s_stats.binds, s_stats.hits, s_stats.misses, s_stats.created,
 			s_stats.destroyed, s_stats.deferred, s_stats.skip_no_source, s_stats.skip_target,
+			s_stats.skip_target_notui, s_stats.skip_target_off, s_stats.skip_target_blocked,
+			s_stats.skip_target_psm,
 			s_stats.skip_unsupported, s_stats.skip_failed, s_stats.failures, s_stats.rt_snapshots,
 			s_stats.unique_content, s_stats.unique_tex0,
 			(s_stats.unique_content > s_stats.unique_tex0) ? (s_stats.unique_content - s_stats.unique_tex0) : 0,
