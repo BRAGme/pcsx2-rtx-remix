@@ -7458,20 +7458,89 @@ void GSTextureCache::Read(Source* t, const GSVector4i& r)
 	if (r.rempty())
 		return;
 
+	// THE STORAGE FORMAT, NOT THE SAMPLING ONE.
+	//
+	// t->m_TEX0 says how the GAME READS this surface. Red Dead Revolver samples 32-bit menu
+	// targets as PSMT8H -- an index living in the high byte -- and other titles sample them as
+	// PSMT8 or PSMT4. The pixels in local memory are whatever the TARGET holds, which is a
+	// different thing, and this function used the sampling format for both the download and the
+	// write-back offset. That put 32-bit pixels at 8-bit offsets and corrupted whatever else
+	// shared those pages; it is why the Remix backend had to refuse every source whose sampling
+	// format was not PSMCT32/24, and why its menus had no materials.
+	//
+	// m_from_target_TEX0 is the target's own TEX0 and is documented to equal m_TEX0 when the
+	// source did not come from a target. Where the two agree -- every pre-existing caller, which
+	// hands this a 32-bit source -- the work below is byte-for-byte what it was.
+	//
+	// The format handling mirrors Read(Target*) deliberately: that overload has always been
+	// format-aware and this one never was, which is the whole defect.
+	const GIFRegTEX0& TEX0 = t->m_from_target_TEX0;
+
+	GSTexture::Format fmt;
+	ShaderConvert ps_shader;
+	std::unique_ptr<GSDownloadTexture>* dltex;
+	switch (TEX0.PSM)
+	{
+		case PSMCT32:
+		case PSMCT24:
+			fmt = GSTexture::Format::Color;
+			ps_shader = ShaderConvert::COPY;
+			dltex = &m_color_download_texture;
+			break;
+
+		case PSMCT16:
+		case PSMCT16S:
+			fmt = GSTexture::Format::UInt16;
+			ps_shader = ShaderConvert::RGB5A1_TO_16_BITS;
+			dltex = &m_uint16_download_texture;
+			break;
+
+		default:
+			// Depth and anything else. Read(Target*) has conversions for those, but a Source is
+			// never handed one here, and writing the wrong conversion back is worse than not
+			// writing at all -- that was the original bug.
+			return;
+	}
+
 	const GSVector4i drc(0, 0, r.width(), r.height());
 
-	if (!PrepareDownloadTexture(drc.z, drc.w, GSTexture::Format::Color, &m_color_download_texture))
+	if (!PrepareDownloadTexture(drc.z, drc.w, fmt, dltex))
 		return;
 
-	m_color_download_texture->CopyFromTexture(drc, t->m_texture, r, 0, true);
-	m_color_download_texture->Flush();
-
-	if (m_color_download_texture->Map(drc))
+	if (ps_shader == ShaderConvert::COPY)
 	{
-		const GSOffset off = g_gs_renderer->m_mem.GetOffset(t->m_TEX0.TBP0, t->m_TEX0.TBW, t->m_TEX0.PSM);
-		g_gs_renderer->m_mem.WritePixel32(
-			const_cast<u8*>(m_color_download_texture->GetMapPointer()), m_color_download_texture->GetMapPitch(), off, r);
-		m_color_download_texture->Unmap();
+		dltex->get()->CopyFromTexture(drc, t->m_texture, r, 0, true);
+	}
+	else
+	{
+		// 16-bit needs the pixels packed by a shader first, so it cannot be a straight copy.
+		GSTexture* tmp = g_gs_device->CreateRenderTarget(drc.z, drc.w, fmt, false);
+		if (!tmp)
+		{
+			Console.Error("Failed to allocate temporary %dx%d target for source read.", drc.z, drc.w);
+			return;
+		}
+
+		const GSVector4 src(GSVector4(r) * GSVector4(t->m_scale) / GSVector4(t->m_texture->GetSize()).xyxy());
+		g_gs_device->StretchRect(t->m_texture, src, tmp, GSVector4(drc), ps_shader, Nearest);
+		dltex->get()->CopyFromTexture(drc, tmp, drc, 0, true);
+		g_gs_device->Recycle(tmp);
+	}
+
+	dltex->get()->Flush();
+
+	if (dltex->get()->Map(drc))
+	{
+		const GSOffset off = g_gs_renderer->m_mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM);
+		u8* bits = const_cast<u8*>(dltex->get()->GetMapPointer());
+		const u32 pitch = dltex->get()->GetMapPitch();
+
+		if (fmt == GSTexture::Format::Color)
+			g_gs_renderer->m_mem.WritePixel32(bits, pitch, off, r);
+		else
+			g_gs_renderer->m_mem.WritePixel16(bits, pitch, off, r);
+
+		dltex->get()->Unmap();
 	}
 }
 

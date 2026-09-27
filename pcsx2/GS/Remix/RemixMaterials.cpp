@@ -2345,15 +2345,22 @@ namespace remix_ps2::materials
 		//
 		// PSMCT24 rides with PSMCT32: same page and block swizzle, and the alpha WritePixel32 adds
 		// is ignored when it is read back.
-		if (is_render_target && source->m_TEX0.PSM != PSMCT32 && source->m_TEX0.PSM != PSMCT24)
+		// Keyed on the STORAGE format, matching what Read(Source*) now writes back. The old test
+		// used m_TEX0.PSM -- how the game SAMPLES the surface -- and so refused a 32-bit target
+		// the moment a title read it as an index. Red Dead Revolver samples its menu targets as
+		// PSMT8H and refused 1,650 binds a run on exactly that.
+		const u32 storage_psm = source->m_from_target_TEX0.PSM;
+		if (is_render_target && storage_psm != PSMCT32 && storage_psm != PSMCT24 &&
+			storage_psm != PSMCT16 && storage_psm != PSMCT16S)
 		{
 			++s_stats.skip_target;
 			++s_stats.skip_target_psm;
 			// Which format, so the next person does not have to guess what to teach the readback.
 			static std::unordered_set<u32> reported;
 			if (reported.insert(source->m_TEX0.PSM).second)
-				INFO_LOG("Remix: render-target snapshot refused PSM 0x{:02X} -- the readback can only "
-					"write PSMCT32/24 back", static_cast<u32>(source->m_TEX0.PSM));
+				INFO_LOG("Remix: render-target snapshot refused storage PSM 0x{:02X} (sampled as 0x{:02X})"
+					" -- the readback writes PSMCT32/24/16 back", storage_psm,
+					static_cast<u32>(source->m_TEX0.PSM));
 			return out;
 		}
 
