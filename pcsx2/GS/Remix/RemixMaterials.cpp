@@ -1938,7 +1938,11 @@ namespace remix_ps2::materials
 			remix_ps2::paths::env_source("PCSX2_REMIX_MATSTAGE"),
 			effective_env("PCSX2_REMIX_UIMODE", "0"),
 			remix_ps2::paths::env_source("PCSX2_REMIX_UIMODE"),
-			effective_env("PCSX2_REMIX_UIRASTER", "0"),
+			// 1, matching ui_raster_mode(). These fallbacks are hand-copied from the accessor
+			// defaults, so when UIRASTER's default was flipped to 1 this string stayed "0" and the
+			// line whose entire job is to report what the backend is USING began reporting the
+			// overlay off while it was demonstrably on. Change both together.
+			effective_env("PCSX2_REMIX_UIRASTER", "1"),
 			remix_ps2::paths::env_source("PCSX2_REMIX_UIRASTER"),
 			effective_env("PCSX2_REMIX_UIWMAX", "50"),
 			remix_ps2::paths::env_source("PCSX2_REMIX_UIWMAX"));
