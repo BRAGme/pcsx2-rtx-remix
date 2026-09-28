@@ -7476,6 +7476,14 @@ void GSTextureCache::Read(Source* t, const GSVector4i& r)
 	// format-aware and this one never was, which is the whole defect.
 	const GIFRegTEX0& TEX0 = t->m_from_target_TEX0;
 
+	// RTA. When a target is stored with its alpha scaled, reading it back with a plain copy
+	// gives the SCALED alpha, and Read(Target*) has always de-corrected for exactly that.
+	// It matters far more here than it looks: PSMT8H takes its palette index from the ALPHA
+	// byte, so a scaled alpha is a wrong index, and a CLUT lookup of wrong indices is not
+	// subtly off -- it is smeared bands of unrelated colour. That is what Red Dead
+	// Revolver's menu turned into once this function started admitting those targets.
+	const bool rta_scaled = (t->m_from_target != nullptr && t->m_from_target->m_rt_alpha_scale);
+
 	GSTexture::Format fmt;
 	ShaderConvert ps_shader;
 	std::unique_ptr<GSDownloadTexture>* dltex;
@@ -7484,7 +7492,7 @@ void GSTextureCache::Read(Source* t, const GSVector4i& r)
 		case PSMCT32:
 		case PSMCT24:
 			fmt = GSTexture::Format::Color;
-			ps_shader = ShaderConvert::COPY;
+			ps_shader = rta_scaled ? ShaderConvert::RTA_DECORRECTION : ShaderConvert::COPY;
 			dltex = &m_color_download_texture;
 			break;
 
