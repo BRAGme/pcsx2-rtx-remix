@@ -120,6 +120,7 @@ Read this before building anything. The backend renders, and it is not finished.
 | SOCOM: U.S. Navy SEALs -- Combined Assault | `SCUS-97545` | World geometry, albedo textures, characters, path-traced lighting -- **still being worked on, not playable** | Capture 2026-08-02 23:11, tip `a311a7c5d` -- **not re-verified since** |
 | PlayStation 2 system menu | `20080220-175343` | The Browser and memory-card screens: readable text, gradient backgrounds, the card models. Entirely 2D, so it exercises the overlay rasteriser rather than the path tracer | Measured 2026-09-25 against GS dumps on tip `aadd688bf` |
 | Black | `SLUS-21376` | `.PSS` movies, the screen fade, and the low-health tint and reload blur mirrored into the runtime's own post-processing. **The world camera is not solved** | Measured 2026-09-25 on tip `aadd688bf` -- **not playable** |
+| Red Dead Revolver | `SLUS-20500` | World geometry, characters, sky, menus, `.PSS` movies, and a **world camera read out of EE memory** -- world terrain, buildings and foliage place correctly and the view tracks the player's own turning | Measured 2026-09-28 on tip `9963744dc` |
 
 SOCOM is listed honestly rather than confidently, and it is **not a playable title on this
 backend yet**. Between `a311a7c5d` and the current tip the material path was rewritten several
