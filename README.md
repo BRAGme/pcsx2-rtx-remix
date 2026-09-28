@@ -36,21 +36,31 @@ fork on the extended API line -- Remix Plus, or a build derived from it:
 |---|---|
 | Requirement | any dxvk-remix fork on the `0.1000.x` API line that exports `remixapi_CreateTexture` |
 | Known-good source | [`RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix), maintainer Kim2091 |
-| Release tag | `remix-plus-1.5.1` (tag object `f4173a9c8b94736363cb27c3bd228059780acbcf`), asset `Remix_Plus_v1.5.1_x64_games_release.zip` |
-| API version | `0.1000.0` (the vendored `remix_c.h:65-67`) |
+| Branch | `rebased-9-19` -- the current line, and what the vendored header is synced from |
+| API version | `0.1000.1` (the vendored `remix_c.h:70-72`) |
 
-**What the measurements in this README were actually taken on is not that tag.** The deployed
-runtime on the development machine reports `dxvk-remix (remix-main+abbae23d)` and carries the
-string `remix-numos3` -- a numos3 build, not Remix Plus 1.5.1. Both sit on the same API line
-(numos3's header is `0.1000.1`, ours is `0.1000.0`, and the handshake only breaks on the minor),
-so either should connect, but only the numos3 build has run this backend for any length of time.
-Treat 1.5.1 as expected-to-work rather than verified, and if you see behaviour this README does
-not describe, the runtime is the first variable to change.
+**The vendored header is synced from `rebased-9-19`, not from a release tag.** `0.1000.1` adds
+four DLSS control-mask fields to the end of `remixapi_MaterialInfoOpaqueEXT`; the change is
+additive and the runtime only reads those fields from callers reporting `>= 0.1000.1`, so a
+binary built against `0.1000.0` still connects. Sync the header wholesale and compare by diff --
+the minor stays `1000` across this change, so **the version macro does not prove a header is
+current**.
+
+**Four entry points this backend uses are fork-local and are not on `rebased-9-19`:**
+`remixapi_SetGuestVisionMode`, `remixapi_SetGuestSkyFrame`, `remixapi_SetGuestThermalFrame` and
+`remixapi_DrawScreenOverlayPremultiplied`. They are resolved by `GetProcAddress` rather than
+through the interface struct, so a runtime without them resolves null and the feature reports
+itself unavailable on the `Remix: guest vision ... premultiplied overlay ...` log line. Nothing
+else changes, but if you expect one of those features and the log says `unavailable`, that is why.
+
+**What the measurements in this README were taken on** is a build off the older fork line
+(`remix-main+3f8efae0`), not `rebased-9-19`. If you see behaviour this README does not describe,
+the runtime is the first variable to change.
 
 Two independent reasons stock will not do:
 
 1. **The version handshake rejects it.** Remix Plus reserves `REMIXAPI_VERSION_MINOR = 1000`
-   (`pcsx2/GS/Remix/remix_c.h:58-67`) and the compatibility check treats every minor as breaking
+   (`pcsx2/GS/Remix/remix_c.h:63-72`) and the compatibility check treats every minor as breaking
    while `MAJOR == 0`. Stock dxvk-remix is on the `0.6.x` line, so the two refuse each other rather
    than running with mismatched struct layouts and category bits.
 2. **`remixapi_CreateTexture` does not exist in stock.** The backend needs to hand the runtime

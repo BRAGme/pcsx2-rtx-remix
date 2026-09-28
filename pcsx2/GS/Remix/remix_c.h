@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -62,9 +62,14 @@
 // reject binaries built against stock Remix 0.6.x or older Remix Plus 0.6.x —
 // the struct layout and category-bit ABI differ. Bump MINOR again on any
 // further breaking ABI change.
+//
+// PATCH 1 tracks upstream 0.6.5: remixapi_MaterialInfoOpaqueEXT grew by the four
+// DLSS control-mask fields. The runtime (and the bridge client) only read those
+// fields from callers reporting >= 0.1000.1, so binaries built against 0.1000.0
+// keep working and receive upstream's defaults.
 #define REMIXAPI_VERSION_MAJOR 0
 #define REMIXAPI_VERSION_MINOR 1000
-#define REMIXAPI_VERSION_PATCH 0
+#define REMIXAPI_VERSION_PATCH 1
 
 
 // External
@@ -260,6 +265,10 @@ extern "C" {
     int                 alphaTestType;
     uint8_t             alphaReferenceValue;
     float               displaceOut;
+    remixapi_Bool       enableDlssControlMask;
+    float               dlssControlMaskIntensity;
+    float               dlssControlMaskToneStrength;
+    float               dlssControlMaskStructuralStrength;
   } remixapi_MaterialInfoOpaqueEXT;
 
   // Valid only if remixapi_MaterialInfo contains remixapi_MaterialInfoOpaqueEXT in pNext chain
@@ -504,6 +513,7 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY  = 1 << 19,
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING     = 1 << 20,
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL      = 1 << 21,
+    // Deprecated. Reserved for API compatibility and ignored by the runtime.
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
     REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER          = 1 << 23,
     REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
