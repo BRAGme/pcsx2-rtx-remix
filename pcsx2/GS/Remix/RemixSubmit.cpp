@@ -841,6 +841,77 @@ namespace RemixSubmit
 		// instance minus the raster figure on the overlay line.
 		u64 s_submit_ticks = 0;      // all of OnDrawPrims
 
+		// PCSX2_REMIX_EEDUMP -- write a snapshot of EE RAM every N frames. 0 is off.
+		//
+		// For finding a camera that is NOT in VU1. Rainbow Six 3's view transform was recovered
+		// by diffing save states for a rotation whose pitch and roll hold while yaw moves, with a
+		// position beside it that freezes when standing still. That worked, but it needed save
+		// states, which need a human driving the game. A title with an attract demo moves its own
+		// camera, so snapshots taken on a timer give the same signal with nobody at the controller.
+		//
+		// Whole RAM rather than a guessed window: the point is that we do not know where to look.
+		// Capped hard, because each one is 32 MB.
+		//
+		// START MATTERS AS MUCH AS INTERVAL. The first capture on Red Dead Revolver began at frame
+		// 0 and spent four of its eight snapshots on logos, the intro .PSS and the title menu --
+		// the run log reads "submitted 0" on every stats line through frame 1500. A snapshot with
+		// no world geometry in it cannot contain a world camera, so half the capture could not
+		// have answered the question it was taken to answer, and the surviving four were 7 seconds
+		// apart, which is far too coarse to tell a camera from a matrix that simply sits still.
+		//
+		// So: START at a frame where the stats line already shows geometry being submitted, and
+		// sample fast enough that a moving camera changes A LITTLE between neighbours. Continuity
+		// is the discriminator -- a real camera rotates smoothly, a parked transform does not move
+		// at all, and garbage is not orthonormal twice in a row.
+		int ee_dump_interval()
+		{
+			static const int value =
+				static_cast<int>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_EEDUMP", 0), 0, 100000));
+			return value;
+		}
+
+		// First frame eligible to be dumped. Read the frame number off the stats line.
+		u64 ee_dump_start()
+		{
+			static const u64 value =
+				static_cast<u64>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_EEDUMPSTART", 0), 0, 100000000));
+			return value;
+		}
+
+		// How many to write before stopping. 32 MB each, so this is the disk budget.
+		u32 ee_dump_count()
+		{
+			static const u32 value =
+				static_cast<u32>(std::clamp<s64>(remix_ps2::read_env_int(L"PCSX2_REMIX_EEDUMPCOUNT", 8), 1, 32));
+			return value;
+		}
+
+		void ee_dump_tick()
+		{
+			const int interval = ee_dump_interval();
+			if (interval <= 0 || !eeMem)
+				return;
+
+			if (s_frame_counter < ee_dump_start())
+				return;
+
+			static u32 written = 0;
+			const u32 limit = ee_dump_count();
+			if (written >= limit || (s_frame_counter % static_cast<u64>(interval)) != 0)
+				return;
+
+			const std::string& dir = EmuFolders::Logs.empty() ? EmuFolders::AppRoot : EmuFolders::Logs;
+			const std::string path = Path::Combine(dir, fmt::format("remix_ee_{:06}.bin", s_frame_counter));
+			std::FILE* file = FileSystem::OpenCFile(path.c_str(), "wb");
+			if (!file)
+				return;
+
+			std::fwrite(eeMem->Main, 1, 0x02000000, file);
+			std::fclose(file);
+			++written;
+			INFO_LOG("Remix: EEDUMP wrote {} ({} of {})", path, written, limit);
+		}
+
 		// PCSX2_REMIX_PROFILE -- sampling profiler, in samples per second. 0 is off.
 		//
 		// WHY IN-PROCESS. ETW CPU sampling (wpr, xperf) needs SeSystemProfilePrivilege and
@@ -3977,6 +4048,15 @@ namespace RemixSubmit
 		u32 ee_cam_loc_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMLOC", 0x00F0F670)); }
 		u32 ee_cam_rot_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMROT", 0x00F0F680)); }
 
+		// EE address of an affine 4x4 camera-to-world matrix, for titles that keep a MATRIX
+		// rather than the position-plus-Euler-angles pair above. Non-zero replaces LOC and ROT.
+		u32 ee_cam_mat_addr() { return static_cast<u32>(env_int_live(L"PCSX2_REMIX_EECAMMAT", 0)); }
+
+		// Yaw the matrix by 180 degrees. Which way along the third row a game calls "forward"
+		// cannot be read off the numbers -- both signs are a valid right-handed basis -- so it
+		// is a knob to be settled by looking at the screen, not a guess baked into the reader.
+		int ee_cam_mat_flip() { return std::clamp(env_int_live(L"PCSX2_REMIX_EECAMMATFLIP", 0), 0, 1); }
+
 		struct r6_view_camera
 		{
 			float position[3];
@@ -4329,11 +4409,92 @@ namespace RemixSubmit
 			}
 		}
 
+		// A camera stored as a MATRIX, not as a position and three fixed-point Euler angles.
+		//
+		// Found by dumping all 32 MB of EE RAM on a frame timer through the Red Dead Revolver
+		// attract demo (PCSX2_REMIX_EEDUMP) and keeping the one 4-byte-aligned offset whose three
+		// consecutive rows stayed a mutually perpendicular set of unit vectors in all ten snapshots
+		// AND turned a few degrees between neighbours. Orthonormality alone is weak -- 1,948
+		// offsets passed it, because every static mesh normal and every parked transform passes it.
+		// CONTINUITY is what identifies a camera: two offsets passed both, and they were this
+		// matrix and a copy of it. The same address survived a second, independent boot.
+		//
+		// Layout, verified across ten snapshots half a second apart:
+		//
+		//     +0x00  right  (x, y, z)  w = 0    y is EXACTLY zero -- this camera never rolls
+		//     +0x10  up     (x, y, z)  w = 0    dominated by +Y, so +Y is up
+		//     +0x20  fwd    (x, y, z)  w = 0    equals right x up, so the basis is right-handed
+		//     +0x30  pos    (x, y, z)  w = 1    sweeps smoothly while its height barely moves
+		//
+		// That is camera-to-world. The view matrix is its inverse, and for an orthonormal basis the
+		// inverse is the transpose with a re-projected translation -- which is exactly the form the
+		// Euler path already builds, so the two share every line downstream of here.
+		bool read_ee_camera_matrix(float (&pos)[3], remix_ps2::mat4& view, float (&angles_deg)[3])
+		{
+			const u32 base = ee_cam_mat_addr() & 0x01FFFFF0u;
+			if (!eeMem || (base + 64u) > Ps2MemSize::MainRam)
+				return false;
+
+			float m[16];
+			std::memcpy(m, eeMem->Main + base, sizeof(m));
+			for (float v : m)
+			{
+				if (!std::isfinite(v) || std::abs(v) > 1e7f)
+					return false;
+			}
+
+			float right[3] = { m[0], m[1], m[2] };
+			float up[3]    = { m[4], m[5], m[6] };
+			float fwd[3]   = { m[8], m[9], m[10] };
+			const auto dot3 = [](const float* a, const float* b) { return (a[0]*b[0]) + (a[1]*b[1]) + (a[2]*b[2]); };
+
+			// REFUSE anything that is not a rotation. This address is a fact about one heap, and a
+			// level change may well put something else there. A sheared or scaled basis would still
+			// solve, and would produce a world that is wrong in a way nobody can read off the screen
+			// -- far worse than falling back to the camera we would have used anyway.
+			if (std::abs(dot3(right, right) - 1.f) > 1e-2f || std::abs(dot3(up, up) - 1.f) > 1e-2f ||
+				std::abs(dot3(fwd, fwd) - 1.f) > 1e-2f || std::abs(dot3(right, up)) > 1e-2f ||
+				std::abs(dot3(right, fwd)) > 1e-2f || std::abs(dot3(up, fwd)) > 1e-2f)
+				return false;
+
+			if (ee_cam_mat_flip() != 0)
+			{
+				// A 180-degree yaw: negate right and forward, keep up, keep the handedness.
+				for (u32 i = 0; i < 3; ++i) { right[i] = -right[i]; fwd[i] = -fwd[i]; }
+			}
+
+			pos[0] = m[12]; pos[1] = m[13]; pos[2] = m[14];
+
+			// Log only. The basis is what is used; this is a readable summary of it.
+			constexpr float to_deg = 57.29577951f;
+			angles_deg[0] = std::asin(std::clamp(fwd[1], -1.f, 1.f)) * to_deg;
+			angles_deg[1] = std::atan2(fwd[0], fwd[2]) * to_deg;
+			angles_deg[2] = std::atan2(right[1], up[1]) * to_deg;
+
+			view = remix_ps2::mat4_identity();
+			for (u32 i = 0; i < 3; ++i)
+			{
+				view.m[i][0] = right[i];
+				view.m[i][1] = up[i];
+				view.m[i][2] = fwd[i];
+				view.m[i][3] = 0.f;
+			}
+			view.m[3][0] = -dot3(pos, right);
+			view.m[3][1] = -dot3(pos, up);
+			view.m[3][2] = -dot3(pos, fwd);
+			view.m[3][3] = 1.f;
+			return true;
+		}
 		bool read_ee_camera(float (&pos)[3], remix_ps2::mat4& view, float (&angles_deg)[3],
 			float* out_fov_y = nullptr, float* out_aspect = nullptr)
 		{
 			if (!eeMem)
 				return false;
+
+			// The matrix form supersedes LOC/ROT entirely: a game keeps one or the other, never both.
+			if (ee_cam_mat_addr() != 0)
+				return read_ee_camera_matrix(pos, view, angles_deg);
+
 			float p[3];
 			s32 r[3];
 			if (remix_ps2::paths::game_id() == "SLUS-20883" && VMManager::GetCurrentCRC() == 0x21CC1EC3)
@@ -17029,6 +17190,7 @@ namespace RemixSubmit
 		// Once a frame. game_id() is a cached reference everywhere else, including the per-draw
 		// path that reads it thousands of times a frame; this is the one place that re-reads it.
 		remix_ps2::paths::refresh_game_id();
+		ee_dump_tick();
 
 		const bool trace_world_seen = s_camera_trace_world_seen;
 		s_camera_trace_world_seen = false;
@@ -17238,9 +17400,12 @@ namespace RemixSubmit
 					s_dd_w_min = 1e30f; s_dd_w_max = -1e30f; s_dd_verts = 0;
 					for (u32 k = 0; k < 3; ++k) { s_dd_p_min[k] = 1e30f; s_dd_p_max[k] = -1e30f; }
 				}
-				if (false)
-					INFO_LOG("Remix: EECAM mode {} pos {:.1f} {:.1f} {:.1f} | pitch {:+.1f} yaw {:+.1f} roll {:+.1f} | used {}",
-						ee_cam_mode(), eepos[0], eepos[1], eepos[2], eeang[0], eeang[1], eeang[2], s_ee_installed);
+				// Silent on the Euler path, which is calibrated and has nothing left to say. Loud on the
+				// matrix path, whose ADDRESS is a fact about one heap that a level change could invalidate.
+				// If this line stops moving while the picture does, the camera has gone stale.
+				if (ee_cam_mat_addr() != 0 && (s_eecam_n % 120) == 1)
+					INFO_LOG("Remix: EECAM matrix pos {:.2f} {:.2f} {:.2f} | pitch {:+.1f} yaw {:+.1f} roll {:+.1f} | used {}",
+						eepos[0], eepos[1], eepos[2], eeang[0], eeang[1], eeang[2], s_ee_installed);
 			}
 			else if ((s_eecam_n++ % 600) == 0)
 				INFO_LOG("Remix: EECAM read FAILED (eeMem {} loc {:#x})",
